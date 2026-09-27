@@ -1,0 +1,35 @@
+# ---------------------------------------------------------------------------
+# Deny by default. ONLY scripts/ is committed — nothing else leaves this machine.
+#
+# Everything else (CLAUDE.md, docs/, literature/, reports/) stays on disk and
+# works normally; it is simply never offered to git.
+#
+# NOTE: this governs UNTRACKED files only. The upstream simulator, devkit,
+# Dockerfiles and graphics are already tracked and are unaffected. A NEW file
+# under autodrive_devkit/ will be ignored — add an allow rule or `git add -f`.
+# ---------------------------------------------------------------------------
+*
+
+# Git must be able to descend into directories, or nothing inside one can be
+# un-ignored. This permits traversal, not the files.
+!*/
+
+# --- the only things we commit ---------------------------------------------
+!/scripts/*.py
+!/scripts/*.sh
+!/.gitignore
+
+# --- never, even if a rule above would otherwise allow it ------------------
+# Listed last because the last matching rule wins.
+*.pdf
+*.docx
+*.pptx
+*.zip
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
