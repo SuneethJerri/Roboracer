@@ -18,6 +18,7 @@
 !/scripts/*.py
 !/scripts/*.sh
 !/.gitignore
+!/README.md
 
 # --- never, even if a rule above would otherwise allow it ------------------
 # Listed last because the last matching rule wins.

@@ -9,7 +9,11 @@ Steers into the widest free gap in the LIDAR scan. No map, no centreline, no tra
 Ref: Sezer & Gokasan, "A novel obstacle avoidance algorithm: Follow the Gap Method",
 Robotics and Autonomous Systems 60(9), 2012.
 """
+import csv
+import os
 import sys
+import time
+
 import numpy as np
 
 # --- tunables -------------------------------------------------------------
@@ -20,11 +24,16 @@ GAP_THRESH = 1.0    # a beam counts as "free" beyond this range, m
 MAX_RANGE = 10.0    # bridge clips here anyway (range_max = 10.0)
 SMOOTH = 5          # boxcar window over ranges, beams
 MAX_STEER = 0.40    # steering angle mapped to command = 1.0, rad
-MAX_THROTTLE = 0.28
-MIN_THROTTLE = 0.10
+CLEARANCE = 3.0     # metres of forward room for full throttle
+MAX_THROTTLE = 0.40
+MIN_THROTTLE = 0.05
 STEER_SIGN = +1.0   # flip to -1.0 if the car steers the wrong way
+LOG_PATH = None     # set by --log; every completed lap is appended
 
 SCAN_TOPIC = '/autodrive/roboracer_1/lidar'
+LAPCOUNT_TOPIC = '/autodrive/roboracer_1/lap_count'
+LASTLAP_TOPIC = '/autodrive/roboracer_1/last_lap_time'
+COLLISION_TOPIC = '/autodrive/roboracer_1/collision_count'
 THROTTLE_TOPIC = '/autodrive/roboracer_1/throttle_command'
 STEERING_TOPIC = '/autodrive/roboracer_1/steering_command'
 
@@ -73,8 +82,12 @@ def plan(ranges, angle_min, angle_increment):
     # Slow for corners, and for anything close dead ahead.
     mid = scan.size // 2
     ahead = float(np.min(scan[max(0, mid - 20):mid + 20])) if scan.size > 40 else 0.0
-    throttle = MAX_THROTTLE * (1.0 - abs(steer_cmd)) ** 2 * np.clip(ahead / 3.0, 0.0, 1.0)
-    return steer_cmd, float(np.clip(throttle, MIN_THROTTLE, MAX_THROTTLE))
+    clearance = float(np.clip(ahead / CLEARANCE, 0.0, 1.0))
+    throttle = MAX_THROTTLE * (1.0 - abs(steer_cmd)) ** 2 * clearance
+    # The floor exists to beat static friction, so it must FADE with clearance. A fixed
+    # floor vetoes the very braking that avoids the wall -- and if MIN >= MAX it pins the
+    # throttle constant and disables speed control entirely.
+    return steer_cmd, float(np.clip(throttle, MIN_THROTTLE * clearance, MAX_THROTTLE))
 
 
 def selftest():
@@ -91,6 +104,13 @@ def selftest():
     # Mirror it -> steer right.
     steer_m, _ = plan(r[::-1], amin, inc)
     assert steer_m < -0.1, f'expected right turn, got {steer_m}'
+
+    # A wall close ahead must drive throttle to ~0 even with a floor set: the floor
+    # must never veto the braking. Regression for the bug where MIN >= MAX pinned it.
+    close = np.full(n, 8.0)
+    close[len(close) // 2 - 60:len(close) // 2 + 60] = 0.35
+    _, thr_close = plan(close, amin, inc)
+    assert thr_close < 0.02, f'floor vetoed braking: {thr_close}'
 
     # Wide open -> near straight, and faster than the cornering case.
     steer_o, thr_o = plan(np.full(n, 9.0), amin, inc)
@@ -123,12 +143,17 @@ def apply_overrides(argv):
     p.add_argument('--throttle', type=float, default=MAX_THROTTLE)
     p.add_argument('--min-throttle', type=float, default=MIN_THROTTLE)
     p.add_argument('--max-steer', type=float, default=MAX_STEER)
+    p.add_argument('--clearance', type=float, default=CLEARANCE)
     p.add_argument('--flip', action='store_true', help='invert steering sign')
+    p.add_argument('--log', default=None,
+                   help='CSV for per-lap results (default: auto-named)')
     a = p.parse_args(argv)
     g = globals()
+    g['LOG_PATH'] = a.log
     g['FOV'], g['BUBBLE_R'], g['BUBBLE_MAX'] = a.fov, a.bubble, a.bubble_max
     g['GAP_THRESH'], g['MAX_STEER'] = a.gap, a.max_steer
     g['MAX_THROTTLE'], g['MIN_THROTTLE'] = a.throttle, a.min_throttle
+    g['CLEARANCE'] = a.clearance
     if a.flip:
         g['STEER_SIGN'] = -STEER_SIGN
     print(f'fov={FOV} bubble={BUBBLE_R} gap={GAP_THRESH} '
@@ -141,7 +166,7 @@ def main(argv=None):
     from rclpy.node import Node
     from rclpy.qos import QoSProfile
     from sensor_msgs.msg import LaserScan
-    from std_msgs.msg import Float32
+    from std_msgs.msg import Float32, Int32
 
     class FollowTheGap(Node):
         def __init__(self):
@@ -150,16 +175,57 @@ def main(argv=None):
             self.pub_t = self.create_publisher(Float32, THROTTLE_TOPIC, qos)
             self.pub_s = self.create_publisher(Float32, STEERING_TOPIC, qos)
             self.create_subscription(LaserScan, SCAN_TOPIC, self.on_scan, qos)
+            self.create_subscription(Int32, LAPCOUNT_TOPIC, self.on_lap, qos)
+            self.create_subscription(
+                Float32, LASTLAP_TOPIC,
+                lambda m: setattr(self, 'last_lap', float(m.data)), qos)
+            self.create_subscription(
+                Int32, COLLISION_TOPIC,
+                lambda m: setattr(self, 'collisions', int(m.data)), qos)
+            path = LOG_PATH or f'ftg_laps_{time.strftime("%Y%m%d-%H%M%S")}.csv'
+            if os.path.dirname(path):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+            self._fh = open(path, 'w', newline='')
+            self._csv = csv.writer(self._fh)
+            self._csv.writerow(['lap', 'lap_time', 'collisions_lap', 'collisions_total',
+                                'fov', 'bubble', 'gap', 'max_throttle', 'max_steer'])
+            self.get_logger().info(f'logging laps to {path}')
+            self.laps = None
+            self.last_lap = 0.0
+            self.collisions = 0
+            self._col_at_lap = 0
             self.n = 0
             self.get_logger().info(f'listening on {SCAN_TOPIC}')
+
+        def on_lap(self, msg):
+            """Report each completed lap. lap_count incrementing is the only reliable
+            signal; last_lap_time then holds the duration of the lap just finished."""
+            n = int(msg.data)
+            if self.laps is not None and n > self.laps:
+                col = self.collisions - self._col_at_lap
+                # last_lap_time is inf until a lap has actually been completed; logging
+                # that would poison any mean computed from the file later.
+                if np.isfinite(self.last_lap):
+                    self.get_logger().info(
+                        f'LAP {n}: {self.last_lap:6.2f} s   '
+                        f'collisions this lap {col}   total {self.collisions}')
+                    self._csv.writerow([n, f'{self.last_lap:.3f}', col, self.collisions,
+                                        FOV, BUBBLE_R, GAP_THRESH, MAX_THROTTLE, MAX_STEER])
+                    self._fh.flush()
+                else:
+                    self.get_logger().info(f'LAP {n}: no time yet (first lap), not logged')
+                self._col_at_lap = self.collisions
+            self.laps = n
 
         def on_scan(self, msg):
             steer, throttle = plan(msg.ranges, msg.angle_min, msg.angle_increment)
             self.pub_s.publish(Float32(data=steer))
             self.pub_t.publish(Float32(data=throttle))
             self.n += 1
-            if self.n % 40 == 0:
-                self.get_logger().info(f'steer={steer:+.2f} throttle={throttle:.2f}')
+            if self.n % 200 == 0:
+                self.get_logger().info(
+                    f'steer={steer:+.2f} throttle={throttle:.2f} '
+                    f'lap_collisions={self.collisions - self._col_at_lap}')
 
     rclpy.init()
     node = FollowTheGap()
@@ -170,6 +236,7 @@ def main(argv=None):
     finally:
         node.pub_t.publish(Float32(data=0.0))   # don't leave it driving
         node.pub_s.publish(Float32(data=0.0))
+        node._fh.close()
         node.destroy_node()
         rclpy.shutdown()
 

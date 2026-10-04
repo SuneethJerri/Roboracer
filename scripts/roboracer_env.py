@@ -35,6 +35,7 @@ SCAN_TOPIC = '/autodrive/roboracer_1/lidar'
 ODOM_TOPIC = '/autodrive/roboracer_1/odom'
 IPS_TOPIC = '/autodrive/roboracer_1/ips'
 LAPTIME_TOPIC = '/autodrive/roboracer_1/lap_time'
+LASTLAP_TOPIC = '/autodrive/roboracer_1/last_lap_time'
 LAPCOUNT_TOPIC = '/autodrive/roboracer_1/lap_count'
 COLLISION_TOPIC = '/autodrive/roboracer_1/collision_count'
 THROTTLE_TOPIC = '/autodrive/roboracer_1/throttle_command'
@@ -68,17 +69,35 @@ def build_obs(ranges, speed, prev_action, n_beams=OBS_BEAMS):
     ]).astype(np.float32)
 
 
-def reset_confirmed(pre_lap_time, pre_pos, lap_time, pos, min_jump=0.5):
+def reset_confirmed(pre_lap_time, pre_pos, lap_time, pos, start_pos=None,
+                    max_start=1.0, min_jump=0.5, start_tol=0.6, start_max_time=4.0):
     """Did the simulator actually reset?
 
     The bridge latches reset_command and never acknowledges it, so there is no signal
-    to wait on. Infer it instead: the lap timer ran backwards, or the car teleported.
-    Without this check an episode can silently begin mid-track on stale data.
+    to wait on. Infer it instead. Without this an episode silently begins mid-track on
+    stale data, and nothing downstream would reveal it.
+
+    The lap-timer gate comes first and is not optional: a reset ALWAYS leaves the timer
+    near zero, so a large lap_time rules a reset out no matter what else looks right.
+    Position alone is not sufficient evidence — a moving car covers `min_jump` in the
+    ordinary course of driving, which reads as a teleport and confirms a reset that
+    never happened.
     """
+    pos = np.asarray(pos, dtype=float)
+    if start_pos is not None:
+        # Strongest test once the start line is known: is the car AT it? This is the only
+        # signal that survives the case where the car is already stationary near the start
+        # with a near-zero timer -- there is then no decrease and no jump to observe, and
+        # both of the heuristics below are blind.
+        # A looser timer bound here: the reset->observe round trip can easily exceed one
+        # second, and the car sitting ON the start line is already strong evidence.
+        return (lap_time < start_max_time
+                and float(np.linalg.norm(pos - np.asarray(start_pos, float))) < start_tol)
+    if lap_time >= max_start:
+        return False
     if lap_time < pre_lap_time - 1e-3:
         return True
-    return float(np.linalg.norm(np.asarray(pos, dtype=float)
-                                - np.asarray(pre_pos, dtype=float))) > min_jump
+    return float(np.linalg.norm(pos - np.asarray(pre_pos, dtype=float))) > min_jump
 
 
 def reward_mapfree(prev, cur, collision_penalty=5.0, lap_bonus=10.0):
@@ -118,15 +137,21 @@ class RoboRacerInterface:
         cmd_qos = QoSProfile(depth=1)
 
         self.scan = None
+        self.angle_min = -2.35619
+        self.angle_increment = 0.004363323
         self.speed = 0.0
         self.position = np.zeros(3)
         self.lap_time = 0.0
+        self.last_lap_time = 0.0
+        self.start_pos = None   # learned on the first confirmed reset
         self.laps = 0
         self.collisions = 0
         self._new_scan = threading.Event()
 
         def on_scan(m):
             self.scan = np.asarray(m.ranges, dtype=float)
+            self.angle_min = float(m.angle_min)
+            self.angle_increment = float(m.angle_increment)
             self._new_scan.set()
 
         def on_odom(m):
@@ -141,6 +166,9 @@ class RoboRacerInterface:
         self.node.create_subscription(
             Float32, LAPTIME_TOPIC, lambda m: setattr(self, 'lap_time', float(m.data)), qos)
         self.node.create_subscription(
+            Float32, LASTLAP_TOPIC,
+            lambda m: setattr(self, 'last_lap_time', float(m.data)), qos)
+        self.node.create_subscription(
             Int32, LAPCOUNT_TOPIC, lambda m: setattr(self, 'laps', int(m.data)), qos)
         self.node.create_subscription(
             Int32, COLLISION_TOPIC, lambda m: setattr(self, 'collisions', int(m.data)), qos)
@@ -152,7 +180,13 @@ class RoboRacerInterface:
 
         self._executor = rclpy.executors.MultiThreadedExecutor()
         self._executor.add_node(self.node)
-        threading.Thread(target=self._executor.spin, daemon=True).start()
+        self._spin = threading.Thread(target=self._executor.spin, daemon=True)
+        self._spin.start()
+
+    def now(self):
+        """Wall clock. AutoDRIVE runs at 1x real time, so this IS simulator time --
+        unlike f1tenth, where the two differ by ~45x."""
+        return time.time()
 
     def send(self, steering, throttle):
         self._pub_s.publish(self._Float32(data=float(np.clip(steering, -1.0, 1.0))))
@@ -165,8 +199,23 @@ class RoboRacerInterface:
 
     def state(self):
         return {'scan': self.scan, 'speed': self.speed, 'position': self.position,
-                'lap_time': self.lap_time, 'laps': self.laps,
-                'collisions': self.collisions}
+                'lap_time': self.lap_time, 'last_lap_time': self.last_lap_time,
+                'laps': self.laps, 'collisions': self.collisions}
+
+    def wait_for_peer(self, timeout=5.0):
+        """Block until the bridge has discovered our command publishers.
+
+        Receiving a scan only proves our SUBSCRIPTIONS matched. A message published
+        before the remote subscriber is discovered is dropped silently, so the first
+        reset of a session vanishes and the lap timer just keeps counting.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if (self._pub_r.get_subscription_count() > 0
+                    and self._pub_t.get_subscription_count() > 0):
+                return True
+            time.sleep(0.05)
+        return False
 
     def reset(self, timeout=5.0, settle=0.3):
         """Pulse reset and confirm it happened.
@@ -175,26 +224,42 @@ class RoboRacerInterface:
         True would reset forever. Pulse True then False, exactly as teleop_keyboard does,
         then verify from telemetry rather than trusting it.
         """
+        if not self.wait_for_peer():
+            raise TimeoutError('bridge never subscribed to our command topics — '
+                               'is bringup_headless running?')
         pre_lap_time, pre_pos = self.lap_time, np.array(self.position)
         self.send(0.0, 0.0)
-        self._pub_r.publish(self._Bool(data=True))
-        time.sleep(settle)
-        self._pub_r.publish(self._Bool(data=False))     # de-latch
-
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if not self.wait_for_scan(timeout=0.5):
-                continue
-            if reset_confirmed(pre_lap_time, pre_pos, self.lap_time, self.position):
-                return self.state()
+        # HOLD the flag until the reset is observed, rather than pulsing for a fixed
+        # time and hoping. A 0.3 s pulse is a race the simulator can lose when it is
+        # busy; holding costs nothing because repeated resets are idempotent.
+        try:
+            self._pub_r.publish(self._Bool(data=True))
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if not self.wait_for_scan(timeout=0.5):
+                    continue
+                if reset_confirmed(pre_lap_time, pre_pos, self.lap_time, self.position,
+                                   start_pos=self.start_pos):
+                    if self.start_pos is None:
+                        self.start_pos = np.array(self.position)
+                    return self.state()
+        finally:
+            self._pub_r.publish(self._Bool(data=False))  # de-latch, always
         raise TimeoutError(
             f'reset not confirmed in {timeout}s (lap_time {pre_lap_time:.2f}->'
             f'{self.lap_time:.2f}). Is the simulator connected and in Autonomous mode?')
 
     def close(self):
+        # Order matters: stop the executor and let its thread exit before destroying the
+        # node, or rclpy raises "cannot use Destroyable because destruction was requested"
+        # from the still-spinning thread.
         self.send(0.0, 0.0)
         self._executor.shutdown()
-        self.node.destroy_node()
+        self._spin.join(timeout=2.0)
+        try:
+            self.node.destroy_node()
+        except Exception:
+            pass
 
 
 # ------------------------------------------------------------------ gymnasium env
@@ -275,6 +340,19 @@ def selftest():
     assert reset_confirmed(0.05, [30, 12, 0], 0.06, [1, 1, 0])
     # A normal mid-lap frame must NOT read as a reset, or episodes start on stale data.
     assert not reset_confirmed(10.0, [1, 1, 0], 10.1, [1.05, 1.0, 0])
+    # Regression, observed live: a car simply DRIVING covers min_jump in the ordinary
+    # course of things. Without the lap-timer gate this confirmed a reset 14 s into a lap.
+    assert not reset_confirmed(13.9, [0.8, 3.2, 0], 13.99, [0.88, 3.71, 0])
+    assert not reset_confirmed(5.0, [0, 0, 0], 5.1, [9, 9, 0]), 'big jump, but timer says no'
+    # Once the start line is known, proximity to it is the test. Regression for a car
+    # sitting stationary at the start with a near-zero timer: no decrease, no jump, but
+    # genuinely reset.
+    START = [0.80, 3.16, 0.06]
+    assert reset_confirmed(0.20, START, 0.40, [0.81, 3.15, 0.06], start_pos=START)
+    assert not reset_confirmed(0.20, START, 0.40, [12.0, 7.0, 0.06], start_pos=START)
+    assert not reset_confirmed(0.20, START, 9.9, [0.80, 3.16, 0.06], start_pos=START)
+    # Regression: the observe round trip took >1 s, so the timer already read 1.20.
+    assert reset_confirmed(0.80, START, 1.20, [0.82, 3.17, 0.06], start_pos=START)
 
     # Reward: collisions hurt, laps pay, and only on the transition.
     base = {'speed': 4.0, 'collisions': 0, 'laps': 0}
@@ -286,9 +364,77 @@ def selftest():
     print('selftest OK')
 
 
+def check_link(seconds=4.0, throttle=0.35):
+    """Both headless gates in one process: is the LIDAR alive, and does the car drive?
+
+    Shell pipelines are awkward here because `ros2 topic pub` never returns, so this keeps
+    everything in one process and gives each gate a clean verdict.
+    """
+    iface = RoboRacerInterface(node_name='check_link')
+    try:
+        print('GATE 1  waiting for a LIDAR scan (10s)...')
+        if not iface.wait_for_scan(timeout=10.0):
+            print('  FAIL  no scan. Either the simulator never connected (check the bridge')
+            print('        terminal for "Connected!"), or the GPU raycaster needs rendering.')
+            return
+        print(f'  PASS  scan arriving, {len(iface.scan)} beams, '
+              f'min={iface.scan.min():.2f} max={iface.scan.max():.2f}')
+
+        if not iface.wait_for_peer():
+            print('GATE 2  FAIL  the bridge never subscribed to our command topics.')
+            return
+        p0 = np.array(iface.position)
+        print(f'GATE 2  throttle={throttle} for {seconds}s from ({p0[0]:.2f}, {p0[1]:.2f})...')
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            iface.send(0.0, throttle)
+            iface.wait_for_scan(timeout=1.0)
+        iface.send(0.0, 0.0)
+        p1 = np.array(iface.position)
+        d = float(np.linalg.norm(p1 - p0))
+        print(f'        moved {d:.2f} m to ({p1[0]:.2f}, {p1[1]:.2f}), speed={iface.speed:.2f}')
+        print('  PASS  the car drives. Autonomous IS reachable headless.' if d > 0.5 else
+              '  FAIL  no movement. Driving Mode is still Manual, and it has no CLI toggle.')
+    finally:
+        iface.close()
+
+
+def check_reset(episodes=3, steps=60):
+    """Exercise the reset handshake against a live simulator.
+
+    The one part unit tests cannot reach: whether pulse-and-confirm actually detects a
+    reset on the real bridge. A silently failing reset starts every episode on stale
+    mid-track data, and nothing downstream would show it.
+    """
+    iface = RoboRacerInterface()
+    print('waiting for the first scan...')
+    if not iface.wait_for_scan(timeout=10.0):
+        raise TimeoutError('no scan — is the bridge up and the simulator connected?')
+    try:
+        for ep in range(episodes):
+            st = iface.reset()
+            print(f'episode {ep}: reset confirmed, lap_time={st["lap_time"]:.2f} '
+                  f'pos=({st["position"][0]:.2f}, {st["position"][1]:.2f})')
+            for _ in range(steps):
+                iface.send(np.random.uniform(-0.3, 0.3), 0.10)
+                iface.wait_for_scan()
+            st = iface.state()
+            print(f'           after {steps} steps: lap_time={st["lap_time"]:.2f} '
+                  f'collisions={st["collisions"]}')
+        print('\nreset handshake OK')
+    finally:
+        iface.close()
+
+
 if __name__ == '__main__':
     if '--selftest' in sys.argv:
         selftest()
+    elif '--check-link' in sys.argv:
+        check_link()
+    elif '--check-reset' in sys.argv:
+        check_reset()
     else:
         print(__doc__.strip().splitlines()[0])
-        print('\nRun with --selftest, or import RoboRacerInterface / make_env.')
+        print('\n  --selftest      pure logic, no ROS')
+        print('  --check-link    headless gates: LIDAR alive, and does the car drive')
+        print('  --check-reset   exercise the reset handshake against a live simulator')

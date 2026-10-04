@@ -16,7 +16,11 @@ Noise: J is observed as J(θ) + [θᵀ,1]·z,  z ~ N(0, σ²I).
 Gains, bounds and theta_0 are taken verbatim from the authors' published MATLAB
 (github.com/cs1070166/1RDSA-2Cand1RDSA-1C, onespsa.m / hadamardpert.m), not guessed.
 """
+import csv
+import os
 import sys
+import time
+
 import numpy as np
 
 ALPHA, GAMMA = 0.602, 0.101          # Spall's finite-sample exponents
@@ -151,21 +155,49 @@ def run(kind='quadratic', family='bernoulli', sigma=0.0, budget=2000, p=10,
     return float(np.sum((theta - theta_star) ** 2) / denom0)
 
 
-def sweep(kind='quadratic', budget=2000, reps=20, seed=0):
-    """NMSE against noise level, per perturbation family."""
+FIELDS = ['objective', 'family', 'sigma', 'budget', 'p',
+          'a', 'c', 'A_stab', 'alpha', 'gamma', 'seed', 'nmse']
+
+
+def sweep(kind='quadratic', budget=2000, reps=20, seed=0, out=None, p=10):
+    """NMSE against noise level, per perturbation family.
+
+    Writes one row PER REPLICATION, not per median: aggregation can always be redone
+    from raw rows, but a median cannot be un-taken. Every row carries the full config so
+    a result is reproducible from the file alone, without the invoking command.
+    """
+    if out is None:
+        out = f'spsa_sweep_{kind}_{time.strftime("%Y%m%d-%H%M%S")}.csv'
+    if os.path.dirname(out):
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+
     sigmas = np.concatenate([[0.0], np.logspace(-4, 0, 9)])
-    print(f'{kind}, budget={budget}, {reps} reps, median NMSE\n')
+    print(f'{kind}, budget={budget}, {reps} reps, median NMSE -> {out}\n')
     print(f'{"sigma":>10} ' + ''.join(f'{n:>14}' for n in FAMILIES))
-    for s in sigmas:
-        row = []
-        for name in FAMILIES:
-            vals = [run(kind, name, s, budget, seed=seed + r) for r in range(reps)]
-            row.append(float(np.median(vals)))
-        best = min(range(len(row)), key=lambda i: row[i])
-        cells = ''.join(f'{v:>13.3e}' + ('*' if i == best else ' ')
-                        for i, v in enumerate(row))
-        print(f'{s:>10.4g} {cells}')
-    print('\n* = best at that noise level. A flip between rows is the crossover.')
+
+    with open(out, 'w', newline='') as fh:
+        w = csv.DictWriter(fh, fieldnames=FIELDS)
+        w.writeheader()
+        for sg in sigmas:
+            medians = []
+            for name in FAMILIES:
+                vals = []
+                for r in range(reps):
+                    v = run(kind, name, sg, budget, p=p, seed=seed + r)
+                    vals.append(v)
+                    w.writerow({'objective': kind, 'family': name, 'sigma': sg,
+                                'budget': budget, 'p': p, 'a': A_GAIN, 'c': C_GAIN,
+                                'A_stab': A_STAB, 'alpha': ALPHA, 'gamma': GAMMA,
+                                'seed': seed + r, 'nmse': v})
+                medians.append(float(np.median(vals)))
+            best = min(range(len(medians)), key=lambda i: medians[i])
+            cells = ''.join(f'{v:>13.3e}' + ('*' if i == best else ' ')
+                            for i, v in enumerate(medians))
+            print(f'{sg:>10.4g} {cells}')
+
+    n = len(sigmas) * len(FAMILIES) * reps
+    print(f'\n* = best at that noise level. A flip between rows is the crossover.')
+    print(f'{n} rows written to {out}')
 
 
 # ------------------------------------------------------------------------------------ checks
@@ -227,10 +259,11 @@ def main(argv):
     q.add_argument('-a', type=float, default=0.5)
     q.add_argument('-c', type=float, default=0.1)
     q.add_argument('--sweep', action='store_true')
+    q.add_argument('--out', default=None, help='CSV path for --sweep results')
     o = q.parse_args(argv)
 
     if o.sweep:
-        sweep(o.objective, o.budget, o.reps)
+        sweep(o.objective, o.budget, o.reps, out=o.out)
         return
     vals = [run(o.objective, o.family, o.sigma, o.budget, a=o.a, c=o.c, seed=r)
             for r in range(o.reps)]
