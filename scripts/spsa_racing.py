@@ -50,7 +50,8 @@ def to_unit(real):
     return np.array([(v - lo) / (hi - lo) for v, (_, lo, hi) in zip(real, GAINS)])
 
 
-def score(lap_times, collisions, laps_wanted, t_max=T_MAX, penalty=PENALTY):
+def score(lap_times, collisions, laps_wanted, t_max=T_MAX, penalty=PENALTY,
+          progress=0.0):
     """Lap time plus a GRADED collision penalty. Lower is better.
 
     Not a hard failure on any collision. The baseline controller collides on ~24% of
@@ -62,7 +63,15 @@ def score(lap_times, collisions, laps_wanted, t_max=T_MAX, penalty=PENALTY):
     and adapted on a slower timescale in the constrained version.
     """
     if len(lap_times) < laps_wanted:
-        return t_max                      # genuinely failed to finish
+        # Graded by how far it got, not a flat failure. A flat T_MAX makes the objective
+        # a cliff: every incomplete rollout scores identically, so the SPSA difference is
+        # zero and carries no information. Scaling by distance NOT covered gives a
+        # gradient everywhere, which is what lets the optimiser climb back into the
+        # feasible region instead of stalling outside it.
+        # progress is CLAMPED here. It can legitimately exceed 1 (the arc counter keeps
+        # running past the start line), and an unclamped 1.999 collapses this to 0.17 --
+        # a failed rollout scoring better than any finished lap.
+        return t_max * (2.0 - min(max(progress, 0.0), 1.0))
     return float(np.mean(lap_times)) + penalty * collisions
 
 
@@ -105,7 +114,9 @@ def rollout(iface, u, laps_wanted=1, timeout=60.0):
     iface.send(0.0, 0.0)
     # t_max = timeout keeps the ordering sound: anything that FINISHED did so before
     # the deadline, so it necessarily scores below a rollout that did not.
-    return score(lap_times, iface.collisions - start_col, laps_wanted, t_max=timeout)
+    prog = getattr(iface, 'progress', lambda: 0.0)()
+    return score(lap_times, iface.collisions - start_col, laps_wanted,
+                 t_max=timeout, progress=prog)
 
 
 # ------------------------------------------------------------------------------- SPSA
@@ -135,7 +146,7 @@ def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
             # cap moves u by >10 box-widths and pins every gain to a corner for the rest
             # of the run. Bounding how far a single noisy measurement can move us is the
             # same instinct as the hypercube projection in Spall's own code.
-            if yp >= timeout and ym >= timeout:
+            if yp >= 2.0 * timeout and ym >= 2.0 * timeout:
                 # Both probes failed, so the difference is exactly zero and SPSA stalls
                 # here forever -- it has no gradient and no way out. Jump instead.
                 u = np.clip(u + rng.normal(0, 2 * cn, size=P), 0.0, 1.0)
@@ -177,6 +188,16 @@ def selftest():
     assert to_real([1.0]*P)[0] == 2.00 and to_real([1.0]*P)[4] == 0.80
     # A slow but COMPLETED lap must beat a timeout, whatever the track's scale.
     assert score([250.0], 0, 1, t_max=300.0) < score([], 0, 1, t_max=300.0)
+    # Progress must be graded: getting 90% round beats getting 10%, and both beat nothing.
+    assert score([], 0, 1, t_max=200., progress=0.9) < score([], 0, 1, t_max=200., progress=0.1)
+    assert score([], 0, 1, t_max=200., progress=1.0) < score([], 0, 1, t_max=200., progress=0.0)
+    # ...and any completed lap still beats any incomplete one.
+    assert score([199.0], 0, 1, t_max=200.) < score([], 0, 1, t_max=200., progress=0.99)
+    # Regression: progress can exceed 1 when the arc counter runs past the start line.
+    # Unclamped, progress=1.999 scored 0.17 -- the worst outcome looking like the best.
+    assert score([], 0, 1, t_max=200., progress=1.999) == 200.0
+    assert score([], 0, 1, t_max=200., progress=5.0) == 200.0
+    assert score([36.0], 0, 1, t_max=200.) < score([], 0, 1, t_max=200., progress=99.0)
 
     # Collisions are priced, not fatal -- a clean lap still beats a dirty one.
     assert np.isclose(score([25.0], 0, 1), 25.0)
@@ -188,8 +209,8 @@ def selftest():
     # Regression: the simulator reported -7.83 s after a mid-lap reset.
 
     # Failing to finish is the only hard failure.
-    assert score([], 0, 1) == T_MAX
-    assert score([25.0], 0, 2) == T_MAX
+    assert score([], 0, 1) == 2.0 * T_MAX
+    assert score([25.0], 0, 2) == 2.0 * T_MAX
     assert np.isclose(score([20.0, 24.0], 0, 2), 22.0)
 
     print('selftest OK')

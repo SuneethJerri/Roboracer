@@ -62,11 +62,52 @@ class F1TenthInterface:
         self._start = self._start_pose()
         self._action = (0.0, 0.0)
         self._steps = 0
+        self._arc = self._arc_max = 0.0
+        self._last_s = None
         self._collisions = 0
         self._was_colliding = False
         self.start_pos = None
         self._obs = None
         self.reset()
+
+    def progress(self):
+        """Furthest point reached around the circuit, as a fraction of a lap.
+
+        Turns a pass/fail objective into a continuous one: without it every incomplete
+        rollout scores identically, the SPSA difference is zero, and the optimiser sees a
+        cliff instead of a gradient.
+
+        Two wrong measures were tried first. Raw Frenet arc-length WRAPS -- the car starts
+        at s=0, so a hair of backward drift reads as s~=track_length and a rollout that
+        went nowhere looks finished. Odometry does not wrap but does not track the
+        CIRCUIT: a car wandering 400 m inside one corner scores a full lap. This is
+        cumulative arc-length with wrap detection, and the furthest point reached.
+        """
+        return float(self._arc_max / self.track_length())
+
+    def _track_arc(self):
+        """Accumulate signed arc-length, unwrapping at the start/finish line."""
+        L = self.track_length()
+        try:
+            s, _, _ = self.env.unwrapped.track.cartesian_to_frenet(
+                float(self._obs['poses_x'][0]), float(self._obs['poses_y'][0]),
+                float(self._obs['poses_theta'][0]))
+        except Exception:
+            return
+        if self._last_s is not None:
+            ds = s - self._last_s
+            if ds > L / 2:                 # jumped back past the line
+                ds -= L
+            elif ds < -L / 2:              # crossed the line forwards
+                ds += L
+            self._arc += ds
+            self._arc_max = max(self._arc_max, self._arc)
+        self._last_s = s
+
+    def track_length(self):
+        c = self.env.unwrapped.track.centerline
+        xs, ys = np.asarray(c.xs), np.asarray(c.ys)
+        return float(np.sum(np.hypot(np.diff(xs), np.diff(ys))))
 
     def min_plausible_lap(self):
         """Shortest lap the vehicle could physically drive: track length / top speed.
@@ -75,10 +116,7 @@ class F1TenthInterface:
         reports a lap far faster than the car can move. Those are spurious counts, not
         fast laps, and without this guard they look like the best result in a search.
         """
-        c = self.env.unwrapped.track.centerline
-        xs, ys = np.asarray(c.xs), np.asarray(c.ys)
-        length = float(np.sum(np.hypot(np.diff(xs), np.diff(ys))))
-        return length / self.max_speed
+        return self.track_length() / self.max_speed
 
     def _start_pose(self):
         """First centreline point, heading toward the second."""
@@ -110,6 +148,19 @@ class F1TenthInterface:
 
     @property
     def laps(self):
+        """Laps completed, counted from OUR arc-length, not the simulator's lap_counts.
+
+        f1tenth's lap_counts does not reset with the environment and stops incrementing
+        after the first lap: a car that drove an identical 36.2 s lap on three successive
+        resets reported laps=1, 1, 1. Arc-length is reset with the rollout and is
+        monotone, so a completed lap is unambiguous.
+        """
+        return int(self._arc_max / self.track_length())
+
+    @property
+    def sim_lap_counts(self):
+        """The simulator's own counter, kept for comparison. See `laps` for why it is
+        not used."""
         return int(self._obs['lap_counts'][0])
 
     @property
@@ -151,6 +202,7 @@ class F1TenthInterface:
         obs, _, term, trunc, _ = self.env.step(np.array([[s, v]]))
         self._absorb(obs)
         self._steps += 1
+        self._track_arc()
         return not (term or trunc)
 
     def reset(self, **kw):
@@ -158,6 +210,8 @@ class F1TenthInterface:
         self._absorb(obs)
         self._action = (0.0, 0.0)
         self._steps = 0
+        self._arc = self._arc_max = 0.0
+        self._last_s = None
         self._collisions = 0
         self._was_colliding = bool(obs['collisions'][0])
         if self.start_pos is None:
