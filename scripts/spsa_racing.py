@@ -335,7 +335,7 @@ def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
                 # Both probes failed, so the difference is exactly zero and SPSA stalls
                 # here forever -- it has no gradient and no way out. Jump instead.
                 u = np.clip(u + rng.normal(0, 2 * cn, size=P), 0.0, 1.0)
-                print(f'{n:3d}  both probes failed -- random restart')
+                print(f'{n:3d}  both probes failed -- random restart', flush=True)
                 # Log it anyway. Skipping the write makes a failed run look like a short
                 # successful one, which is how the first f1tenth run read as 4 iterations
                 # when 40 had actually been spent.
@@ -355,8 +355,13 @@ def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
             row.update({name: v for (name, _, _), v in zip(GAINS, real)})
             w.writerow(row)
             fh.flush()                               # survive a Ctrl-C mid-run
+            # flush: stdout is block-buffered when redirected, so an unflushed run
+            # shows nothing at all until it exits -- which makes a multi-hour background
+            # sweep indistinguishable from a hung one. The CSV is already flushed per
+            # row; the log should be too.
             print(f'{n:3d}  y+={yp:6.2f}  y-={ym:6.2f}  ' +
-                  '  '.join(f'{nm}={v:.3f}' for (nm, _, _), v in zip(GAINS, real)))
+                  '  '.join(f'{nm}={v:.3f}' for (nm, _, _), v in zip(GAINS, real)),
+                  flush=True)
 
     print(f'\nfinal gains: ' +
           '  '.join(f'--{nm.lower().replace("_", "-")} {v:.3f}'
