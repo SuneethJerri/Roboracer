@@ -20,6 +20,8 @@ import time
 
 import numpy as np
 
+from typing import NamedTuple
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import follow_the_gap as ftg                                    # noqa: E402
 
@@ -51,7 +53,7 @@ def to_unit(real):
 
 
 def score(lap_times, collisions, laps_wanted, t_max=T_MAX, penalty=PENALTY,
-          progress=0.0):
+          progress=0.0, ref_lap=None):
     """Lap time plus a GRADED collision penalty. Lower is better.
 
     Not a hard failure on any collision. The baseline controller collides on ~24% of
@@ -68,10 +70,17 @@ def score(lap_times, collisions, laps_wanted, t_max=T_MAX, penalty=PENALTY,
         # zero and carries no information. Scaling by distance NOT covered gives a
         # gradient everywhere, which is what lets the optimiser climb back into the
         # feasible region instead of stalling outside it.
-        # progress is CLAMPED here. It can legitimately exceed 1 (the arc counter keeps
-        # running past the start line), and an unclamped 1.999 collapses this to 0.17 --
-        # a failed rollout scoring better than any finished lap.
-        return t_max * (2.0 - min(max(progress, 0.0), 1.0))
+        # Scale the failure penalty to a TYPICAL LAP, not the timeout. Against laps of
+        # 35-50 s a timeout-scaled failure scores ~378, so one failed probe makes the
+        # SPSA difference ~340 where an informative one is ~5 -- a 70x ratio that lets
+        # failures dictate every direction they appear in. ref_lap keeps failures clearly
+        # worse than any finished lap while staying on the same scale as the signal.
+        #
+        # progress is CLAMPED: it can legitimately exceed 1 (the arc counter runs past
+        # the start line), and unclamped, progress=1.999 collapsed this to 0.17 -- the
+        # worst outcome scoring better than the best.
+        ref = ref_lap if ref_lap is not None else t_max
+        return ref * (2.0 - min(max(progress, 0.0), 1.0))
     return float(np.mean(lap_times)) + penalty * collisions
 
 
@@ -82,8 +91,25 @@ def apply_gains(real):
 
 
 # ------------------------------------------------------------------------ the rollout
-def rollout(iface, u, laps_wanted=1, timeout=60.0):
-    """Reset, drive, and return the projected lap time for gains `u`."""
+class Rollout(NamedTuple):
+    """What one rollout measured.
+
+    `feasible` is REPORTED, never inferred from `score`. Recovering it by threshold --
+    `score < timeout` -- is what broke the parallel search: under ref_lap scaling a total
+    failure scores 2*ref_lap (140 at ref_lap=70), which is below timeout=300, so every
+    failure counted as a completed lap. A threshold is fragile in principle too: a 75 s
+    lap with ref_lap=70 misclassifies. The rollout knows the answer; it should say it.
+    """
+    score: float
+    feasible: bool
+    laps: int
+    collisions: int
+    progress: float
+    circuit: str
+
+
+def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None):
+    """Reset, drive, and report what happened for gains `u`."""
     apply_gains(to_real(u))
     iface.reset()
     start_laps, start_col = iface.laps, iface.collisions
@@ -115,13 +141,17 @@ def rollout(iface, u, laps_wanted=1, timeout=60.0):
     # t_max = timeout keeps the ordering sound: anything that FINISHED did so before
     # the deadline, so it necessarily scores below a rollout that did not.
     prog = getattr(iface, 'progress', lambda: 0.0)()
-    return score(lap_times, iface.collisions - start_col, laps_wanted,
-                 t_max=timeout, progress=prog)
+    cols = iface.collisions - start_col
+    return Rollout(score=score(lap_times, cols, laps_wanted, t_max=timeout,
+                               progress=prog, ref_lap=ref_lap),
+                   feasible=len(lap_times) >= laps_wanted,
+                   laps=len(lap_times), collisions=cols, progress=prog,
+                   circuit=getattr(iface, 'map_name', ''))
 
 
 # ------------------------------------------------------------------------------- SPSA
 def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
-         max_step=0.10, timeout=60.0):
+         max_step=0.10, timeout=60.0, ref_lap=None):
     if out is None:
         out = f'spsa_racing_{time.strftime("%Y%m%d-%H%M%S")}.csv'
     if os.path.dirname(out):
@@ -140,8 +170,8 @@ def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
             an = a / (n + 1 + A_stab) ** ALPHA
             cn = c / (n + 1) ** GAMMA
             d = rng.choice([-1.0, 1.0], size=P)     # Bernoulli: finite inverse moment
-            yp = rollout(iface, u + cn * d, laps, timeout)
-            ym = rollout(iface, u - cn * d, laps, timeout)
+            yp = rollout(iface, u + cn * d, laps, timeout, ref_lap).score
+            ym = rollout(iface, u - cn * d, laps, timeout, ref_lap).score
             # Clip the step. One T_MAX rollout makes (y+ - y-) ~ -70, which without a
             # cap moves u by >10 box-widths and pins every gain to a corner for the rest
             # of the run. Bounding how far a single noisy measurement can move us is the
@@ -208,6 +238,19 @@ def selftest():
     # Lap times are wall-clock measured, so they are always positive and plausible.
     # Regression: the simulator reported -7.83 s after a mid-lap reset.
 
+    # Feasibility is REPORTED, never inferred from the score. Thresholding `score <
+    # timeout` counted 98% of 42 configs feasible when 40% were: under ref_lap scaling a
+    # total failure scores 2*ref_lap (140 at ref_lap=70), which is below timeout=300, so
+    # every failure read as a completed lap. One measured example: score=104.2 with
+    # laps=0 and timeout=120, a rollout that never finished, counted as one that did.
+    assert score([], 0, 1, t_max=200., progress=0.0, ref_lap=70.) == 140.0
+    assert score([50.0], 0, 1, t_max=200., ref_lap=70.) < score([], 0, 1, t_max=200.,
+                                                                progress=0.99, ref_lap=70.)
+    fail = score([], 0, 1, t_max=300., progress=0.0, ref_lap=70.)
+    assert fail < 300.0, 'a total failure scores BELOW the timeout -- hence no threshold'
+    # ...and a slow finished lap scores ABOVE ref_lap, so no threshold separates the two.
+    assert score([75.0], 0, 1, t_max=300., ref_lap=70.) > 70.0
+
     # Failing to finish is the only hard failure.
     assert score([], 0, 1) == 2.0 * T_MAX
     assert score([25.0], 0, 2) == 2.0 * T_MAX
@@ -222,6 +265,9 @@ def main(argv):
     q.add_argument('--iters', type=int, default=40)
     q.add_argument('--laps', type=int, default=1, help='laps per rollout')
     q.add_argument('-a', type=float, default=0.01)
+    q.add_argument('--ref-lap', type=float, default=None,
+                   help='scale the failure penalty to a typical lap rather than to the '
+                        'timeout; keeps failures on the signal scale')
     q.add_argument('--max-step', type=float, default=0.10,
                    help='cap on |step| per coordinate, in normalised units')
     q.add_argument('-c', type=float, default=0.08, help='set from the measured noise floor')
@@ -250,7 +296,7 @@ def main(argv):
             raise TimeoutError('no scan — is the bridge up and the simulator connected?')
     try:
         spsa(iface, o.iters, o.laps, o.a, o.c, seed=o.seed, out=o.out,
-             max_step=o.max_step, timeout=o.timeout)
+             max_step=o.max_step, timeout=o.timeout, ref_lap=o.ref_lap)
     finally:
         iface.close()
 
