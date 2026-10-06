@@ -58,6 +58,7 @@ class F1TenthInterface:
                             config={'num_agents': 1, 'map': map_name,
                                     'control_input': ['speed', 'steering_angle']},
                             render_mode=None)
+        self.map_name = map_name        # rollout() keys normalisation off this
         self.max_speed, self.max_steer = max_speed, max_steer
         self._start = self._start_pose()
         self._action = (0.0, 0.0)
@@ -206,6 +207,16 @@ class F1TenthInterface:
         return not (term or trunc)
 
     def reset(self, **kw):
+        # f1tenth_gym keeps ONE ScanSimulator2D as a RaceCar CLASS attribute
+        # (base_classes.py:57) and points it at a map only in F110Env.__init__, so with
+        # two envs alive the older one's LIDAR -- and the collisions and lap counts
+        # derived from it -- come from the newer one's map (notebook B7). Take the
+        # raytracer back whenever someone else holds it. The guard reads the simulator's
+        # OWN loaded track rather than our bookkeeping, so it cannot drift; 95 ms, paid
+        # only on an actual change, against a ~2.5 s rollout.
+        from f1tenth_gym.envs.base_classes import RaceCar
+        if RaceCar.scan_simulator.track.spec.name != self.map_name:
+            RaceCar.scan_simulator.set_map(self.env.unwrapped.track)
         obs, _ = self.env.reset(options={'poses': self._start[None, :]})
         self._absorb(obs)
         self._action = (0.0, 0.0)
@@ -236,6 +247,19 @@ def selftest():
     s = clip_scan([0.0, 5.0, 25.0, np.inf, np.nan])
     assert np.allclose(s, [0.0, 5.0, 10.0, 10.0, 0.0])
     assert s.max() <= MAX_RANGE
+
+    # B7: two live envs share one raytracer, so each must take it back on reset.
+    # Checking the loaded track by name is what the bug actually was -- a scan can
+    # coincide between maps, an identity cannot. Two env builds, so it goes last.
+    a, b = F1TenthInterface('Austin'), F1TenthInterface('Oschersleben')
+    for ifc, want in ((a, 'Austin'), (b, 'Oschersleben')):
+        ifc.reset()
+        from f1tenth_gym.envs.base_classes import RaceCar
+        assert RaceCar.scan_simulator.track.spec.name == want, (
+            f'reset() left the shared raytracer on '
+            f'{RaceCar.scan_simulator.track.spec.name}, not {want}')
+    assert abs(a.track_length() - b.track_length()) > 50.0, 'these two differ by >50 m'
+    a.close(), b.close()
 
     print('selftest OK')
 
