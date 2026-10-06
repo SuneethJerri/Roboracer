@@ -98,7 +98,8 @@ class Rollout(NamedTuple):
     `score < timeout` -- is what broke the parallel search: under ref_lap scaling a total
     failure scores 2*ref_lap (140 at ref_lap=70), which is below timeout=300, so every
     failure counted as a completed lap. A threshold is fragile in principle too: a 75 s
-    lap with ref_lap=70 misclassifies. The rollout knows the answer; it should say it.
+    lap with ref_lap=70 misclassifies, and under D5 normalisation scores are ratios, so
+    no fixed threshold exists at all. The rollout knows the answer; it should say it.
     """
     score: float
     feasible: bool
@@ -108,8 +109,22 @@ class Rollout(NamedTuple):
     circuit: str
 
 
-def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None):
-    """Reset, drive, and report what happened for gains `u`."""
+def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None, normalize=False):
+    """Reset, drive, and report what happened for gains `u`.
+
+    `normalize` divides the score by the circuit's frozen baseline (D5) and, unless
+    `ref_lap` is given, scales the failure penalty by that same baseline. Both are keyed
+    off the interface's own circuit so a caller cannot forget one and not the other --
+    a global ref_lap would charge Shanghai and IMS the same failure cost despite a 2x
+    lap-time difference, smuggling back exactly the length weighting D5 removes.
+    """
+    circuit = getattr(iface, 'map_name', '')
+    base = None
+    if normalize:
+        import circuits          # lazy: this module still runs with no map infrastructure
+        base = circuits.baseline(circuit)
+        if ref_lap is None:
+            ref_lap = base
     apply_gains(to_real(u))
     iface.reset()
     start_laps, start_col = iface.laps, iface.collisions
@@ -142,26 +157,87 @@ def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None):
     # the deadline, so it necessarily scores below a rollout that did not.
     prog = getattr(iface, 'progress', lambda: 0.0)()
     cols = iface.collisions - start_col
-    return Rollout(score=score(lap_times, cols, laps_wanted, t_max=timeout,
-                               progress=prog, ref_lap=ref_lap),
+    sc = score(lap_times, cols, laps_wanted,
+               t_max=timeout, progress=prog, ref_lap=ref_lap)
+    return Rollout(score=sc / base if base else sc,
                    feasible=len(lap_times) >= laps_wanted,
                    laps=len(lap_times), collisions=cols, progress=prog,
-                   circuit=getattr(iface, 'map_name', ''))
+                   circuit=circuit)
+
+
+# -------------------------------------------------------------- multi-circuit measurement
+class CircuitPool:
+    """Interfaces built on demand and reused, one per circuit.
+
+    Building an env costs ~2-3 s of numba JIT, so a fresh one per rollout would dominate
+    a 2 s rollout. Only circuits actually drawn get built.
+
+    ponytail: serial over the drawn circuits -- 2k rollouts per iteration, so ~10 s at
+    k=3 and ~10 min for a 40-iteration run. Push the inner loop through
+    parallel_eval's Pool if that ever becomes the bottleneck.
+    """
+
+    def __init__(self, factory):
+        self._factory, self._cache = factory, {}
+
+    def get(self, track):
+        if track not in self._cache:
+            self._cache[track] = self._factory(track)
+        return self._cache[track]
+
+    def close(self):
+        for ifc in self._cache.values():
+            try:
+                ifc.close()
+            except Exception:
+                pass
+        self._cache.clear()
+
+
+class Meas(NamedTuple):
+    """One measurement of `u` over a circuit draw."""
+    score: float        # mean normalised score over the draw
+    feasible: bool      # all-of
+    rollouts: tuple
+
+
+def measure(pool, u, tracks, laps=1, timeout=250.0, ref_lap=None):
+    """Measure `u` over `tracks`.
+
+    `feasible` is all-of: a gain set that finishes 2 of 3 circuits has not solved the
+    task, and treating it as feasible would let the optimiser bank a cheap mean by
+    abandoning the hardest circuit in the draw.
+
+    """
+    rs = [rollout(pool.get(t), u, laps, timeout, ref_lap, normalize=True)
+          for t in tracks]
+    return Meas(score=float(np.mean([r.score for r in rs])),
+                feasible=all(r.feasible for r in rs),
+                rollouts=tuple(rs))
 
 
 # ------------------------------------------------------------------------------- SPSA
 def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
-         max_step=0.10, timeout=60.0, ref_lap=None):
+         max_step=0.10, timeout=60.0, ref_lap=None, normalize=False,
+         pool=None, tracks_per_iter=0):
     if out is None:
         out = f'spsa_racing_{time.strftime("%Y%m%d-%H%M%S")}.csv'
     if os.path.dirname(out):
         os.makedirs(os.path.dirname(out), exist_ok=True)
     A_stab = 0.1 * iters if A_stab is None else A_stab
 
-    rng = np.random.default_rng(seed)
+    if tracks_per_iter and pool is None:
+        raise ValueError('tracks_per_iter needs a CircuitPool')
+
+    # SEPARATE streams. Sharing one would make the perturbation sequence depend on k, so
+    # two runs differing only in tracks_per_iter would not be comparable -- and comparing
+    # across k is the entire point of the sigma knob (D3).
+    rng = np.random.default_rng([seed, 0])          # perturbations
+    trng = np.random.default_rng([seed, 1])         # circuit draws
     u = to_unit([ftg.FOV, ftg.BUBBLE_R, ftg.GAP_THRESH, ftg.MAX_THROTTLE,
                  ftg.MAX_STEER, ftg.CLEARANCE])
-    fields = ['iter', 'a_n', 'c_n'] + [n for n, _, _ in GAINS] + ['y_plus', 'y_minus']
+    fields = (['iter', 'a_n', 'c_n'] + [n for n, _, _ in GAINS]
+              + ['y_plus', 'y_minus', 'feas_plus', 'feas_minus', 'circuits'])
 
     with open(out, 'w', newline='') as fh:
         w = csv.DictWriter(fh, fieldnames=fields)
@@ -170,13 +246,26 @@ def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
             an = a / (n + 1 + A_stab) ** ALPHA
             cn = c / (n + 1) ** GAMMA
             d = rng.choice([-1.0, 1.0], size=P)     # Bernoulli: finite inverse moment
-            yp = rollout(iface, u + cn * d, laps, timeout, ref_lap).score
-            ym = rollout(iface, u - cn * d, laps, timeout, ref_lap).score
+            if tracks_per_iter:
+                # COMMON RANDOM NUMBERS (D4): one draw per iteration, used by BOTH arms.
+                # Drawing separately would put 53.9 s of circuit mismatch (R6) into a
+                # difference whose real signal is ~1-2 s, so the gradient would be ~97%
+                # circuit identity. Pairing cancels the circuit term exactly.
+                import circuits
+                tracks = circuits.sample(tracks_per_iter, trng)
+                mp = measure(pool, u + cn*d, tracks, laps, timeout, ref_lap)
+                mm = measure(pool, u - cn*d, tracks, laps, timeout, ref_lap)
+                yp, fp, ym, fm = mp.score, mp.feasible, mm.score, mm.feasible
+            else:
+                tracks = (getattr(iface, 'map_name', ''),)
+                rp = rollout(iface, u + cn * d, laps, timeout, ref_lap, normalize)
+                rm = rollout(iface, u - cn * d, laps, timeout, ref_lap, normalize)
+                yp, fp, ym, fm = rp.score, rp.feasible, rm.score, rm.feasible
             # Clip the step. One T_MAX rollout makes (y+ - y-) ~ -70, which without a
             # cap moves u by >10 box-widths and pins every gain to a corner for the rest
             # of the run. Bounding how far a single noisy measurement can move us is the
             # same instinct as the hypercube projection in Spall's own code.
-            if yp >= 2.0 * timeout and ym >= 2.0 * timeout:
+            if not fp and not fm:
                 # Both probes failed, so the difference is exactly zero and SPSA stalls
                 # here forever -- it has no gradient and no way out. Jump instead.
                 u = np.clip(u + rng.normal(0, 2 * cn, size=P), 0.0, 1.0)
@@ -184,7 +273,9 @@ def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
                 # Log it anyway. Skipping the write makes a failed run look like a short
                 # successful one, which is how the first f1tenth run read as 4 iterations
                 # when 40 had actually been spent.
-                row = {'iter': n, 'a_n': an, 'c_n': cn, 'y_plus': yp, 'y_minus': ym}
+                row = {'iter': n, 'a_n': an, 'c_n': cn, 'y_plus': yp, 'y_minus': ym,
+                       'feas_plus': int(fp), 'feas_minus': int(fm),
+                       'circuits': ';'.join(tracks)}
                 row.update({nm: v for (nm, _, _), v in zip(GAINS, to_real(u))})
                 w.writerow(row); fh.flush()
                 continue
@@ -192,7 +283,9 @@ def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
             u = np.clip(u - step, 0.0, 1.0)
 
             real = to_real(u)
-            row = {'iter': n, 'a_n': an, 'c_n': cn, 'y_plus': yp, 'y_minus': ym}
+            row = {'iter': n, 'a_n': an, 'c_n': cn, 'y_plus': yp, 'y_minus': ym,
+                   'feas_plus': int(fp), 'feas_minus': int(fm),
+                   'circuits': ';'.join(tracks)}
             row.update({name: v for (name, _, _), v in zip(GAINS, real)})
             w.writerow(row)
             fh.flush()                               # survive a Ctrl-C mid-run
@@ -206,6 +299,7 @@ def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
     return to_real(u)
 
 
+# ------------------------------------------------------------- C3: constrained two-timescale
 # ------------------------------------------------------------------------------ checks
 def selftest():
     mid = to_real([0.5] * P)
@@ -226,6 +320,10 @@ def selftest():
     # Regression: progress can exceed 1 when the arc counter runs past the start line.
     # Unclamped, progress=1.999 scored 0.17 -- the worst outcome looking like the best.
     assert score([], 0, 1, t_max=200., progress=1.999) == 200.0
+    # Rescaled failures stay on the signal's scale but still lose to every finished lap.
+    assert score([], 0, 1, t_max=200., progress=0.0, ref_lap=70.) == 140.0
+    assert score([50.0], 0, 1, t_max=200., ref_lap=70.) < score([], 0, 1, t_max=200.,
+                                                                progress=0.99, ref_lap=70.)
     assert score([], 0, 1, t_max=200., progress=5.0) == 200.0
     assert score([36.0], 0, 1, t_max=200.) < score([], 0, 1, t_max=200., progress=99.0)
 
@@ -238,23 +336,82 @@ def selftest():
     # Lap times are wall-clock measured, so they are always positive and plausible.
     # Regression: the simulator reported -7.83 s after a mid-lap reset.
 
-    # Feasibility is REPORTED, never inferred from the score. Thresholding `score <
-    # timeout` counted 98% of 42 configs feasible when 40% were: under ref_lap scaling a
-    # total failure scores 2*ref_lap (140 at ref_lap=70), which is below timeout=300, so
-    # every failure read as a completed lap. One measured example: score=104.2 with
-    # laps=0 and timeout=120, a rollout that never finished, counted as one that did.
-    assert score([], 0, 1, t_max=200., progress=0.0, ref_lap=70.) == 140.0
-    assert score([50.0], 0, 1, t_max=200., ref_lap=70.) < score([], 0, 1, t_max=200.,
-                                                                progress=0.99, ref_lap=70.)
-    fail = score([], 0, 1, t_max=300., progress=0.0, ref_lap=70.)
-    assert fail < 300.0, 'a total failure scores BELOW the timeout -- hence no threshold'
-    # ...and a slow finished lap scores ABOVE ref_lap, so no threshold separates the two.
-    assert score([75.0], 0, 1, t_max=300., ref_lap=70.) > 70.0
-
     # Failing to finish is the only hard failure.
     assert score([], 0, 1) == 2.0 * T_MAX
     assert score([25.0], 0, 2) == 2.0 * T_MAX
     assert np.isclose(score([20.0, 24.0], 0, 2), 22.0)
+
+    # B1 regression. Feasibility must NOT be recoverable from the score by threshold.
+    # With ref_lap=70 a total failure scores 140, which is BELOW timeout=300, so the old
+    # `score < timeout` test called every failure a completed lap.
+    fail = score([], 0, 1, t_max=300., progress=0.0, ref_lap=70.)
+    assert fail == 140.0 and fail < 300.0, 'the exact trap B1 fell into'
+    # ...and a slow finished lap scores ABOVE ref_lap, so no threshold separates the two.
+    assert score([75.0], 0, 1, t_max=300., ref_lap=70.) > 70.0
+    # Rollout reports it instead, on any scale -- including D5 ratios, where a failure is
+    # a small number (~2.0) and a threshold against a timeout is meaningless.
+    ok = Rollout(1.02, True, 1, 0, 1.0, 'IMS')
+    bad = Rollout(2.00, False, 0, 1, 0.0, 'IMS')
+    assert ok.feasible and not bad.feasible
+    assert bad.score < 300.0 and ok.score < bad.score
+
+    # ---- common random numbers (D4) ----
+    import circuits
+
+    class _Stub:
+        """Enough interface to drive rollout() with no simulator. Lap time is a fixed
+        multiple of the circuit's baseline, so a normalised score must come out at that
+        multiple on every circuit -- which is exactly what D5 is for."""
+        def __init__(self, track, mult=1.1):
+            self.map_name = track
+            self._lap = circuits.baseline(track) * mult   # sim-seconds for one lap
+            self.laps = self.collisions = 0
+            self._t = 0.0
+            self.ok = True
+            self.angle_min, self.angle_increment = -2.35, 0.00435
+            self.scan = np.full(1080, 5.0)
+
+        def reset(self):
+            self.laps, self._t = 0, 0.0
+
+        def now(self):
+            return self._t                     # a clock READ has no side effect
+
+        def wait_for_scan(self, timeout=None):
+            if not self.ok:
+                return False                   # models the real disconnect -> break path
+            self._t += self._lap               # one step completes one lap, for the test
+            self.laps += 1
+            return True
+
+        def send(self, *a):
+            pass
+
+    pool = CircuitPool(lambda t: _Stub(t))
+    m = measure(pool, [0.5] * P, ('IMS', 'Shanghai'), 1, 1e9)
+    assert m.feasible and len(m.rollouts) == 2
+    # 1.1x baseline on circuits 2.12x apart must average to 1.1, not to a length-weighted
+    # number. Unnormalised this would be (52.7 + 112.0)/2 = 82.4 -- meaningless.
+    assert abs(m.score - 1.1) < 1e-9, f'normalised mean should be 1.1, got {m.score}'
+
+    # Feasibility is all-of: abandoning the hardest circuit must not read as success.
+    pool._cache['Shanghai'].ok = False           # never completes a lap
+    m2 = measure(pool, [0.5] * P, ('IMS', 'Shanghai'), 1, 250.0)
+    assert not m2.feasible, 'one unfinished circuit must make the whole measurement infeasible'
+
+    # The draw is per-iteration and shared by both arms, and its stream is INDEPENDENT of
+    # the perturbation stream -- so changing tracks_per_iter cannot shift the directions.
+    def streams(seed):
+        r, t = np.random.default_rng([seed, 0]), np.random.default_rng([seed, 1])
+        return ([r.choice([-1.0, 1.0], size=P).tolist() for _ in range(3)],
+                [circuits.sample(k, t) for k in (2, 2, 2)])
+    d1, t1 = streams(0)
+    d2, t2 = streams(0)
+    assert d1 == d2 and t1 == t2, 'same seed must reproduce both streams'
+    assert len(set(t1)) > 1, 'the draw must actually vary across iterations'
+    r3 = np.random.default_rng([0, 0])
+    assert [r3.choice([-1.0, 1.0], size=P).tolist() for _ in range(3)] == d1, \
+        'perturbations must not depend on how many circuits were drawn'
 
     print('selftest OK')
 
@@ -265,13 +422,15 @@ def main(argv):
     q.add_argument('--iters', type=int, default=40)
     q.add_argument('--laps', type=int, default=1, help='laps per rollout')
     q.add_argument('-a', type=float, default=0.01)
-    q.add_argument('--ref-lap', type=float, default=None,
-                   help='scale the failure penalty to a typical lap rather than to the '
-                        'timeout; keeps failures on the signal scale')
     q.add_argument('--max-step', type=float, default=0.10,
                    help='cap on |step| per coordinate, in normalised units')
     q.add_argument('-c', type=float, default=0.08, help='set from the measured noise floor')
     q.add_argument('--seed', type=int, default=0)
+    q.add_argument('--tracks-per-iter', type=int, default=0,
+                   help='circuits averaged per measurement (D3 sigma knob); '
+                        '0 = single circuit. Both SPSA arms share one draw (D4)')
+    q.add_argument('--ref-lap', type=float, default=None,
+                   help='scale failures to a typical lap instead of the timeout')
     q.add_argument('--timeout', type=float, default=60.0,
                    help='seconds per rollout before scoring T_MAX')
     q.add_argument('--start', default=None,
@@ -286,9 +445,14 @@ def main(argv):
         apply_gains(np.array(vals))
         print('start gains:', dict(zip([n for n, _, _ in GAINS], vals)))
 
+    pool = None
     if o.backend == 'f1tenth':
         from f1tenth_iface import F1TenthInterface
-        iface = F1TenthInterface(o.map)
+        if o.tracks_per_iter:
+            pool = CircuitPool(F1TenthInterface)
+            iface = None
+        else:
+            iface = F1TenthInterface(o.map)
     else:
         from roboracer_env import RoboRacerInterface
         iface = RoboRacerInterface(node_name='spsa_racing')
@@ -296,9 +460,10 @@ def main(argv):
             raise TimeoutError('no scan — is the bridge up and the simulator connected?')
     try:
         spsa(iface, o.iters, o.laps, o.a, o.c, seed=o.seed, out=o.out,
-             max_step=o.max_step, timeout=o.timeout, ref_lap=o.ref_lap)
+             max_step=o.max_step, timeout=o.timeout, ref_lap=o.ref_lap,
+             pool=pool, tracks_per_iter=o.tracks_per_iter)
     finally:
-        iface.close()
+        (pool or iface).close()
 
 
 if __name__ == '__main__':
