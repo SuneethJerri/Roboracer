@@ -147,8 +147,8 @@ class Rollout(NamedTuple):
     collisions: int
     progress: float
     circuit: str
-    cost: float = float('nan')          # implied normalised lap time
-    shortfall: float = float('nan')     # completion shortfall, the constraint channel
+    cost: float = float('nan')          # implied normalised lap time (C3's objective)
+    shortfall: float = float('nan')     # 1 - progress (C3's constraint channel)
 
 
 def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None, normalize=False):
@@ -256,9 +256,9 @@ class CircuitPool:
 class Meas(NamedTuple):
     """One measurement of `u` over a circuit draw. Three channels, because R11 showed
     that collapsing them into one is what breaks the ordering."""
-    score: float        # mean graded-penalty scalar (the existing objective)
-    cost: float         # mean implied normalised lap time
-    shortfall: float    # mean completion shortfall, the constraint channel
+    score: float        # mean D5 scalar -- the unconstrained objective (D2/D5)
+    cost: float         # mean implied normalised lap time -- C3's objective
+    shortfall: float    # mean (1 - progress) -- C3's constraint
     feasible: bool      # all-of
     rollouts: tuple
 
@@ -271,7 +271,7 @@ def measure(pool, u, tracks, laps=1, timeout=250.0, ref_lap=None):
     abandoning the hardest circuit in the draw.
 
     All three channels come from the same two rollouts, so carrying them costs nothing.
-    `score` is kept so that every number already recorded stays comparable.
+    `score` is kept so that every number recorded before C3 stays comparable.
     """
     rs = [rollout(pool.get(t), u, laps, timeout, ref_lap, normalize=True)
           for t in tracks]
@@ -365,6 +365,146 @@ def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
     return to_real(u)
 
 
+# ------------------------------------------------------------- C3: constrained two-timescale
+BETA = 0.85     # lambda's step exponent, in its OWN update index (see LAM_EVERY)
+DELTA = 0.15    # a rollout stopping more than this fraction short counts as a full
+                # violation. Needed because the raw shortfall is far too small to drive
+                # the dual: one failure among k circuits contributes (1-p)/k, which at the
+                # measured p=0.886 and k=5 is 0.023, so lambda would have to travel ~3.3
+                # (R11) on steps of 0.023*b. Normalising by DELTA makes a real failure
+                # worth ~0.76 instead of 0.11 and keeps the channel graded, so the SPSA
+                # difference still carries magnitude.
+B_GAIN = 5.0    # lambda's step gain, sized to the HORIZON rather than taken from a
+                # table. Over 40 iterations the dual gets 40 // LAM_EVERY = 8 updates and
+                # sum_j b/j^0.85 = 3.14 b, so with a typical violation of ~0.3 lambda can
+                # travel ~0.94 b. R11 says it must be able to reach ~0.5 at k=5 and ~8 at
+                # k=17, which puts b at a few units, not the small constant a textbook
+                # asymptotic schedule would suggest. A gain that cannot cross the range
+                # it needs in the iterations available is not a slow schedule, it is a
+                # fixed penalty with extra steps.
+LAM_EVERY = 5   # theta steps per lambda step. THE timescale separation is structural, not
+                # asymptotic: b_n/a_n ~ n^(ALPHA-BETA) = n^-0.248 is still 0.51 at n=10000
+                # and about 2 at n=40, i.e. over any horizon we actually run, a step-size
+                # ratio puts lambda on the FASTER timescale -- the opposite of the intent.
+                # Subsampling the dual gives honest separation at 40 iterations.
+
+
+def violation(rollouts, delta=DELTA):
+    """Mean constraint violation over a draw: 0 if every circuit finished, up to 1.
+
+    Graded, and normalised per circuit BEFORE averaging -- the cap has to apply to each
+    rollout, or one catastrophic circuit would be charged the same as one near-miss.
+    """
+    return float(np.mean([min(1.0, r.shortfall / delta) for r in rollouts]))
+
+
+def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=None,
+                     seed=0, out=None, max_step=0.10, timeout=250.0, alpha=0.02,
+                     lam0=1.0, tracks_per_iter=2, start=None, lam_every=LAM_EVERY,
+                     delta=DELTA):
+    """Primal-dual SPSA on a constrained racing problem (notebook C3).
+
+        minimise   J(theta)  = E_M[ implied_lap(theta, M) / baseline(M) ]
+        subject to G(theta)  = E_M[ min(1, (1 - progress) / delta) ]  <=  alpha
+
+    on the Lagrangian  L(theta, lambda) = J(theta) + lambda * (G(theta) - alpha), with
+    theta on the fast timescale and lambda on the slow one:
+
+        theta_{n+1}  = theta_n - a_n (L+ - L-) / (2 c_n Delta_n)      every iteration
+        lambda_{j+1} = [ lambda_j + b_j (Ghat - alpha) ]_+            every `lam_every`
+
+    Theta sees a quasi-static multiplier; lambda sees a theta that has had `lam_every`
+    steps to respond. Separation is by SUBSAMPLING, not by a step-size ratio -- see
+    LAM_EVERY for why the usual `b_n/a_n -> 0` is vacuous at a 40-iteration horizon. Both
+    schedules still satisfy Robbins-Monro in their own index (sum = inf, squares < inf).
+
+    `alpha > 0` matters: at alpha = 0 the dual recursion is monotone non-decreasing (the
+    violation can never go below zero), so any overshoot is permanent. A small positive
+    alpha lets lambda retreat once the constraint holds with margin, which is what keeps
+    it bounded.
+
+    WHY a multiplier instead of the fixed penalty (D2). R11 measured the unconstrained
+    scalarisation failing: 5.28% of (failure, completed-lap) pairs mis-ordered, and the
+    rate RISING with the batch size k (0% at k=1, 10.7% at k=3) because a failure gets
+    diluted by good circuits in the same mean. A fixed penalty has to be chosen once, for
+    all theta, and R11's point is that no such constant exists -- too small and failures
+    undercut slow laps, too large (ref = timeout) and the difference saturates `max_step`,
+    which R7 showed converts direction into an uninformative maximal jump. The multiplier
+    does not have to be chosen: it is driven by the measured constraint violation, so the
+    exchange rate between time and completion is learned on the slow timescale.
+
+    Ghat uses the mean of the two probes rather than a third rollout at theta: that is an
+    O(c_n^2) approximation of G(theta), the same order as SPSA's own bias, so it costs
+    nothing in accuracy and keeps the iteration at two measurements.
+
+    ponytail: one constraint. Collisions are the obvious second (and `Rollout.collisions`
+    is already carried for it), but D7's warning about interacting schedules is real --
+    every extra multiplier is another timescale to separate. Add it when the completion
+    constraint is shown to hold.
+    """
+    import circuits
+    if out is None:
+        out = f'spsa_c3_{time.strftime("%Y%m%d-%H%M%S")}.csv'
+    if os.path.dirname(out):
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+    A_stab = 0.1 * iters if A_stab is None else A_stab
+    assert lam_every >= 2, 'the dual must be slower than the primal'
+
+    rng = np.random.default_rng([seed, 0])          # perturbations
+    trng = np.random.default_rng([seed, 1])         # circuit draws (same streams as spsa)
+    u = np.array([0.5] * P) if start is None else np.asarray(start, dtype=float)
+    lam = float(lam0)
+
+    fields = (['iter', 'a_n', 'b_n', 'c_n', 'lam'] + [n for n, _, _ in GAINS]
+              + ['L_plus', 'L_minus', 'J_plus', 'J_minus', 'G_plus', 'G_minus',
+                 'G_hat', 'feas_plus', 'feas_minus', 'circuits'])
+    with open(out, 'w', newline='') as fh:
+        w = csv.DictWriter(fh, fieldnames=fields)
+        w.writeheader()
+        for n in range(iters):
+            an = a / (n + 1 + A_stab) ** ALPHA
+            cn = c / (n + 1) ** GAMMA
+            d = rng.choice([-1.0, 1.0], size=P)
+            tracks = circuits.sample(tracks_per_iter, trng)      # CRN, both arms (D4)
+            mp = measure(pool, u + cn * d, tracks, laps, timeout)
+            mm = measure(pool, u - cn * d, tracks, laps, timeout)
+
+            Gp, Gm = violation(mp.rollouts, delta), violation(mm.rollouts, delta)
+            Lp = mp.cost + lam * (Gp - alpha)
+            Lm = mm.cost + lam * (Gm - alpha)
+            # No both-failed special case. The unconstrained loop needs one because its
+            # failure scalar saturates at 2*ref and the difference becomes exactly zero;
+            # implied_lap keeps varying with how far each arm got, so the gradient stays
+            # informative outside the feasible region and there is nothing to escape.
+            u = np.clip(u - np.clip(an * (Lp - Lm) / (2 * cn * d), -max_step, max_step),
+                        0.0, 1.0)
+            Ghat = 0.5 * (Gp + Gm)
+            if n % lam_every == lam_every - 1:                   # the slow timescale
+                j = n // lam_every + 1
+                bn = b / j ** BETA
+                lam = max(0.0, lam + bn * (Ghat - alpha))        # projection onto [0, inf)
+            else:
+                bn = 0.0
+
+            row = {'iter': n, 'a_n': an, 'b_n': bn, 'c_n': cn, 'lam': lam,
+                   'L_plus': Lp, 'L_minus': Lm, 'J_plus': mp.cost, 'J_minus': mm.cost,
+                   'G_plus': Gp, 'G_minus': Gm, 'G_hat': Ghat,
+                   'feas_plus': int(mp.feasible), 'feas_minus': int(mm.feasible),
+                   'circuits': ';'.join(tracks)}
+            row.update({nm: v for (nm, _, _), v in zip(GAINS, to_real(u))})
+            w.writerow(row)
+            fh.flush()
+            print(f'{n:3d}  L+={Lp:7.3f} L-={Lm:7.3f}  J={0.5*(mp.cost+mm.cost):6.3f}  '
+                  f'G={Ghat:6.4f}  lam={lam:7.4f}  feas={int(mp.feasible)}{int(mm.feasible)}',
+                  flush=True)
+
+    print(f'\nfinal lambda {lam:.4f};  gains: ' +
+          '  '.join(f'--{nm.lower().replace("_", "-")} {v:.3f}'
+                    for (nm, _, _), v in zip(GAINS, to_real(u))))
+    print(f'{iters} iterations -> {out}')
+    return to_real(u), lam
+
+
 # ------------------------------------------------------------------------------ checks
 def selftest():
     mid = to_real([0.5] * P)
@@ -407,8 +547,8 @@ def selftest():
     assert np.isclose(score([20.0, 24.0], 0, 2), 22.0)
 
     # B1 regression. Feasibility must NOT be recoverable from the score by threshold.
-    # ---- implied_lap must order a failure above every completed lap, and must keep
-    # doing so under averaging. Both were measured failing for the graded penalty.
+    # ---- C3. implied_lap must order a failure above every completed lap, and must keep
+    # doing so under averaging -- R11 measured both failing for the D5 scalar.
     assert implied_lap([50.0], 250.0, 1.0, 1) == 50.0, 'a finished lap reports its own time'
     assert implied_lap([40.0, 60.0], 250.0, 1.0, 2) == 50.0, 'multi-lap takes the mean'
     # An unfinished rollout is charged the BUDGET over its progress, never the elapsed
@@ -436,13 +576,42 @@ def selftest():
     assert dil[2] > slow and dil[3] > slow, 'should hold where D5 already failed'
     assert dil[5] < slow, 'k=5 is where a bounded failure term stops being enough'
 
-    # No scalar cost survives that. It is the argument for a constrained formulation:
-    # the shortfall has to be carried as its own channel and priced, rather than folded
-    # into the number being averaged. Carried here; consumed by the optimiser that
-    # prices it.
+    # THE C3 PROPERTY, and the reason a multiplier beats any constant. The constraint
+    # channel is not dilutable away, because a finite lambda restores the ordering at
+    # every k -- and the dual recursion climbs to it on its own instead of being tuned.
+    class _R:                                    # the measured Shanghai failure
+        shortfall = 1 - 0.8861
+    class _F:
+        shortfall = 0.0
+    assert violation([_F(), _F()]) == 0.0, 'an all-feasible draw must not violate'
+    wide = {**dil, 8: (back + 7 * .727) / 8, 17: (back + 16 * .727) / 17}
+    for k, inf_arm in wide.items():
+        g_inf = violation([_R()] + [_F()] * (k - 1))     # one failure in a draw of k
+        lam_star = max(0.0, (slow - inf_arm) / g_inf)    # what the dual has to reach
+        assert lam_star < 20.0, f'k={k}: needs lambda {lam_star:.1f}, out of reach'
+        for lam in (lam_star + 0.5, lam_star + 50.0):    # any lambda past it also works
+            assert inf_arm + lam * g_inf > slow, (
+                f'k={k}: lambda={lam:.2f} failed to order the Lagrangian')
+
+    # Normalising by DELTA is what puts lambda* in reach; on the raw shortfall the dual
+    # would have to travel several times further on the same steps.
+    assert (slow - dil[5]) / ((1 - 0.8861) / 5) > \
+           4 * (slow - dil[5]) / violation([_R()] + [_F()] * 4)
 
     assert np.isfinite(implied_lap([], 250.0, 0.0, 1))
 
+    # The dual's own schedule, in ITS index, must satisfy Robbins-Monro...
+    S = [(1.0 / np.arange(1, m + 1) ** BETA).sum() for m in (10**4, 10**5, 10**6)]
+    # Divergence is slow at BETA=0.85 (the partial sum grows like j^0.15), so the honest
+    # finite witness is that it keeps climbing by a wide margin, not that it is large.
+    assert S[2] - S[1] > 10 and S[1] - S[0] > 10, f'sum b_j must diverge: {S}'
+    assert (1.0 / np.arange(1, 100_001) ** (2 * BETA)).sum() < 10, 'sum b_j^2 converges'
+    # ...and the separation has to be real at the horizon we RUN. This is the assertion
+    # that sent LAM_EVERY in: at 40 iterations the textbook step-size ratio puts lambda
+    # on the FASTER timescale, which is the opposite of two-timescale.
+    assert LAM_EVERY >= 2
+    assert (0.05 / 40 ** BETA) / (0.01 / 40 ** ALPHA) > 1.0
+    assert sum(1 for n in range(40) if n % LAM_EVERY == LAM_EVERY - 1) == 40 // LAM_EVERY
 
     # With ref_lap=70 a total failure scores 140, which is BELOW timeout=300, so the old
     # `score < timeout` test called every failure a completed lap.
@@ -495,17 +664,18 @@ def selftest():
     # 1.1x baseline on circuits 2.12x apart must average to 1.1, not to a length-weighted
     # number. Unnormalised this would be (52.7 + 112.0)/2 = 82.4 -- meaningless.
     assert abs(m.score - 1.1) < 1e-9, f'normalised mean should be 1.1, got {m.score}'
-    # On a completed lap the cost IS the lap time, so both channels agree.
+    # On a completed lap the C3 cost IS the lap time, so both channels agree and a
+    # feasible draw carries no violation at all.
     assert abs(m.cost - 1.1) < 1e-9, f'cost should equal score when feasible: {m.cost}'
-    assert m.shortfall == 0.0, 'a completed lap has no shortfall by definition'
+    assert m.shortfall == 0.0 and violation(m.rollouts) == 0.0
 
     # Feasibility is all-of: abandoning the hardest circuit must not read as success.
     pool._cache['Shanghai'].ok = False           # never completes a lap
     m2 = measure(pool, [0.5] * P, ('IMS', 'Shanghai'), 1, 250.0)
     assert not m2.feasible, 'one unfinished circuit must make the whole measurement infeasible'
-    # ...and that circuit must register in the constraint channel: the failure shows
-    # up where averaging cannot hide it.
-    assert m2.shortfall > 0.0
+    # ...and that circuit must register in the constraint channel, which is the whole
+    # point of C3: the failure shows up where averaging cannot hide it.
+    assert m2.shortfall > 0.0 and violation(m2.rollouts) > 0.0
     assert m2.cost > m.cost, 'an unfinished draw must imply a longer time than a finished one'
     # The B2 guard: a timeout under the circuit's own baseline must refuse, not quietly
     # measure the progress penalty and call it a lap time.
@@ -550,6 +720,15 @@ def main(argv):
                    help='scale failures to a typical lap instead of the timeout')
     q.add_argument('--timeout', type=float, default=60.0,
                    help='seconds per rollout before scoring T_MAX')
+    q.add_argument('--c3', action='store_true',
+                   help='constrained primal-dual SPSA (notebook C3) instead of the '
+                        'unconstrained penalty form')
+    q.add_argument('--lam0', type=float, default=1.0, help='initial multiplier (C3)')
+    q.add_argument('-b', type=float, default=5.0,
+                   help="lambda's step gain (C3); sized to the HORIZON -- see B_GAIN")
+    q.add_argument('--alpha', type=float, default=0.02,
+                   help='allowed mean constraint violation (C3); must stay > 0 so that '
+                        'lambda can retreat once the constraint holds')
     q.add_argument('--start', default=None,
                    help='comma-separated starting gains, in GAINS order')
     q.add_argument('--backend', default='autodrive', choices=['autodrive', 'f1tenth'])
@@ -576,9 +755,20 @@ def main(argv):
         if not iface.wait_for_scan(timeout=10.0):
             raise TimeoutError('no scan — is the bridge up and the simulator connected?')
     try:
-        spsa(iface, o.iters, o.laps, o.a, o.c, seed=o.seed, out=o.out,
-             max_step=o.max_step, timeout=o.timeout, ref_lap=o.ref_lap,
-             pool=pool, tracks_per_iter=o.tracks_per_iter)
+        if o.c3:
+            if pool is None:
+                raise SystemExit('--c3 needs the multi-circuit path: '
+                                 '--backend f1tenth --tracks-per-iter 2 or more')
+            spsa_constrained(pool, o.iters, o.laps, a=o.a, b=o.b, c=o.c, seed=o.seed,
+                             out=o.out, max_step=o.max_step, timeout=o.timeout,
+                             alpha=o.alpha, lam0=o.lam0,
+                             tracks_per_iter=o.tracks_per_iter,
+                             start=[float(x) for x in o.start.split(',')]
+                             if o.start else None)
+        else:
+            spsa(iface, o.iters, o.laps, o.a, o.c, seed=o.seed, out=o.out,
+                 max_step=o.max_step, timeout=o.timeout, ref_lap=o.ref_lap,
+                 pool=pool, tracks_per_iter=o.tracks_per_iter)
     finally:
         (pool or iface).close()
 
