@@ -84,6 +84,46 @@ def score(lap_times, collisions, laps_wanted, t_max=T_MAX, penalty=PENALTY,
     return float(np.mean(lap_times)) + penalty * collisions
 
 
+PROG_FLOOR = 0.5    # below this, progress carries no usable magnitude -- only scale
+COST_CAP = 3.0      # ceiling on an unfinished rollout's NORMALISED cost
+
+
+def implied_lap(lap_times, timeout, progress, laps_wanted):
+    """How long this controller takes to go round, whether or not it got there.
+
+    A completed lap reports its measured time. A rollout that did not finish is charged
+    `timeout / progress`: it was given the whole budget, covered fraction `p` of a lap,
+    so its implied full-lap time is at least that. Since any completed lap finished
+    *before* the deadline, every unfinished rollout costs more than every finished one --
+    ordering sound by construction rather than by a tuned constant.
+
+    This is what D2's graded penalty was reaching for. D2 chose the failure scale by hand
+    (`ref * (2 - progress)`) and R11 measured the consequence: with `ref = baseline` the
+    penalty lands in [1, 2] and a car driving the circuit BACKWARDS scored 1.1139 against
+    1.2120 for a car that finished (B6). The same rollout's implied time is
+    250 / 0.886 = 282 s = 2.77x baseline, i.e. above every lap actually completed.
+
+    Two things are deliberately NOT done here:
+
+    - The budget is used, not the ELAPSED time. `elapsed / progress` extrapolates the
+      pace a car held until it died, so a crash at 10% after 5 s would imply a 50 s lap
+      and read as excellent. Worse, a rollout that breaks out immediately (the real
+      AutoDRIVE case: a dropped Socket.IO connection makes `wait_for_scan` return False)
+      has elapsed 0 and would score a perfect 0.0 -- the worst outcome looking like the
+      best, which is the same bug as the unclamped progress fixed in b828c7e. The stub
+      test caught exactly this.
+    - Progress is floored and the normalised cost capped. Ungraded, `timeout / p` as
+      p -> 0 is unbounded, and R7 measured what an unbounded difference does: it
+      saturates `max_step` and converts the step into direction-only at maximum
+      magnitude, which walks out of the feasible region and does not return. Below
+      PROG_FLOOR the number says "failed badly" and nothing more precise, so grading it
+      buys nothing and costs the step its magnitude.
+    """
+    if len(lap_times) >= laps_wanted:
+        return float(np.mean(lap_times))
+    return timeout / max(progress, PROG_FLOOR)
+
+
 def apply_gains(real):
     """Push a gain vector into follow_the_gap's module globals."""
     for (name, _, _), v in zip(GAINS, real):
@@ -107,6 +147,8 @@ class Rollout(NamedTuple):
     collisions: int
     progress: float
     circuit: str
+    cost: float = float('nan')          # implied normalised lap time
+    shortfall: float = float('nan')     # completion shortfall, the constraint channel
 
 
 def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None, normalize=False):
@@ -123,6 +165,14 @@ def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None, normalize=False
     if normalize:
         import circuits          # lazy: this module still runs with no map infrastructure
         base = circuits.baseline(circuit)
+        if timeout <= base:
+            # B2 in code rather than in a notebook entry. Below the circuit's own
+            # baseline lap, every rollout fails on the clock and the objective measures
+            # the progress penalty instead of lap time -- which is how a 42x cliff once
+            # looked perfectly smooth. It also inverts the cost: an unfinished rollout
+            # could then be charged LESS than a completed lap.
+            raise ValueError(f'timeout {timeout:g}s is below {circuit}\'s baseline '
+                             f'{base:.1f}s; nothing can finish (notebook B2)')
         if ref_lap is None:
             ref_lap = base
     apply_gains(to_real(u))
@@ -133,8 +183,8 @@ def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None, normalize=False
     # durations -- and every rollout here begins with a reset. The simulator runs at 1x
     # real time, so wall clock is the honest measure and it is wholly under our control.
     lap_times = []
-    t0 = iface.now()           # SIM time: wall clock is wrong at 45x real time
-    deadline = t0 + timeout
+    t0 = t_start = iface.now()  # SIM time: wall clock is wrong at 45x real time. t0 is
+    deadline = t0 + timeout     # reset at each crossing; t_start is the rollout's own
     seen = start_laps
 
     while iface.now() < deadline and len(lap_times) < laps_wanted:
@@ -159,10 +209,19 @@ def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None, normalize=False
     cols = iface.collisions - start_col
     sc = score(lap_times, cols, laps_wanted,
                t_max=timeout, progress=prog, ref_lap=ref_lap)
+    imp = implied_lap(lap_times, timeout, prog, laps_wanted)
     return Rollout(score=sc / base if base else sc,
                    feasible=len(lap_times) >= laps_wanted,
                    laps=len(lap_times), collisions=cols, progress=prog,
-                   circuit=circuit)
+                   circuit=circuit,
+                   cost=min(COST_CAP, imp / base) if base else imp,
+                   # Keyed off COMPLETION, not off the progress reading. A lap that
+                   # finished has no shortfall by definition, and deriving it from
+                   # progress instead would charge a full violation to any interface
+                   # whose progress lags or is unreported -- caught by the stub, which
+                   # completes laps without reporting progress at all.
+                   shortfall=0.0 if len(lap_times) >= laps_wanted
+                   else 1.0 - min(prog, 1.0))
 
 
 # -------------------------------------------------------------- multi-circuit measurement
@@ -195,8 +254,11 @@ class CircuitPool:
 
 
 class Meas(NamedTuple):
-    """One measurement of `u` over a circuit draw."""
-    score: float        # mean normalised score over the draw
+    """One measurement of `u` over a circuit draw. Three channels, because R11 showed
+    that collapsing them into one is what breaks the ordering."""
+    score: float        # mean graded-penalty scalar (the existing objective)
+    cost: float         # mean implied normalised lap time
+    shortfall: float    # mean completion shortfall, the constraint channel
     feasible: bool      # all-of
     rollouts: tuple
 
@@ -208,10 +270,14 @@ def measure(pool, u, tracks, laps=1, timeout=250.0, ref_lap=None):
     task, and treating it as feasible would let the optimiser bank a cheap mean by
     abandoning the hardest circuit in the draw.
 
+    All three channels come from the same two rollouts, so carrying them costs nothing.
+    `score` is kept so that every number already recorded stays comparable.
     """
     rs = [rollout(pool.get(t), u, laps, timeout, ref_lap, normalize=True)
           for t in tracks]
     return Meas(score=float(np.mean([r.score for r in rs])),
+                cost=float(np.mean([r.cost for r in rs])),
+                shortfall=float(np.mean([r.shortfall for r in rs])),
                 feasible=all(r.feasible for r in rs),
                 rollouts=tuple(rs))
 
@@ -299,7 +365,6 @@ def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
     return to_real(u)
 
 
-# ------------------------------------------------------------- C3: constrained two-timescale
 # ------------------------------------------------------------------------------ checks
 def selftest():
     mid = to_real([0.5] * P)
@@ -342,6 +407,43 @@ def selftest():
     assert np.isclose(score([20.0, 24.0], 0, 2), 22.0)
 
     # B1 regression. Feasibility must NOT be recoverable from the score by threshold.
+    # ---- implied_lap must order a failure above every completed lap, and must keep
+    # doing so under averaging. Both were measured failing for the graded penalty.
+    assert implied_lap([50.0], 250.0, 1.0, 1) == 50.0, 'a finished lap reports its own time'
+    assert implied_lap([40.0, 60.0], 250.0, 1.0, 2) == 50.0, 'multi-lap takes the mean'
+    # An unfinished rollout is charged the BUDGET over its progress, never the elapsed
+    # time: a crash at 10% after 5 s must not imply a 50 s lap and read as excellent.
+    assert implied_lap([], 250.0, 0.10, 1) > implied_lap([50.0], 250.0, 1.0, 1) * 4
+    # ...and a rollout that broke out instantly (a dropped connection) is the worst, not
+    # the best. This scored 0.0 before the stub test caught it.
+    assert implied_lap([], 250.0, 0.0, 1) >= 250.0
+    # Bounded, or an unbounded difference saturates max_step into a maximal jump (R7).
+    assert implied_lap([], 250.0, 0.0, 1) == implied_lap([], 250.0, PROG_FLOOR / 2, 1)
+    # R11's actual rollout: 250 s at 88.6% progress on Shanghai, baseline 101.81 s.
+    back = implied_lap([], 250.0, 0.8861, 1) / 101.81
+    assert 2.7 < back < 2.8, f'the backwards-driving car should imply ~2.77x, got {back}'
+    slow = 1.2120            # the slowest completed lap R11 measured, normalised
+    assert back > slow, 'a rollout that never finished must cost more than one that did'
+    # ...and the D5 scalar is what gets this wrong, which is B6 in one line.
+    assert score([], 0, 1, t_max=250., progress=0.8861, ref_lap=101.81) / 101.81 < slow
+
+    # Dilution (R11 Q3). implied_lap does NOT escape it, and this is the check that says
+    # so: averaging is what breaks the ordering, not the scale of the failure term, so
+    # raising that scale only pushes out the k at which one failure can be averaged below
+    # a mean of slow completed laps. At the measured numbers it survives k=2 and 3 and
+    # fails at k=5 -- better than D5, which fails at k=2, but still not sound.
+    dil = {k: (back + (k - 1) * 0.727) / k for k in (2, 3, 5)}   # failure + fastest laps
+    assert dil[2] > slow and dil[3] > slow, 'should hold where D5 already failed'
+    assert dil[5] < slow, 'k=5 is where a bounded failure term stops being enough'
+
+    # No scalar cost survives that. It is the argument for a constrained formulation:
+    # the shortfall has to be carried as its own channel and priced, rather than folded
+    # into the number being averaged. Carried here; consumed by the optimiser that
+    # prices it.
+
+    assert np.isfinite(implied_lap([], 250.0, 0.0, 1))
+
+
     # With ref_lap=70 a total failure scores 140, which is BELOW timeout=300, so the old
     # `score < timeout` test called every failure a completed lap.
     fail = score([], 0, 1, t_max=300., progress=0.0, ref_lap=70.)
@@ -393,11 +495,26 @@ def selftest():
     # 1.1x baseline on circuits 2.12x apart must average to 1.1, not to a length-weighted
     # number. Unnormalised this would be (52.7 + 112.0)/2 = 82.4 -- meaningless.
     assert abs(m.score - 1.1) < 1e-9, f'normalised mean should be 1.1, got {m.score}'
+    # On a completed lap the cost IS the lap time, so both channels agree.
+    assert abs(m.cost - 1.1) < 1e-9, f'cost should equal score when feasible: {m.cost}'
+    assert m.shortfall == 0.0, 'a completed lap has no shortfall by definition'
 
     # Feasibility is all-of: abandoning the hardest circuit must not read as success.
     pool._cache['Shanghai'].ok = False           # never completes a lap
     m2 = measure(pool, [0.5] * P, ('IMS', 'Shanghai'), 1, 250.0)
     assert not m2.feasible, 'one unfinished circuit must make the whole measurement infeasible'
+    # ...and that circuit must register in the constraint channel: the failure shows
+    # up where averaging cannot hide it.
+    assert m2.shortfall > 0.0
+    assert m2.cost > m.cost, 'an unfinished draw must imply a longer time than a finished one'
+    # The B2 guard: a timeout under the circuit's own baseline must refuse, not quietly
+    # measure the progress penalty and call it a lap time.
+    try:
+        measure(pool, [0.5] * P, ('Shanghai',), 1, 10.0)
+    except ValueError as e:
+        assert 'B2' in str(e)
+    else:
+        raise AssertionError('a timeout below the baseline must raise')
 
     # The draw is per-iteration and shared by both arms, and its stream is INDEPENDENT of
     # the perturbation stream -- so changing tracks_per_iter cannot shift the directions.
