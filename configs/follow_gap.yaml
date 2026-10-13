@@ -1,0 +1,29 @@
+# Follow-the-Gap baseline parameters (P2).
+# Nothing is hardcoded in ftg.py: change values here, never in the code.
+
+# --- sensor geometry (must match the simulator) ---
+n_beams: 1080            # number of LIDAR beams
+lidar_fov_deg: 270       # total LIDAR field of view [deg]; index 540 = straight ahead
+
+# --- scan preprocessing ---
+max_range: 6.0           # [m] readings beyond this are clipped
+smooth_window: 5         # [beams] moving-average window (odd)
+
+# --- gap search ---
+fov_deg: 180             # [deg] only search +-90 deg ahead, never behind
+bubble_radius: 0.4       # [m] safety bubble around the nearest obstacle
+free_threshold: 1.0      # [m] a beam counts as free only if farther than this
+min_gap_width: 5         # [beams] ignore gaps narrower than this
+target_mode: center      # center | deepest  (center = baseline rule)
+
+# --- steering ---
+steer_gain: 1.0          # steer = gain * angle to the target beam
+steer_alpha: 0.8         # steering smoothing, 1.0 = none, lower = smoother
+max_steer: 0.4189        # [rad] steering limit (check against the simulator)
+
+# --- speed regulation (from the same scan) ---
+front_cone_deg: 15       # [deg] half-width of the cone used for the forward range
+speed_min: 0.8           # [m/s]
+speed_max: 2.0           # [m/s] start slow, raise in steps of 0.5
+k_range: 0.8             # speed gain on forward range
+k_steer: 2.0             # speed penalty per rad of steering

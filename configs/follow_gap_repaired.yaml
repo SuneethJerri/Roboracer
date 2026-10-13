@@ -1,0 +1,34 @@
+# Follow-the-Gap REPAIRED parameters (P2).
+# Same keys as follow_gap.yaml plus the gap-scoring weights at the bottom.
+# With w_depth = 0 and w_turn = 0 this behaves like the baseline (widest gap).
+# Tune the weights only AFTER you have seen your two failure cases (week 3).
+
+n_beams: 1080
+lidar_fov_deg: 270
+
+max_range: 6.0
+smooth_window: 5
+
+fov_deg: 180
+bubble_radius: 0.4
+free_threshold: 1.0
+min_gap_width: 5
+target_mode: center      # try "deepest" if the gap centre is the problem
+
+steer_gain: 1.0
+steer_alpha: 0.8
+max_steer: 0.4189
+
+front_cone_deg: 15
+speed_min: 0.8
+speed_max: 2.0
+k_range: 0.8
+k_steer: 2.0
+
+# --- repair: gap score = w_width*width + w_depth*depth - w_turn*turn ---
+# width = gap width / search window width        (0..1)
+# depth = mean range inside the gap / max_range  (0..1)
+# turn  = |angle to gap centre| / half search FOV (0..1)
+w_width: 1.0
+w_depth: 0.0
+w_turn: 0.0

@@ -1,0 +1,5 @@
+# Extra packages for the P2 tools. Install with:  python -m pip install -r controllers\follow_gap\requirements.txt
+# matplotlib is pinned to a release that works with numpy 1.22 (needed by f110_gym).
+matplotlib==3.7.5
+pytest
+pyyaml
