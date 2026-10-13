@@ -33,3 +33,9 @@ __pycache__/
 .idea/
 .DS_Store
 Thumbs.db
+f1env/
+venv/
+__pycache__/
+*.pyc
+.vscode/
+*.npz
