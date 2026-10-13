@@ -1,0 +1,483 @@
+=====================================================================
+P2 - FOLLOW-THE-GAP (REACTIVE DRIVING FROM RAW LIDAR)
+Complete project context and step-by-step guide
+=====================================================================
+Owner: Abhis (P2)        Team size: 5        Target: finish in 4 weeks
+Written: 13 Oct 2026
+
+Keep this file in your repo (report/p2_follow_gap/GUIDE.txt) and tick
+off the checklist at the bottom as you go.
+
+
+---------------------------------------------------------------------
+PART 1. PROJECT CONTEXT
+---------------------------------------------------------------------
+
+1.1 The overall project
+- A group project on autonomous racing with a 1:10-scale RoboRacer /
+  F1TENTH car on the Porto track.
+- Five topics, one per person:
+    P1  Pure Pursuit (geometric path tracking)
+    P2  Follow-the-Gap (reactive LIDAR driving)        <-- YOU
+    P3  Track representation / reference centreline (spline, curvature)
+    P4  Evaluation protocol and statistics (CSV schema, box plots, CIs)
+    P5  Deep RL baselines (PPO and SAC from Stable-Baselines3)
+- The report's central claim is a comparison between methods, based on
+  about 5 runs per method (small samples, so honest statistics matter).
+
+1.2 The two simulators
+- f1tenth_gym: pure-Python simulator, CPU only, runs much faster than
+  real time. Used for ALL development, tuning and training.
+  Your install is the OLD API: package f110_gym 0.2.1, gym 0.19.0,
+  4-value returns from reset() and step(), timestep 0.01 s per step.
+- AutoDRIVE: Unity-based high-fidelity digital twin, needs a GPU, runs
+  in REAL TIME only, only the Porto track, run CENTRALLY (you request
+  slots and recordings, you do not run it yourself). Gives a 1080-beam
+  270-degree LIDAR, IMU, encoders, odometry, camera. Accepts normalised
+  throttle and steering. Simulator time is the scarcest resource.
+- Rule: build and tune in f1tenth_gym, then move the finished method to
+  AutoDRIVE with NO CODE CHANGES (only config/parameter changes).
+
+1.3 What P2 is
+- Follow-the-Gap drives using ONLY the current LIDAR scan: no map, no
+  centreline, no memory of the lap.
+- Algorithm:
+    1. Clean the scan (clip far values, smooth, fix NaN/inf).
+    2. Find the nearest obstacle, blank a "safety bubble" around it.
+    3. Find the widest run of free beams (the gap).
+    4. Steer toward the middle of that gap.
+    5. Speed from the same scan: slower when steering hard and when the
+       range ahead is short.
+- A reference implementation exists in the repository (starting point).
+- THE REAL SUBSTANCE: the widest gap is not always the right direction.
+  Somewhere on Porto the rule will pick an opening that is wide in the
+  scan but wrong on the ground (past a corner, or on the outside of a
+  hairpin). You must find those cases, explain what the rule got wrong,
+  repair it, and show the repair did not cost lap time elsewhere.
+
+1.4 Your objective (from the problem statement)
+  Complete clean laps using only the current scan, and characterise
+  where the widest-gap rule selects the wrong direction on this track.
+
+1.5 Your four deliverables
+  D1  Gap selection verified offline on saved scans: the returned
+      heading points into visibly free space.
+  D2  One full lap of Porto in f1tenth_gym without collision, with
+      scan-derived speed regulation.
+  D3  Three consecutive clean laps in AutoDRIVE with NO code changes.
+  D4  Two documented failure cases (the scan, the wrong choice, the
+      repair) and lap results submitted.
+
+1.6 Reference
+  V. Sezer and M. Gokasan, "A novel obstacle avoidance algorithm:
+  Follow the Gap Method," Robotics and Autonomous Systems, 60(9), 2012.
+
+1.7 Dependencies on teammates (you are about 90% independent)
+  - P3 centreline: OPTIONAL. Only helps to analyse failures (compare
+    chosen heading to track direction).
+  - P1, P5: none.
+  - P4 CSV schema: needed when you log final results (week 2 onward).
+    Until agreed, log in your own format and convert later.
+  - Shared controller interface: agree once, early.
+  - AutoDRIVE slots: your one real external dependency. Book early.
+
+
+---------------------------------------------------------------------
+PART 2. WHAT YOU HAVE ALREADY DONE (STATUS)
+---------------------------------------------------------------------
+[x] Python 3.9 virtual environment created: C:\Users\abhis\f1env
+[x] f1tenth_gym (f110_gym 0.2.1) cloned to C:\Users\abhis\f1tenth_gym
+    and installed in editable mode; waypoint_follow.py example runs.
+[x] Drafted ftg.py (FollowGap class) and record_run.py (run + log).
+[ ] Not yet: team repo cloned, Porto map obtained, reference FTG found,
+    AutoDRIVE slot requested, first FTG run, plots, tests.
+
+
+---------------------------------------------------------------------
+PART 3. ENVIRONMENT RULES (avoid the problems you already hit)
+---------------------------------------------------------------------
+1. ALWAYS activate the venv first:
+       C:\Users\abhis\f1env\Scripts\Activate.ps1
+   You should see (f1env) at the start of the prompt.
+2. ALWAYS use "python -m pip", NEVER plain "pip". Plain pip launched
+   your system Python 3.15 and caused the BackendUnavailable errors.
+3. Keep numpy at 1.22.0 (the simulator needs it). Do not upgrade it.
+4. Run example scripts from inside their own folder (the examples read
+   config files with relative paths).
+5. In VS Code: Ctrl+Shift+P -> Python: Select Interpreter ->
+   C:\Users\abhis\f1env\Scripts\python.exe
+6. The RK4 UserWarning is harmless. "Rendering window was closed" is
+   deliberate when you close the window. Ignore both.
+7. Never commit inside f1tenth_gym. Never commit f1env.
+
+
+---------------------------------------------------------------------
+PART 4. FOLDER AND REPO STRUCTURE
+---------------------------------------------------------------------
+One shared team Git repo. Only edit your own folders.
+
+roboracer-project/
+  README.md
+  requirements.txt
+  configs/
+    env_gym.yaml
+    env_autodrive.yaml
+    pure_pursuit.yaml            (P1)
+    follow_gap.yaml              (YOU - baseline)
+    follow_gap_repaired.yaml     (YOU - repaired)
+  common/                        (shared; changes need team approval)
+    interface.py                 Controller: act(scan, pose=None)->(steer, speed)
+    logger.py                    writes CSV in P4's schema
+    utils.py
+  sims/
+    gym_env.py                   f1tenth_gym wrapper
+    autodrive_env.py             AutoDRIVE / ROS 2 wrapper, same interface
+  centreline/                    (P3)
+  controllers/
+    pure_pursuit/                (P1)
+    follow_gap/                  (YOU)
+      ftg.py                     baseline controller
+      ftg_repaired.py            repaired controller
+      tests/                     unit tests on synthetic scans
+      tools/
+        record_run.py            run laps, save per-step data
+        find_bad_moments.py      flag collisions / near-misses / flips
+        plot_scan.py             polar plots
+      data/
+        scans/                   saved scans (.npz)
+        plots/                   plots for the report
+        runs/                    raw per-step run logs
+  rl/                            (P5)
+  evaluation/                    (P4)
+  scripts/                       run_gym.py, run_autodrive.py
+  results/                       results/<method>/<run_id>.csv
+  report/p2_follow_gap/          your report section
+
+Git rules:
+- Your branch: p2-followgap. Merge into main by pull request.
+- git checkout main; git pull; git checkout p2-followgap;
+  git merge main      <- do this at the start of every session.
+- Commit small and often, push at the end of every session.
+- Do not change common/ or sims/ without telling the team.
+- Parameters live in YAML, never hardcoded.
+- .gitignore must include: f1env/  venv/  __pycache__/  *.pyc  .vscode/
+
+
+---------------------------------------------------------------------
+PART 5. THE CONTROLLER INTERFACE AND KEY FORMULAS
+---------------------------------------------------------------------
+Interface (agreed with team):  steer, speed = controller.act(scan, pose=None)
+  - scan: array of 1080 ranges in metres, 270 degrees, index 540 is
+    straight ahead, index 0 is the right-most beam (-135 deg),
+    angle increases to the left.
+  - steer: radians, positive = left (check sign in AutoDRIVE mapping).
+  - speed: m/s (the sim wrapper converts to normalised throttle).
+  - FTG ignores pose; it must work from the scan alone.
+
+Formulas:
+  angle(idx)      = -135 deg + idx * (270 / 1079)
+  bubble half-width (beams) = ceil( atan(bubble_radius / nearest_dist)
+                                    / angle_per_beam )
+  steer           = clip(steer_gain * angle(target_idx), -max_steer, max_steer)
+  speed           = clip(k_range * front_range - k_steer * |steer|,
+                         speed_min, speed_max)
+  front_range     = minimum range in the central +-15 degree cone
+
+Control rate: the gym steps at 100 Hz. Repeat each command for 5 steps
+so the controller runs at 20 Hz, the rate used in AutoDRIVE and RL.
+
+
+---------------------------------------------------------------------
+PART 6. FOUR-WEEK PLAN, STEP BY STEP
+---------------------------------------------------------------------
+Budget: about 15-20 h per week, 65-75 h total.
+Book the first AutoDRIVE slot in WEEK 1.
+
+=== WEEK 1: Setup, controller, offline verification (D1) ===  15-18 h
+
+Day 1 (about 3 h) - team and access
+ 1. Message the team and get: the team repo URL, the Porto map files
+    (.png + .yaml), the location of the reference FTG, the schema
+    owner (P4), and who coordinates AutoDRIVE.
+ 2. Request your first AutoDRIVE slot for the end of week 2.
+ 3. Confirm the shared interface act(scan, pose=None) -> (steer, speed),
+    the scan format (1080 beams, 270 deg, metres) and the steer/speed
+    units and sign convention.
+ 4. Clone the team repo to C:\Users\abhis\roboracer-project, set your
+    git name/email, create branch p2-followgap.
+ 5. Copy ftg.py, record_run.py and follow_gap.yaml into your folders.
+ 6. Commit and push.
+
+Days 2-3 (about 4 h) - understand the reference
+ 7. Skim the Sezer & Gokasan paper. Read the reference FTG line by
+    line; be able to explain preprocess, bubble, gap search, target.
+ 8. List everything hardcoded in the reference; make sure each item is
+    a parameter in follow_gap.yaml.
+ 9. Put Porto in the simulator: copy the map files somewhere stable,
+    write an env config yaml (map_path, map_ext, start pose sx, sy,
+    stheta) like examples/config_example_map.yaml. Check the start
+    pose puts the car on track facing forward (view it with --render).
+
+Days 3-5 (about 6 h) - first runs
+10. Run: python controllers\follow_gap\tools\record_run.py
+        --env_config <path to Porto env yaml> --render
+11. If it crashes: lower speed_max (1.5), raise bubble_radius (0.5).
+    Change ONE parameter at a time, note the result in a lab notebook
+    (date, parameter changed, outcome).
+12. Keep config in YAML only. If you must change controller behaviour,
+    add a parameter.
+
+Days 5-7 (about 4 h) - offline verification, D1
+13. Write tools/plot_scan.py: polar plot of one scan: filled range
+    shape, bubble marked, every gap in its own colour, arrow for the
+    chosen heading, and the car position on the map beside it.
+14. Save 20-30 scans from runs at: straights, every corner, hairpins,
+    and the start. Store in data/scans/ (.npz).
+15. Write unit tests in tests/ with synthetic scans (pytest):
+      - wall on the left            -> heading to the right (steer < 0)
+      - wall on the right           -> heading to the left (steer > 0)
+      - open corridor               -> heading about 0
+      - one narrow gap, one wide    -> picks the wide one (baseline)
+      - all beams blocked / NaN/inf -> no crash, safe output
+      - nothing behind the car is ever chosen (FOV restriction)
+16. Make 10+ plots into data/plots/. D1 is DONE when every arrow
+    visibly points into free space.
+End of week 1: controller exists, tests pass, plots saved, slot booked.
+
+=== WEEK 2: Full lap, logging, first AutoDRIVE test (D2) ===  16-20 h
+
+Days 1-3 (about 6 h) - speed regulation and the first full lap
+ 1. Start with speed_max 2.0 and confirm one clean lap of Porto.
+ 2. Raise speed_max in steps of 0.5; at each step run 3 laps and note
+    lap time and collisions. Stop when collisions appear, then step
+    back one notch.
+ 3. Tune k_range and k_steer so the car slows before corners and not
+    on straights.
+ 4. D2 is DONE when one full lap completes with no collision. Save the
+    exact parameter file used (follow_gap.yaml) and commit it with a
+    tag, e.g. git tag ftg-baseline-v1.
+
+Days 3-5 (about 5 h) - logging
+ 5. Make sure record_run.py saves every step: time, full scan, steer,
+    speed, x, y, theta, front range, collision flag.
+ 6. Get P4's CSV schema; write a small converter that turns a run .npz
+    into one CSV row per run (lap time, best lap, collisions, success)
+    with the units P4 defines. Write results to
+    results/follow_gap/<run_id>.csv.
+ 7. If the schema is not ready yet, keep raw .npz and convert later;
+    never lose raw data.
+
+Days 5-7 (about 6 h) - baseline statistics and first AutoDRIVE test
+ 8. Run 10 baseline laps (different start poses if possible), log them.
+ 9. Use your AutoDRIVE slot to test the BASELINE. Goal is discovery,
+    not perfection. Write down everything that differs:
+      - LIDAR noise, range limit, NaN/inf values
+      - throttle/steer normalisation
+      - latency and control rate
+      - how fast the car actually moves for a given command
+10. Fix the differences in CONFIG (and in the sim wrapper if needed),
+    NEVER in the controller code. Create configs/env_autodrive.yaml
+    values for the mapping.
+End of week 2: clean gym laps, logging works, AutoDRIVE differences known.
+
+=== WEEK 3: Failure analysis and repair (D4 analysis) ===  16-20 h
+
+Days 1-2 (about 6 h) - find the bad moments
+ 1. Write tools/find_bad_moments.py. Load a run .npz and flag steps with:
+      a. Collision (keep the 2 seconds BEFORE it: the bad decision
+         happens earlier than the crash)
+      b. Near-miss: minimum range in the forward +-60 deg below 0.3 m
+      c. Steering flip: steer changes sign within a few steps
+         (left-right-left = two gaps competing)
+      d. Very low speed for many steps (stuck/hesitating)
+      e. If P3's centreline is ready: chosen heading differs from the
+         track direction by more than about 40 deg, or lateral
+         deviation spikes
+ 2. Provoke failures deliberately:
+      - spawn at 8-10 different places (before every corner/hairpin)
+      - raise speed slightly
+      - vary bubble_radius (small bubbles show failures big ones hide)
+      - replay saved scans offline: which gap does the rule pick and
+        is it right? A wrong choice does not need a crash to be found.
+
+Days 3-4 (about 5 h) - classify and pick two cases
+ 3. Plot every flagged moment with plot_scan.py. For each ask:
+    "Is the arrow pointing where the track actually continues?"
+      NO  -> gap-selection failure: it counts for your analysis
+      YES -> speed or bubble problem: tune it and move on
+ 4. Choose TWO clear gap-selection failures (likely: a wide opening
+    past a corner, and the outside of a hairpin). For each, write:
+      - Where on the track (coordinates / corner name)
+      - The scan plot (save in data/plots/)
+      - What the rule picked and WHY (widest run of free beams)
+      - What was actually correct (where the track continues)
+      - The proposed repair
+
+Days 5-7 (about 7 h) - repair and compare
+ 5. Implement the repair in ftg_repaired.py with its own
+    follow_gap_repaired.yaml. Pick based on what you observed:
+      - score gaps by depth AND width, not width alone
+      - steer toward the deepest beam in the gap instead of its centre
+      - penalise gaps requiring a big steering change vs the last one
+      - disparity extender, or a bigger bubble in corners
+      - apply the fix conditionally (only when the failure pattern is
+        detected)
+ 6. Write NEW unit tests that reproduce your two failure scans: the
+    baseline must fail them, the repaired version must pass them.
+ 7. Run both versions on the SAME start poses and the same conditions,
+    at least 5 runs each. Compare lap time and collisions.
+ 8. If the repair slows laps elsewhere, retune or make it conditional.
+ 9. Commit and tag: git tag ftg-repaired-v1.
+End of week 3: two documented failures, repaired controller, before/after
+numbers.
+
+=== WEEK 4: Final runs and write-up (D3, D4 results) ===  16-20 h
+
+Days 1-3 (about 7 h) - AutoDRIVE final runs, D3
+ 1. FREEZE code and parameters. Record the commit hash and the yaml.
+ 2. In your AutoDRIVE slot: three consecutive clean laps with the same
+    code (D3). Aim for about 5 runs per version if slots allow.
+ 3. If a lap fails, change CONFIG only, never code; rerun and record
+    every attempt (failed runs are data too, report them).
+ 4. Request recordings for the demonstration if needed.
+
+Days 3-5 (about 5 h) - results and figures
+ 5. Put all runs in results/follow_gap/ and results/follow_gap_repaired/
+    in P4's format.
+ 6. Work with P4 for box plots, summary table, interquartile means and
+    bootstrap confidence intervals. With about 5 runs per method, state
+    what size of difference can actually be resolved. Do not claim
+    differences that the protocol cannot resolve.
+
+Days 5-7 (about 6 h) - write-up
+ 7. Report section in report/p2_follow_gap/:
+      a. Algorithm description with a diagram
+      b. Parameters and why you chose them
+      c. Offline verification plots (D1)
+      d. Gym lap results (D2)
+      e. Two failure cases: scan, wrong choice, why, repair
+      f. Before/after comparison with uncertainty
+      g. AutoDRIVE results (D3) and what differed from the gym
+      h. Limitations: what the repair does not solve; simulator
+         differences; small sample size
+ 8. Final check against the checklist in Part 9, merge to main, tag the
+    final version.
+
+
+---------------------------------------------------------------------
+PART 7. HOW TO DETECT "THE RULE CHOSE WRONG"
+---------------------------------------------------------------------
+Workflow: record -> flag -> plot -> judge -> repair -> re-run.
+
+ - Log every step: scan (1080 values), steer, speed, x, y, theta,
+   front range, collision flag, time.
+ - Flag: collisions (and the 2 s before), near-misses, steering flips,
+   stuck/slow moments, centreline disagreement (if P3 available).
+ - Plot: polar scan, bubble, all gaps in colour, chosen heading arrow,
+   and the car on the map.
+ - Judge: arrow into a real continuation of the track = rule was right
+   (the crash was speed or bubble). Arrow into a wall pocket, the
+   outside of a hairpin, or an opening past the corner = gap-selection
+   failure.
+ - Only gap-selection failures count for the two documented cases.
+
+
+---------------------------------------------------------------------
+PART 8. RISKS AND PREVENTION
+---------------------------------------------------------------------
+ - AutoDRIVE slot comes too late      -> request in week 1, test week 2
+ - Controller needs code change for AutoDRIVE -> keep scan-only and
+   fully parameterised; changes go into configs or the sim wrapper
+ - Repair fixes a corner but slows laps -> always compare on identical
+   starts, and make the repair conditional if needed
+ - Only crashes are counted as failures -> also replay saved scans
+ - Metric/schema changes late         -> keep raw per-step data so the
+   CSV can be regenerated
+ - Tuning on one start only           -> use several start poses
+ - Overwriting results                -> one file per run, never edit raw
+ - Forgetting to record parameters    -> commit a yaml + tag per version
+ - Python/pip confusion               -> python -m pip, activate f1env
+
+
+---------------------------------------------------------------------
+PART 9. FINAL CHECKLIST
+---------------------------------------------------------------------
+Setup
+[ ] Team repo cloned; branch p2-followgap pushed
+[ ] Porto map and env config working in f1tenth_gym
+[ ] AutoDRIVE slots booked (first for end of week 2)
+[ ] Interface, scan format, units and CSV schema agreed
+
+D1 - offline gap check
+[ ] ftg.py configurable via follow_gap.yaml
+[ ] Unit tests pass (wall left/right, corridor, narrow vs wide, NaN)
+[ ] 20-30 scans saved; 10+ polar plots, every arrow in free space
+
+D2 - gym lap
+[ ] One full Porto lap, no collision, scan-based speed regulation
+[ ] Parameters saved and tagged (ftg-baseline-v1)
+[ ] 10 baseline laps logged in P4's format
+
+D4 - failure analysis
+[ ] find_bad_moments.py written and run
+[ ] Two failure cases: location, scan plot, wrong choice, why, repair
+[ ] ftg_repaired.py + yaml; new tests reproduce both failures
+[ ] 5+ runs per version on identical starts; lap time and collisions
+[ ] Repair does not cost lap time elsewhere (or is conditional)
+
+D3 - AutoDRIVE
+[ ] First AutoDRIVE test done; differences documented
+[ ] Code frozen; commit hash and parameters recorded
+[ ] Three consecutive clean laps, NO code changes
+[ ] About 5 runs per version if slots allowed
+
+Delivery
+[ ] All runs in results/ in P4's format
+[ ] Box plots / summary table with uncertainty (with P4)
+[ ] Report section written (items a-h in week 4)
+[ ] Everything merged to main; final tag created
+
+
+---------------------------------------------------------------------
+PART 10. COMMAND CHEAT SHEET (PowerShell)
+---------------------------------------------------------------------
+Activate venv:
+    C:\Users\abhis\f1env\Scripts\Activate.ps1
+
+Install a package:
+    python -m pip install <package>
+
+Run FTG with window / without window (faster):
+    python controllers\follow_gap\tools\record_run.py --env_config <porto_env.yaml> --render
+    python controllers\follow_gap\tools\record_run.py --env_config <porto_env.yaml>
+
+Run tests:
+    python -m pip install pytest
+    python -m pytest controllers\follow_gap\tests
+
+Git (daily):
+    git checkout main ; git pull ; git checkout p2-followgap ; git merge main
+    git add . ; git commit -m "message" ; git push
+Tag a version:
+    git tag ftg-baseline-v1 ; git push --tags
+
+Open the project in VS Code:
+    code .
+
+
+---------------------------------------------------------------------
+PART 11. FILES STILL TO BE WRITTEN (ask your AI assistant)
+---------------------------------------------------------------------
+ 1. tools/plot_scan.py          polar plot tool (D1)
+ 2. tests/test_ftg.py           synthetic-scan unit tests (D1)
+ 3. tools/find_bad_moments.py   flagging script (week 3)
+ 4. ftg_repaired.py             after you have seen your failure cases
+ 5. npz -> CSV converter        once P4's schema is fixed
+ 6. Report section template     week 4
+
+Whenever you ask for help, paste: the exact error text, the command you
+ran, your folder, and the parameter file you used.
+
+=====================================================================
+END OF GUIDE
+=====================================================================

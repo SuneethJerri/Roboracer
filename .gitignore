@@ -1,41 +1,81 @@
-# ---------------------------------------------------------------------------
-# Deny by default. ONLY scripts/ is committed — nothing else leaves this machine.
-#
-# Everything else (CLAUDE.md, docs/, literature/, reports/) stays on disk and
-# works normally; it is simply never offered to git.
-#
-# NOTE: this governs UNTRACKED files only. The upstream simulator, devkit,
-# Dockerfiles and graphics are already tracked and are unaffected. A NEW file
-# under autodrive_devkit/ will be ignored — add an allow rule or `git add -f`.
-# ---------------------------------------------------------------------------
-*
+# ============================================================
+# Git ignore rules for Roboracer
+# Track source code, configs, reports and project files.
+# Ignore generated files, environments, caches and raw data.
+# ============================================================
 
-# Git must be able to descend into directories, or nothing inside one can be
-# un-ignored. This permits traversal, not the files.
-!*/
-
-# --- the only things we commit ---------------------------------------------
-!/scripts/*.py
-!/scripts/*.sh
-!/.gitignore
-
-# --- never, even if a rule above would otherwise allow it ------------------
-# Listed last because the last matching rule wins.
-*.pdf
-*.docx
-*.pptx
-*.zip
+# ------------------------------------------------------------
+# Python
+# ------------------------------------------------------------
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
-.ipynb_checkpoints/
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
+
+# Virtual environments
 f1env/
 venv/
-__pycache__/
-*.pyc
+.venv/
+env/
+
+# Test / tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ------------------------------------------------------------
+# IDE / editor files
+# ------------------------------------------------------------
 .vscode/
+.idea/
+
+# ------------------------------------------------------------
+# OS files
+# ------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ------------------------------------------------------------
+# Generated / temporary files
+# ------------------------------------------------------------
+*.tmp
+*.temp
+*.log
+*.bak
+*.swp
+*.swo
+
+# ------------------------------------------------------------
+# Large/raw/generated data
+# ------------------------------------------------------------
+# Raw experiment data
 *.npz
+
+# ------------------------------------------------------------
+# Archives / exported documents
+# ------------------------------------------------------------
+*.zip
+
+# ------------------------------------------------------------
+# Python packaging / build output
+# ------------------------------------------------------------
+build/
+dist/
+*.egg-info/
+
+# ------------------------------------------------------------
+# Keep the actual project files
+# ------------------------------------------------------------
+# Source code:
+#   scripts/
+#   controllers/
+#
+# Configuration:
+#   configs/
+#
+# Reports/documentation:
+#   report/
+#
+# These directories are intentionally NOT ignored.
+# ============================================================

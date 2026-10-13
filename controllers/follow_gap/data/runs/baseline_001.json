@@ -1,0 +1,39 @@
+{
+  "run_id": "baseline_001",
+  "variant": "baseline",
+  "controller_config": "follow_gap.yaml",
+  "params": {
+    "n_beams": 1080,
+    "lidar_fov_deg": 270,
+    "max_range": 6.0,
+    "smooth_window": 5,
+    "fov_deg": 180,
+    "bubble_radius": 0.4,
+    "free_threshold": 1.0,
+    "min_gap_width": 5,
+    "target_mode": "center",
+    "steer_gain": 1.0,
+    "steer_alpha": 0.8,
+    "max_steer": 0.4189,
+    "front_cone_deg": 15,
+    "speed_min": 0.8,
+    "speed_max": 2.0,
+    "k_range": 0.8,
+    "k_steer": 2.0
+  },
+  "start_pose": [
+    0.7,
+    0.0,
+    1.37079632679
+  ],
+  "control_hz": 20.0,
+  "steps": 2054,
+  "sim_time_s": 102.7,
+  "collision": false,
+  "laps_completed": 1,
+  "lap_times_s": [
+    90.9
+  ],
+  "clean": false,
+  "error": null
+}
