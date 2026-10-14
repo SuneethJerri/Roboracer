@@ -699,6 +699,17 @@ def selftest():
     # point of C3: the failure shows up where averaging cannot hide it.
     assert m2.shortfall > 0.0 and violation(m2.rollouts) > 0.0
     assert m2.cost > m.cost, 'an unfinished draw must imply a longer time than a finished one'
+    # --start means REAL gains on both paths, and the conversion is not the identity:
+    # feeding real values in where unit coordinates belong clips to the box and pins
+    # gains to corners. The Follow-the-Gap defaults are the case that bit.
+    ftg_real = [1.22, 0.30, 1.00, 0.40, 0.40, 3.00]
+    ftg_unit = to_unit(ftg_real)
+    assert np.all((ftg_unit >= 0) & (ftg_unit <= 1))
+    assert not np.allclose(ftg_unit, np.clip(ftg_real, 0, 1)), (
+        'real gains read as unit coordinates must differ from the correct conversion, '
+        'or this test cannot detect the confusion')
+    assert np.allclose(to_real(ftg_unit), ftg_real), 'the round trip must be exact'
+
     # The ablation's plumbing: `channel` selects which scalar the unconstrained loop
     # minimises, and both names must resolve on the record it reads. Verified against the
     # archived penalty run as well -- `--channel score` reproduces it on every column,
@@ -776,11 +787,22 @@ def main(argv):
     q.add_argument('--map', default='Spielberg', help='f1tenth backend only')
     q.add_argument('--out', default=None)
     o = q.parse_args(argv)
+    # --start is REAL gain values, on both paths. It used to be real gains for the
+    # unconstrained loop (which carries them in via apply_gains, since spsa() reads the
+    # module globals for its start point) and unit-box coordinates for the constrained
+    # one, which took the same list straight in as `u`. The same string therefore meant
+    # two different points, and the second silently clipped to the box: a start of
+    # `1.22,0.30,1.00,0.40,0.40,3.00` -- the Follow-the-Gap defaults -- became
+    # `1.00,0.30,1.00,0.40,0.40,1.00` in unit coordinates, i.e. three gains pinned to a
+    # corner. Convert once, here, so there is one meaning.
+    start_u = None
     if o.start:
         vals = [float(x) for x in o.start.split(',')]
         assert len(vals) == P, f'--start needs {P} values, got {len(vals)}'
         apply_gains(np.array(vals))
+        start_u = to_unit(vals)
         print('start gains:', dict(zip([n for n, _, _ in GAINS], vals)))
+        print('start (unit):', np.round(start_u, 4))
 
     pool = None
     if o.backend == 'f1tenth':
@@ -803,9 +825,7 @@ def main(argv):
             spsa_constrained(pool, o.iters, o.laps, a=o.a, b=o.b, c=o.c, seed=o.seed,
                              out=o.out, max_step=o.max_step, timeout=o.timeout,
                              alpha=o.alpha, lam0=o.lam0,
-                             tracks_per_iter=o.tracks_per_iter,
-                             start=[float(x) for x in o.start.split(',')]
-                             if o.start else None)
+                             tracks_per_iter=o.tracks_per_iter, start=start_u)
         else:
             spsa(iface, o.iters, o.laps, o.a, o.c, seed=o.seed, out=o.out,
                  max_step=o.max_step, timeout=o.timeout, ref_lap=o.ref_lap,
