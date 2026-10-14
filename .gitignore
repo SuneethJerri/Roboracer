@@ -17,6 +17,11 @@
 # --- the only things we commit ---------------------------------------------
 !/scripts/*.py
 !/scripts/*.sh
+# The frozen Follow-the-Gap baselines: the one piece of data the committed code
+# cannot work without. circuits.py reads it on import and raises without it, and
+# every normalised score ever recorded is relative to these numbers. Measurement
+# output, not notes -- the notebook and the experiment CSVs stay local.
+!/data/baseline_ftg.csv
 !/.gitignore
 !/README.md
 
