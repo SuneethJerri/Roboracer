@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------------------
 # Deny by default. ONLY scripts/ is committed — nothing else leaves this machine.
 #
-# Everything else (CLAUDE.md, docs/, literature/, reports/) stays on disk and
+# Everything else (notes/, docs/, literature/, reports/) stays on disk and
 # works normally; it is simply never offered to git.
 #
 # NOTE: this governs UNTRACKED files only. The upstream simulator, devkit,
