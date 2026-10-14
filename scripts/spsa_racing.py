@@ -285,7 +285,19 @@ def measure(pool, u, tracks, laps=1, timeout=250.0, ref_lap=None):
 # ------------------------------------------------------------------------------- SPSA
 def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
          max_step=0.10, timeout=60.0, ref_lap=None, normalize=False,
-         pool=None, tracks_per_iter=0):
+         pool=None, tracks_per_iter=0, channel='score'):
+    """Unconstrained SPSA on one scalar channel.
+
+    `channel` picks WHICH scalar: 'score' is the graded-penalty objective, 'cost' is the
+    implied lap time. It exists to separate two things the constrained run confounds.
+    The constrained optimiser changed the cost function AND added a multiplier at the same
+    time, and it beat this loop decisively -- but its lambda barely moved, so the win
+    cannot be attributed. Running this loop on 'cost' holds the cost function fixed and
+    removes only the dual, which is the ablation. 'score' must stay the default so every
+    number already recorded reproduces.
+    """
+    if channel not in ('score', 'cost'):
+        raise ValueError(f"channel must be 'score' or 'cost', got {channel!r}")
     if out is None:
         out = f'spsa_racing_{time.strftime("%Y%m%d-%H%M%S")}.csv'
     if os.path.dirname(out):
@@ -302,8 +314,11 @@ def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
     trng = np.random.default_rng([seed, 1])         # circuit draws
     u = to_unit([ftg.FOV, ftg.BUBBLE_R, ftg.GAP_THRESH, ftg.MAX_THROTTLE,
                  ftg.MAX_STEER, ftg.CLEARANCE])
+    # `channel` is constant within a file, and that is exactly why it is written: two CSV
+    # families now exist whose y_plus means different quantities, and nothing else in the
+    # row distinguishes them.
     fields = (['iter', 'a_n', 'c_n'] + [n for n, _, _ in GAINS]
-              + ['y_plus', 'y_minus', 'feas_plus', 'feas_minus', 'circuits'])
+              + ['y_plus', 'y_minus', 'feas_plus', 'feas_minus', 'circuits', 'channel'])
 
     with open(out, 'w', newline='') as fh:
         w = csv.DictWriter(fh, fieldnames=fields)
@@ -321,12 +336,14 @@ def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
                 tracks = circuits.sample(tracks_per_iter, trng)
                 mp = measure(pool, u + cn*d, tracks, laps, timeout, ref_lap)
                 mm = measure(pool, u - cn*d, tracks, laps, timeout, ref_lap)
-                yp, fp, ym, fm = mp.score, mp.feasible, mm.score, mm.feasible
+                yp, fp = getattr(mp, channel), mp.feasible
+                ym, fm = getattr(mm, channel), mm.feasible
             else:
                 tracks = (getattr(iface, 'map_name', ''),)
                 rp = rollout(iface, u + cn * d, laps, timeout, ref_lap, normalize)
                 rm = rollout(iface, u - cn * d, laps, timeout, ref_lap, normalize)
-                yp, fp, ym, fm = rp.score, rp.feasible, rm.score, rm.feasible
+                yp, fp = getattr(rp, channel), rp.feasible
+                ym, fm = getattr(rm, channel), rm.feasible
             # Clip the step. One T_MAX rollout makes (y+ - y-) ~ -70, which without a
             # cap moves u by >10 box-widths and pins every gain to a corner for the rest
             # of the run. Bounding how far a single noisy measurement can move us is the
@@ -341,7 +358,7 @@ def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
                 # when 40 had actually been spent.
                 row = {'iter': n, 'a_n': an, 'c_n': cn, 'y_plus': yp, 'y_minus': ym,
                        'feas_plus': int(fp), 'feas_minus': int(fm),
-                       'circuits': ';'.join(tracks)}
+                       'circuits': ';'.join(tracks), 'channel': channel}
                 row.update({nm: v for (nm, _, _), v in zip(GAINS, to_real(u))})
                 w.writerow(row); fh.flush()
                 continue
@@ -351,7 +368,7 @@ def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
             real = to_real(u)
             row = {'iter': n, 'a_n': an, 'c_n': cn, 'y_plus': yp, 'y_minus': ym,
                    'feas_plus': int(fp), 'feas_minus': int(fm),
-                   'circuits': ';'.join(tracks)}
+                   'circuits': ';'.join(tracks), 'channel': channel}
             row.update({name: v for (name, _, _), v in zip(GAINS, real)})
             w.writerow(row)
             fh.flush()                               # survive a Ctrl-C mid-run
@@ -682,6 +699,21 @@ def selftest():
     # point of C3: the failure shows up where averaging cannot hide it.
     assert m2.shortfall > 0.0 and violation(m2.rollouts) > 0.0
     assert m2.cost > m.cost, 'an unfinished draw must imply a longer time than a finished one'
+    # The ablation's plumbing: `channel` selects which scalar the unconstrained loop
+    # minimises, and both names must resolve on the record it reads. Verified against the
+    # archived penalty run as well -- `--channel score` reproduces it on every column,
+    # a_n and the circuit draws included -- which is what makes the ablation an ablation
+    # and not two unrelated runs. A typo must raise rather than silently pick a default,
+    # because the two channels differ by ~2.8x on a failure and the CSV would look
+    # plausible either way.
+    for ch in ('score', 'cost'):
+        assert isinstance(getattr(m, ch), float)
+    try:
+        spsa(None, channel='implied')
+    except ValueError as e:
+        assert 'channel' in str(e)
+    else:
+        raise AssertionError('an unknown channel must raise')
     # The B2 guard: a timeout under the circuit's own baseline must refuse, not quietly
     # measure the progress penalty and call it a lap time.
     try:
@@ -725,6 +757,10 @@ def main(argv):
                    help='scale failures to a typical lap instead of the timeout')
     q.add_argument('--timeout', type=float, default=60.0,
                    help='seconds per rollout before scoring T_MAX')
+    q.add_argument('--channel', default='score', choices=['score', 'cost'],
+                   help='which scalar the UNCONSTRAINED loop minimises: the graded '
+                        'penalty (default) or the implied lap time. The ablation that '
+                        'separates the cost function from the multiplier.')
     q.add_argument('--c3', action='store_true',
                    help='constrained primal-dual SPSA (notebook C3) instead of the '
                         'unconstrained penalty form')
@@ -773,7 +809,7 @@ def main(argv):
         else:
             spsa(iface, o.iters, o.laps, o.a, o.c, seed=o.seed, out=o.out,
                  max_step=o.max_step, timeout=o.timeout, ref_lap=o.ref_lap,
-                 pool=pool, tracks_per_iter=o.tracks_per_iter)
+                 pool=pool, tracks_per_iter=o.tracks_per_iter, channel=o.channel)
     finally:
         (pool or iface).close()
 
