@@ -79,3 +79,16 @@ dist/
 #
 # These directories are intentionally NOT ignored.
 # ============================================================
+# --- run output (added with the shared runner) ---------------------------------
+# Logs and plots are regenerated from code; keep them out of the history so the repo
+# does not fill with large binaries. Commit a figure only when it goes in the report.
+results/*.csv
+results/*.npz
+results/*.log
+*.npz
+controllers/*/data/runs/*.csv
+controllers/*/data/plots/*.png
+!controllers/*/data/**/.gitkeep
+__pycache__/
+.venv
+.venv/
