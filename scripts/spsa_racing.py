@@ -24,6 +24,7 @@ from typing import NamedTuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import follow_the_gap as ftg                                    # noqa: E402
+from spsa_testbed import FAMILIES                                # noqa: E402
 
 ALPHA, GAMMA = 0.602, 0.101
 T_MAX = 90.0            # score for a rollout that never finishes, seconds
@@ -130,6 +131,26 @@ def apply_gains(real):
         setattr(ftg, name, float(v))
 
 
+def perturbation(family, p=None):
+    """A perturbation generator `pert(n, rng) -> delta` from the testbed's families (R5).
+
+    `sf-gaussian` has no finite inverse moment, so it cannot be divided by: smoothed
+    functionals MULTIPLY instead, and `sf_form()` reports which estimator to use.
+    """
+    if family not in FAMILIES:
+        raise ValueError(f'unknown family {family!r}; have {sorted(FAMILIES)}')
+    return FAMILIES[family](P if p is None else p)
+
+
+def sf_form(family):
+    return family == 'sf-gaussian'
+
+
+def grad(dy, cn, d, is_sf):
+    """One-sided difference into a gradient estimate. SF multiplies by the perturbation,
+    SPSA/RDKW divides -- the same branch as `spsa_testbed.run`, kept identical on purpose."""
+    return d * dy / (2 * cn) if is_sf else dy / (2 * cn * d)
+
 # ------------------------------------------------------------------------ the rollout
 class Rollout(NamedTuple):
     """What one rollout measured.
@@ -151,7 +172,8 @@ class Rollout(NamedTuple):
     shortfall: float = float('nan')     # 1 - progress (C3's constraint channel)
 
 
-def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None, normalize=False):
+def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None, normalize=False,
+            act=None):
     """Reset, drive, and report what happened for gains `u`.
 
     `normalize` divides the score by the circuit's frozen baseline (D5) and, unless
@@ -159,6 +181,11 @@ def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None, normalize=False
     off the interface's own circuit so a caller cannot forget one and not the other --
     a global ref_lap would charge Shanghai and IMS the same failure cost despite a 2x
     lap-time difference, smuggling back exactly the length weighting D5 removes.
+
+    `act(iface) -> (steering, throttle)` replaces Follow-the-Gap, so a learned policy is
+    scored through THIS function and not a second one (D13). `u` is then None. One scoring
+    path means one normalisation, one failure scalar and one feasibility rule; a parallel
+    evaluator is how B1 happened.
     """
     circuit = getattr(iface, 'map_name', '')
     base = None
@@ -175,7 +202,10 @@ def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None, normalize=False
                              f'{base:.1f}s; nothing can finish (notebook B2)')
         if ref_lap is None:
             ref_lap = base
-    apply_gains(to_real(u))
+    if (u is None) == (act is None):
+        raise ValueError('pass gains `u` or a policy `act`, not both and not neither')
+    if u is not None:
+        apply_gains(to_real(u))
     iface.reset()
     start_laps, start_col = iface.laps, iface.collisions
     # Time laps OURSELVES rather than trusting the simulator's last_lap_time. Resetting
@@ -190,7 +220,8 @@ def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None, normalize=False
     while iface.now() < deadline and len(lap_times) < laps_wanted:
         if not iface.wait_for_scan(timeout=2.0):
             break
-        steer, throttle = ftg.plan(iface.scan, iface.angle_min, iface.angle_increment)
+        steer, throttle = (act(iface) if act else
+                           ftg.plan(iface.scan, iface.angle_min, iface.angle_increment))
         iface.send(steer, throttle)
         if iface.laps > seen:
             now = iface.now()
@@ -285,7 +316,7 @@ def measure(pool, u, tracks, laps=1, timeout=250.0, ref_lap=None):
 # ------------------------------------------------------------------------------- SPSA
 def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
          max_step=0.10, timeout=60.0, ref_lap=None, normalize=False,
-         pool=None, tracks_per_iter=0, channel='score'):
+         pool=None, tracks_per_iter=0, channel='score', family='bernoulli'):
     """Unconstrained SPSA on one scalar channel.
 
     `channel` picks WHICH scalar: 'score' is the graded-penalty objective, 'cost' is the
@@ -298,6 +329,11 @@ def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
     """
     if channel not in ('score', 'cost'):
         raise ValueError(f"channel must be 'score' or 'cost', got {channel!r}")
+    # `family` is the C2 knob. 'bernoulli' draws exactly what this loop drew before it
+    # existed, so every recorded run reproduces bit-for-bit; that is what makes a family
+    # comparison an ablation of one variable rather than two unrelated runs (as R13 did
+    # for `channel`).
+    pert, is_sf = perturbation(family), sf_form(family)
     if out is None:
         out = f'spsa_racing_{time.strftime("%Y%m%d-%H%M%S")}.csv'
     if os.path.dirname(out):
@@ -318,7 +354,8 @@ def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
     # families now exist whose y_plus means different quantities, and nothing else in the
     # row distinguishes them.
     fields = (['iter', 'a_n', 'c_n'] + [n for n, _, _ in GAINS]
-              + ['y_plus', 'y_minus', 'feas_plus', 'feas_minus', 'circuits', 'channel'])
+              + ['y_plus', 'y_minus', 'feas_plus', 'feas_minus', 'circuits', 'channel',
+                 'family'])
 
     with open(out, 'w', newline='') as fh:
         w = csv.DictWriter(fh, fieldnames=fields)
@@ -326,7 +363,7 @@ def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
         for n in range(iters):
             an = a / (n + 1 + A_stab) ** ALPHA
             cn = c / (n + 1) ** GAMMA
-            d = rng.choice([-1.0, 1.0], size=P)     # Bernoulli: finite inverse moment
+            d = pert(n, rng)
             if tracks_per_iter:
                 # COMMON RANDOM NUMBERS (D4): one draw per iteration, used by BOTH arms.
                 # Drawing separately would put 53.9 s of circuit mismatch (R6) into a
@@ -358,17 +395,19 @@ def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
                 # when 40 had actually been spent.
                 row = {'iter': n, 'a_n': an, 'c_n': cn, 'y_plus': yp, 'y_minus': ym,
                        'feas_plus': int(fp), 'feas_minus': int(fm),
-                       'circuits': ';'.join(tracks), 'channel': channel}
+                       'circuits': ';'.join(tracks), 'channel': channel,
+                       'family': family}
                 row.update({nm: v for (nm, _, _), v in zip(GAINS, to_real(u))})
                 w.writerow(row); fh.flush()
                 continue
-            step = np.clip(an * (yp - ym) / (2 * cn * d), -max_step, max_step)
+            step = np.clip(an * grad(yp - ym, cn, d, is_sf), -max_step, max_step)
             u = np.clip(u - step, 0.0, 1.0)
 
             real = to_real(u)
             row = {'iter': n, 'a_n': an, 'c_n': cn, 'y_plus': yp, 'y_minus': ym,
                    'feas_plus': int(fp), 'feas_minus': int(fm),
-                   'circuits': ';'.join(tracks), 'channel': channel}
+                   'circuits': ';'.join(tracks), 'channel': channel,
+                   'family': family}
             row.update({name: v for (name, _, _), v in zip(GAINS, real)})
             w.writerow(row)
             fh.flush()                               # survive a Ctrl-C mid-run
@@ -423,7 +462,7 @@ def violation(rollouts, delta=DELTA):
 def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=None,
                      seed=0, out=None, max_step=0.10, timeout=250.0, alpha=0.02,
                      lam0=1.0, tracks_per_iter=2, start=None, lam_every=LAM_EVERY,
-                     delta=DELTA):
+                     delta=DELTA, family='bernoulli'):
     """Primal-dual SPSA on a constrained racing problem (notebook C3).
 
         minimise   J(theta)  = E_M[ implied_lap(theta, M) / baseline(M) ]
@@ -471,6 +510,7 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
         os.makedirs(os.path.dirname(out), exist_ok=True)
     A_stab = 0.1 * iters if A_stab is None else A_stab
     assert lam_every >= 2, 'the dual must be slower than the primal'
+    pert, is_sf = perturbation(family), sf_form(family)      # C2 knob; see spsa()
 
     rng = np.random.default_rng([seed, 0])          # perturbations
     trng = np.random.default_rng([seed, 1])         # circuit draws (same streams as spsa)
@@ -479,14 +519,14 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
 
     fields = (['iter', 'a_n', 'b_n', 'c_n', 'lam'] + [n for n, _, _ in GAINS]
               + ['L_plus', 'L_minus', 'J_plus', 'J_minus', 'G_plus', 'G_minus',
-                 'G_hat', 'feas_plus', 'feas_minus', 'circuits'])
+                 'G_hat', 'feas_plus', 'feas_minus', 'circuits', 'family'])
     with open(out, 'w', newline='') as fh:
         w = csv.DictWriter(fh, fieldnames=fields)
         w.writeheader()
         for n in range(iters):
             an = a / (n + 1 + A_stab) ** ALPHA
             cn = c / (n + 1) ** GAMMA
-            d = rng.choice([-1.0, 1.0], size=P)
+            d = pert(n, rng)
             tracks = circuits.sample(tracks_per_iter, trng)      # CRN, both arms (D4)
             mp = measure(pool, u + cn * d, tracks, laps, timeout)
             mm = measure(pool, u - cn * d, tracks, laps, timeout)
@@ -498,8 +538,8 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
             # failure scalar saturates at 2*ref and the difference becomes exactly zero;
             # implied_lap keeps varying with how far each arm got, so the gradient stays
             # informative outside the feasible region and there is nothing to escape.
-            u = np.clip(u - np.clip(an * (Lp - Lm) / (2 * cn * d), -max_step, max_step),
-                        0.0, 1.0)
+            u = np.clip(u - np.clip(an * grad(Lp - Lm, cn, d, is_sf),
+                                    -max_step, max_step), 0.0, 1.0)
             Ghat = 0.5 * (Gp + Gm)
             if n % lam_every == lam_every - 1:                   # the slow timescale
                 j = n // lam_every + 1
@@ -510,7 +550,7 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
 
             row = {'iter': n, 'a_n': an, 'b_n': bn, 'c_n': cn, 'lam': lam,
                    'L_plus': Lp, 'L_minus': Lm, 'J_plus': mp.cost, 'J_minus': mm.cost,
-                   'G_plus': Gp, 'G_minus': Gm, 'G_hat': Ghat,
+                   'G_plus': Gp, 'G_minus': Gm, 'G_hat': Ghat, 'family': family,
                    'feas_plus': int(mp.feasible), 'feas_minus': int(mm.feasible),
                    'circuits': ';'.join(tracks)}
             row.update({nm: v for (nm, _, _), v in zip(GAINS, to_real(u))})
@@ -748,6 +788,34 @@ def selftest():
     assert [r3.choice([-1.0, 1.0], size=P).tolist() for _ in range(3)] == d1, \
         'perturbations must not depend on how many circuits were drawn'
 
+
+    # C2: 'bernoulli' must draw EXACTLY what the hardcoded line drew before --family
+    # existed, or no recorded run reproduces and a family comparison is two unrelated
+    # changes at once (the property R13 relied on for --channel).
+    rb, rh = np.random.default_rng([7, 0]), np.random.default_rng([7, 0])
+    pb = perturbation('bernoulli')
+    assert all(np.array_equal(pb(n, rb), rh.choice([-1.0, 1.0], size=P))
+               for n in range(5)), 'bernoulli family must be behaviour-preserving'
+    # Hadamard is a deterministic cycle whose period covers every coordinate, and its
+    # cross-terms cancel exactly over one period rather than in expectation.
+    ph = perturbation('hadamard')
+    rows = [ph(n, None) for n in range(ph.period)]
+    assert all(set(np.unique(r)) <= {-1.0, 1.0} for r in rows)
+    assert np.allclose(np.array(rows).T @ np.array(rows), ph.period * np.eye(P)), \
+        'one period must be exactly orthogonal'
+    assert np.array_equal(ph(0, None), ph(ph.period, None)), 'must cycle'
+    # SF multiplies instead of dividing: no finite inverse moment exists to divide by.
+    assert sf_form('sf-gaussian') and not sf_form('bernoulli')
+    d = np.array([2.0, -4.0] + [1.0] * (P - 2))
+    assert np.allclose(grad(1.0, 0.5, d, False), 1.0 / (2 * 0.5 * d))
+    assert np.allclose(grad(1.0, 0.5, d, True), d / (2 * 0.5))
+    try:
+        perturbation('nope')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('an unknown family must raise, not fall back to bernoulli')
+
     print('selftest OK')
 
 
@@ -768,6 +836,9 @@ def main(argv):
                    help='scale failures to a typical lap instead of the timeout')
     q.add_argument('--timeout', type=float, default=60.0,
                    help='seconds per rollout before scoring T_MAX')
+    q.add_argument('--family', default='bernoulli', choices=sorted(FAMILIES),
+                   help='perturbation family (C2). bernoulli reproduces every run '
+                        'recorded before this flag existed')
     q.add_argument('--channel', default='score', choices=['score', 'cost'],
                    help='which scalar the UNCONSTRAINED loop minimises: the graded '
                         'penalty (default) or the implied lap time. The ablation that '
@@ -825,11 +896,13 @@ def main(argv):
             spsa_constrained(pool, o.iters, o.laps, a=o.a, b=o.b, c=o.c, seed=o.seed,
                              out=o.out, max_step=o.max_step, timeout=o.timeout,
                              alpha=o.alpha, lam0=o.lam0,
-                             tracks_per_iter=o.tracks_per_iter, start=start_u)
+                             tracks_per_iter=o.tracks_per_iter, start=start_u,
+                             family=o.family)
         else:
             spsa(iface, o.iters, o.laps, o.a, o.c, seed=o.seed, out=o.out,
                  max_step=o.max_step, timeout=o.timeout, ref_lap=o.ref_lap,
-                 pool=pool, tracks_per_iter=o.tracks_per_iter, channel=o.channel)
+                 pool=pool, tracks_per_iter=o.tracks_per_iter, channel=o.channel,
+                 family=o.family)
     finally:
         (pool or iface).close()
 
