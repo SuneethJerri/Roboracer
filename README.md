@@ -8,9 +8,15 @@ controller, and a stochastic-approximation testbed.
 
 | File | What it does |
 |---|---|
-| `scripts/roboracer_env.py` | ROS 2 interface and `gymnasium.Env` for the AutoDRIVE simulator |
+| `scripts/roboracer_env.py` | ROS 2 interface and `gymnasium.Env`; the frozen observation/action contract |
+| `scripts/f1tenth_iface.py` | `f1tenth_gym` behind the same interface, for unattended runs |
 | `scripts/follow_the_gap.py` | Follow-the-Gap reactive controller — the performance baseline |
-| `scripts/spsa_testbed.py` | SPSA on standard synthetic objectives, for gain and perturbation studies |
+| `scripts/circuits.py` | The 22-circuit set, the frozen baselines, and the train/test split |
+| `scripts/fetch_circuits.py` | Downloads the circuit maps |
+| `scripts/spsa_racing.py` | SPSA and constrained primal-dual SPSA on the racing objective |
+| `scripts/spsa_testbed.py` | SPSA on synthetic objectives, for gain and perturbation studies |
+| `scripts/parallel_eval.py` | Scores many gain sets at once, one simulator per worker |
+| `scripts/rl_baseline.py` | PPO baseline, scored through the same rollout as everything else |
 
 ## Quick start
 
@@ -21,6 +27,15 @@ only `numpy`. Start here to check the logic runs:
 python3 scripts/roboracer_env.py   --selftest
 python3 scripts/follow_the_gap.py  --selftest
 python3 scripts/spsa_testbed.py    --selftest
+```
+
+The rest need the project venv, because they drive a simulator:
+
+```bash
+.venv/bin/python scripts/circuits.py      --selftest   # needs data/baseline_ftg.csv
+.venv/bin/python scripts/f1tenth_iface.py --selftest   # needs f1tenth_gym
+.venv/bin/python scripts/spsa_racing.py   --selftest
+.venv/bin/python scripts/rl_baseline.py   --selftest   # needs stable-baselines3
 ```
 
 The SPSA testbed is entirely self-contained:
@@ -84,14 +99,17 @@ Two details worth knowing if you extend this:
 
 ## Requirements
 
-`numpy` for the self-tests. `rclpy` and ROS 2 Humble for the interface (present in the
-devkit container). `gymnasium` only for `RoboRacerEnv`, imported lazily so the rest of
-the module works without it.
+`numpy` for the self-tests. `rclpy` and ROS 2 Humble for the ROS interface (present in
+the devkit container). `gymnasium` only for `RoboRacerEnv`, imported lazily so the rest
+of the module works without it. `f1tenth_gym` for the unattended backend, and
+`stable-baselines3` with CPU `torch` for the PPO baseline — the simulator is the
+bottleneck, so a GPU build buys nothing.
 
 ## Status
 
-Environment wrapper and baselines implemented and unit-tested; end-to-end validation
-against the simulator is in progress.
+Environment wrapper, baselines and the SPSA work implemented and unit-tested, validated
+end-to-end on `f1tenth_gym` across 22 circuits. Best tuned controller completes all five
+held-out circuits at 0.79x the baseline lap time.
 
 ## References
 
