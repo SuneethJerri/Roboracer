@@ -61,10 +61,13 @@ def downsample_scan(ranges, n_out=OBS_BEAMS, max_range=MAX_RANGE):
     return r.reshape(n_out, -1).min(axis=1) / max_range
 
 
-def build_obs(ranges, speed, prev_action, n_beams=OBS_BEAMS):
+def build_obs(ranges, speed, prev_action, n_beams=OBS_BEAMS, max_speed=MAX_SPEED):
+    """`max_speed` is the normalisation constant, not a limit. Pass the simulator's own
+    top speed: f1tenth commands 15 m/s against this module's AutoDRIVE 8, and the default
+    would saturate the channel exactly in the racing regime (D13)."""
     return np.concatenate([
         downsample_scan(ranges, n_beams),
-        [np.clip(speed / MAX_SPEED, -1.0, 1.0)],
+        [np.clip(speed / max_speed, -1.0, 1.0)],
         np.clip(np.asarray(prev_action, dtype=float), -1.0, 1.0),
     ]).astype(np.float32)
 
@@ -109,6 +112,18 @@ def reward_mapfree(prev, cur, collision_penalty=5.0, lap_bonus=10.0):
     r = float(cur['speed']) / MAX_SPEED
     r -= collision_penalty * max(0, cur['collisions'] - prev['collisions'])
     r += lap_bonus * max(0, cur['laps'] - prev['laps'])
+    return r
+
+
+def reward_progress(prev, cur, collision_penalty=5.0, progress_scale=100.0):
+    """Arc-length gained, not instantaneous speed. The reward `reward_mapfree`'s docstring
+    promised; see D13 for why speed-per-step is the wrong objective over a 6000-step episode.
+
+    Requires `progress` in the state dict and raises without it rather than defaulting to
+    zero -- a silent fallback here is B1's failure mode (D9).
+    """
+    r = progress_scale * max(0.0, float(cur['progress']) - float(prev['progress']))
+    r -= collision_penalty * max(0, cur['collisions'] - prev['collisions'])
     return r
 
 
@@ -263,8 +278,13 @@ class RoboRacerInterface:
 
 
 # ------------------------------------------------------------------ gymnasium env
-def make_env(max_steps=3000, reward_fn=reward_mapfree, **kw):
-    """Built lazily so this module imports without gymnasium installed."""
+def make_env(max_steps=3000, reward_fn=reward_mapfree,
+             iface_factory=RoboRacerInterface, max_speed=MAX_SPEED, **kw):
+    """Built lazily so this module imports without gymnasium installed.
+
+    `iface_factory` is what lets the learning methods run on f1tenth (D1): F1TenthInterface
+    presents the same API surface, so only the constructor differs.
+    """
     import gymnasium as gym
 
     class RoboRacerEnv(gym.Env):
@@ -273,14 +293,14 @@ def make_env(max_steps=3000, reward_fn=reward_mapfree, **kw):
         def __init__(self):
             self.action_space = gym.spaces.Box(-1.0, 1.0, (2,), dtype=np.float32)
             self.observation_space = gym.spaces.Box(-1.0, 1.0, (OBS_DIM,), dtype=np.float32)
-            self.iface = RoboRacerInterface(**kw)
+            self.iface = iface_factory(**kw)
             self.prev_action = np.zeros(2)
             self.prev = None
             self.steps = 0
 
         def _obs(self, st):
             return build_obs(st['scan'] if st['scan'] is not None else np.zeros(1080),
-                             st['speed'], self.prev_action)
+                             st['speed'], self.prev_action, max_speed=max_speed)
 
         def reset(self, seed=None, options=None):
             super().reset(seed=seed)
@@ -292,12 +312,16 @@ def make_env(max_steps=3000, reward_fn=reward_mapfree, **kw):
         def step(self, action):
             a = np.clip(np.asarray(action, dtype=float), -1.0, 1.0)
             self.iface.send(a[0], a[1])
-            if not self.iface.wait_for_scan():
+            alive = self.iface.wait_for_scan()
+            # On ROS a false scan means the bridge dropped and the episode is garbage; on
+            # f1tenth it means the episode ENDED normally. Only the interface knows which,
+            # so it says (B9). Guessing either way costs a real result.
+            if not alive and not getattr(self.iface, 'scan_false_is_episode_end', False):
                 raise TimeoutError('no scan — simulator disconnected mid-episode')
             st = self.iface.state()
             self.prev_action, self.steps = a, self.steps + 1
             reward = reward_fn(self.prev, st)
-            terminated = st['collisions'] > self.prev['collisions']
+            terminated = st['collisions'] > self.prev['collisions'] or not alive
             self.prev = st
             return (self._obs(st), reward, terminated, self.steps >= max_steps,
                     {'lap_time': st['lap_time'], 'laps': st['laps'],
@@ -360,6 +384,29 @@ def selftest():
     assert reward_mapfree(base, {**base, 'collisions': 1}) < -4
     assert reward_mapfree(base, {**base, 'laps': 1}) > 10
     assert reward_mapfree({**base, 'laps': 1}, {**base, 'laps': 1}) == 0.5
+
+    # reward_progress pays arc-length, cannot be farmed by oscillating, and refuses to
+    # guess a missing progress reading (D13).
+    pb = {**base, 'progress': 0.20}
+    assert reward_progress(pb, pb) == 0.0, 'standing still must pay nothing'
+    assert np.isclose(reward_progress(pb, {**pb, 'progress': 0.30}), 10.0)
+    assert reward_progress(pb, {**pb, 'progress': 0.10}) == 0.0, 'backward must not be negative'
+    # A collision costs exactly its penalty on the step. It is a marker, not the
+    # deterrent: in f1tenth a collision ENDS the episode (R16), so what actually punishes
+    # it is the progress forfeited -- up to 80 here against a penalty of 5.
+    assert np.isclose(reward_progress(pb, {**pb, 'progress': 0.30, 'collisions': 1}), 5.0)
+    assert reward_progress(pb, {**pb, 'collisions': 1}) == -5.0
+    # A full lap is worth progress_scale however it was driven, so the lap is the target
+    # and speed is only the means -- the defect in reward_mapfree over a long episode.
+    assert np.isclose(sum(reward_progress({**pb, 'progress': i / 100},
+                                          {**pb, 'progress': (i + 1) / 100})
+                          for i in range(20, 100)), 80.0)
+    try:
+        reward_progress(base, base)
+    except KeyError:
+        pass
+    else:
+        raise AssertionError('a missing progress reading must raise, not default to 0')
 
     print('selftest OK')
 

@@ -186,17 +186,24 @@ class F1TenthInterface:
         return self._steps * DT
 
     def state(self):
+        # `progress` is additive: the ROS interface has no centreline and omits it, so a
+        # reward that needs it raises there rather than reading zero (D13).
         return {'scan': self.scan, 'speed': self.speed, 'position': self.position,
                 'lap_time': self.lap_time, 'laps': self.laps,
-                'collisions': self.collisions}
+                'collisions': self.collisions, 'progress': self.progress()}
 
     # ----------------------------------------------------------------- control
     def send(self, steering, throttle):
         self._action = to_physical(steering, throttle, self.max_steer, self.max_speed)
 
+    # False from wait_for_scan() means the EPISODE ended -- collision or the simulator's
+    # own truncation -- NOT that the simulator died, which is what it means on ROS. The
+    # learning env has to tell those apart (B9); rollout() stops either way and does not.
+    scan_false_is_episode_end = True
+
     def wait_for_scan(self, timeout=None):
-        """Advance one step with the stored action. Always succeeds, unlike the ROS version
-        where a timeout means the simulator disconnected."""
+        """Advance one step with the stored action. Returns False when the episode ended,
+        which on ROS instead signals a dropped connection -- see `scan_false_is_episode_end`."""
         v, s = self._action
         # Action order is [steering_angle, speed] -- the REVERSE of the control_input
         # list, as the action_space bounds Box([[-0.4189,-5],[0.4189,20]]) make clear.
