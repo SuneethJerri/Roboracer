@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
-"""C1: SPSA's bias law measured against EXACT ground truth, across the feasibility cliff.
+"""C1 (D15): SPSA's bias against a reference with no statistical error on either side.
 
-Most empirical SPSA work can only infer the `O(c^2)` bias, because the true gradient of a
-simulation objective is unknown and every estimate carries Monte-Carlo error. Two
-properties of this problem remove both obstacles:
+Two properties of this problem make `E[ghat] - grad J` measurable rather than fitted:
+the objective is deterministic (R1), so a central difference is the gradient to `O(h^2)`
+in 2p evaluations; and `p = 6` with `ghat` invariant to flipping `Delta`'s sign, so fixing
+one coordinate enumerates the 2^(p-1) = 32 distinct Bernoulli perturbations exactly once
+and the estimator's EXPECTATION is a finite sum over all of them, in 64 evaluations.
 
-  * the objective is bit-for-bit deterministic (R1), so a central difference IS the
-    gradient to `O(h^2)` with no statistical error at all; and
-  * `p = 6`, so the SPSA estimator's EXPECTATION is a finite sum over 2^(p-1) = 32
-    distinct Bernoulli perturbations -- computed exactly in 64 evaluations, not sampled.
-
-So `E[ghat] - grad J` is measured, not fitted. The question C1 asks is where that law
-stops holding: R3 found a 42x discontinuity with theta* sitting against it, and a Taylor
-expansion through a discontinuity has no reason to predict anything.
+Determinism is reproducibility, not smoothness, so `--hscan` asks first whether the
+reference exists: R20 found a roughness floor at `h ~ 1e-3` and, at the R3 cliff, no
+plateau at any scale. Keep `h` inside the plateau, and expect no bias number to mean
+anything where the gradient does not exist.
 
     .venv/bin/python scripts/spsa_bias.py --selftest
-    .venv/bin/python scripts/spsa_bias.py --sweep --out scratch/c1/bias.csv
+    .venv/bin/python scripts/spsa_bias.py --hscan --u3 0.90
+    .venv/bin/python scripts/spsa_bias.py --sweep --out scratch/c1/bias.csv --h 0.01
 """
 import argparse
 import csv

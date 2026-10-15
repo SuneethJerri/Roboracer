@@ -8,17 +8,14 @@ Wraps a command instead of changing it, so no experiment script has to know this
     runlog.py ls
     runlog.py verify
 
-Each run gets `runs/<UTC>_<name>/` holding `log.txt`, `meta.json`, and `patch.diff` when
-the tree was dirty. `meta.json` carries the argv, the git commit, the package versions and
-a SHA-256 of every tracked output, which is what makes a result citable: "R18, run
-20261015T201133Z_r18-holdout" names the code, the inputs and the bytes produced.
+Each run gets `runs/<UTC>_<name>/` holding `log.txt`, `meta.json` (argv, commit, dirty
+flag, package versions, a SHA-256 per tracked output) and `patch.diff` when the tree was
+dirty. A notebook entry names the run directory, and the result is citable.
 
-WHY the hashes earn their keep here. The racing objective is bit-for-bit deterministic
-(R1), so the same command at the same commit MUST produce the same bytes. `verify` groups
-runs by (command, args, commit) and reports any group whose outputs disagree -- a
-discrepancy that can only mean hidden state, and hidden state is exactly what B7 was. Runs
-marked `--nondeterministic` (the RL arm: PPO over 14 worker processes) are exempt, because
-flagging expected variation would train everyone to ignore the check.
+`verify` re-hashes those outputs and, because the objective is deterministic (R1), reports
+any two runs of the same command at the same commit that produced different bytes -- which
+can only be hidden state, as in B7. The RL arm is exempt via `--nondeterministic`; PPO over
+14 worker processes does not reproduce exactly.
 """
 import argparse
 import hashlib

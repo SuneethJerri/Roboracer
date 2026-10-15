@@ -15,8 +15,10 @@ controller, and a stochastic-approximation testbed.
 | `scripts/fetch_circuits.py` | Downloads the circuit maps |
 | `scripts/spsa_racing.py` | SPSA and constrained primal-dual SPSA on the racing objective |
 | `scripts/spsa_testbed.py` | SPSA on synthetic objectives, for gain and perturbation studies |
+| `scripts/spsa_bias.py` | Measures SPSA's gradient bias against an exact expectation |
 | `scripts/parallel_eval.py` | Scores many gain sets at once, one simulator per worker |
 | `scripts/rl_baseline.py` | PPO baseline, scored through the same rollout as everything else |
+| `scripts/runlog.py` | Records each run's code, inputs and output hashes so results can be cited |
 
 ## Quick start
 
@@ -35,7 +37,17 @@ The rest need the project venv, because they drive a simulator:
 .venv/bin/python scripts/circuits.py      --selftest   # needs data/baseline_ftg.csv
 .venv/bin/python scripts/f1tenth_iface.py --selftest   # needs f1tenth_gym
 .venv/bin/python scripts/spsa_racing.py   --selftest
+.venv/bin/python scripts/spsa_bias.py     --selftest
 .venv/bin/python scripts/rl_baseline.py   --selftest   # needs stable-baselines3
+```
+
+`runlog.py --selftest` needs nothing but the standard library. Every experiment is run
+through it, so each result can name the code and the bytes that produced it:
+
+```bash
+.venv/bin/python scripts/runlog.py run --name my-run --track out.csv -- \
+    .venv/bin/python scripts/spsa_racing.py --backend f1tenth --out out.csv
+.venv/bin/python scripts/runlog.py verify
 ```
 
 The SPSA testbed is entirely self-contained:
