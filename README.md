@@ -93,7 +93,7 @@ Both controllers and the environment are written against one contract:
 ```
 action = [steering, throttle]            each in [-1, 1]
 obs    = [54 LIDAR bins in [0, 1]]       min-pooled from the 1080-beam scan
-       + [speed / 8.0]
+       + [speed / max_speed]            8.0 on AutoDRIVE, 15.0 on f1tenth
        + [previous action]               -> 57 floats
 ```
 
@@ -105,6 +105,9 @@ Two details worth knowing if you extend this:
 
 - The LIDAR is **min-pooled**, not subsampled. A thin obstacle falling between sampled
   beams would otherwise vanish from the observation.
+- `max_speed` normalises the speed channel and is **the simulator's own top speed**, not a
+  limit. Leaving it at AutoDRIVE's 8.0 on f1tenth, which commands 15.0, saturates the
+  channel in exactly the racing regime.
 - `reset_command` is latched by the bridge and never acknowledged, so `reset()` pulses
   it and then **confirms from telemetry** — the lap timer running backwards, or the car
   teleporting — rather than assuming it worked.
