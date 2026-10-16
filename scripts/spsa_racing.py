@@ -873,11 +873,17 @@ def main(argv):
     q.add_argument('--lam0', type=float, default=1.0, help='initial multiplier (C3)')
     q.add_argument('-b', type=float, default=5.0,
                    help="lambda's step gain (C3); sized to the HORIZON -- see B_GAIN")
+    q.add_argument('--lam-every', type=int, default=LAM_EVERY,
+                   help='theta steps per dual step (C3). Separation is by subsampling '
+                        'because the textbook step-size ratio is about 2 at n=40, i.e. '
+                        'backwards over any horizon we run (D11)')
     q.add_argument('--alpha', type=float, default=0.02,
                    help='allowed mean constraint violation (C3); must stay > 0 so that '
                         'lambda can retreat once the constraint holds')
     q.add_argument('--start', default=None,
-                   help='comma-separated starting gains, in GAINS order')
+                   help="comma-separated starting gains in GAINS order, or 'random' for a "
+                        "uniform draw in the box (seeded separately, so it does not shift "
+                        "the perturbation or circuit streams)")
     q.add_argument('--backend', default='autodrive', choices=['autodrive', 'f1tenth'])
     q.add_argument('--map', default='Spielberg', help='f1tenth backend only')
     q.add_argument('--out', default=None)
@@ -891,7 +897,16 @@ def main(argv):
     # `1.00,0.30,1.00,0.40,0.40,1.00` in unit coordinates, i.e. three gains pinned to a
     # corner. Convert once, here, so there is one meaning.
     start_u = None
-    if o.start:
+    if o.start == 'random':
+        # Stream 2: perturbations are [seed,0] and circuit draws [seed,1], so the start
+        # is reproducible from the seed without shifting either (the reason those two were
+        # split in the first place).
+        start_u = np.random.default_rng([o.seed, 2]).random(P)
+        apply_gains(to_real(start_u))
+        print('start gains:', dict(zip([n for n, _, _ in GAINS],
+                                       np.round(to_real(start_u), 4))))
+        print('start (unit):', np.round(start_u, 4), '= random, seed', o.seed)
+    elif o.start:
         vals = [float(x) for x in o.start.split(',')]
         assert len(vals) == P, f'--start needs {P} values, got {len(vals)}'
         apply_gains(np.array(vals))
@@ -921,7 +936,7 @@ def main(argv):
                              out=o.out, max_step=o.max_step, timeout=o.timeout,
                              alpha=o.alpha, lam0=o.lam0,
                              tracks_per_iter=o.tracks_per_iter, start=start_u,
-                             family=o.family)
+                             family=o.family, lam_every=o.lam_every)
         else:
             spsa(iface, o.iters, o.laps, o.a, o.c, seed=o.seed, out=o.out,
                  max_step=o.max_step, timeout=o.timeout, ref_lap=o.ref_lap,
