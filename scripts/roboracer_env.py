@@ -117,16 +117,22 @@ def reward_mapfree(prev, cur, collision_penalty=5.0, lap_bonus=10.0):
     return r
 
 
-def reward_progress(prev, cur, collision_penalty=5.0, progress_scale=100.0):
+def reward_progress(prev, cur, collision_penalty=5.0, progress_scale=100.0,
+                    step_cost=0.01):
     """Arc-length gained, not instantaneous speed. The reward `reward_mapfree`'s docstring
     promised; see D13 for why speed-per-step is the wrong objective over a 6000-step episode.
 
     Requires `progress` in the state dict and raises without it rather than defaulting to
     zero -- a silent fallback here is B1's failure mode (D9).
+
+    `step_cost` makes standing still strictly negative. Without it zero is a fixed point
+    with zero gradient, so a policy that cannot yet steer reaches it and stays -- B13 and
+    R19 are that outcome measured twice. Charged per DECISION, not per simulator step, so
+    it does not scale with `action_repeat`.
     """
     r = progress_scale * max(0.0, float(cur['progress']) - float(prev['progress']))
     r -= collision_penalty * max(0, cur['collisions'] - prev['collisions'])
-    return r
+    return r - step_cost
 
 
 # ----------------------------------------------------------------- ROS 2 interface
@@ -386,7 +392,8 @@ class RoboRacerInterface:
 
 # ------------------------------------------------------------------ gymnasium env
 def make_env(max_steps=3000, reward_fn=reward_mapfree,
-             iface_factory=RoboRacerInterface, max_speed=MAX_SPEED, **kw):
+             iface_factory=RoboRacerInterface, max_speed=MAX_SPEED,
+             action_repeat=1, **kw):
     """Built lazily so this module imports without gymnasium installed.
 
     `iface_factory` is what lets the learning methods run on f1tenth (D1): F1TenthInterface
@@ -417,19 +424,31 @@ def make_env(max_steps=3000, reward_fn=reward_mapfree,
             return self._obs(st), {}
 
         def step(self, action):
+            """One DECISION, held for `action_repeat` simulator steps.
+
+            The repeat is what lets the discount horizon reach a lap (B13): it divides the
+            steps per episode, so the same gamma buys that many times the real-time
+            lookahead. Rewards over the held steps are summed, so the return per unit of
+            simulated time is unchanged. Breaks early on termination rather than driving a
+            dead episode.
+            """
             a = np.clip(np.asarray(action, dtype=float), -1.0, 1.0)
-            self.iface.send(a[0], a[1])
-            alive = self.iface.wait_for_scan()
-            # On ROS a false scan means the bridge dropped and the episode is garbage; on
-            # f1tenth it means the episode ENDED normally. Only the interface knows which,
-            # so it says (B9). Guessing either way costs a real result.
-            if not alive and not getattr(self.iface, 'scan_false_is_episode_end', False):
-                raise TimeoutError('no scan — simulator disconnected mid-episode')
-            st = self.iface.state()
+            reward, terminated, alive = 0.0, False, True
+            for _ in range(action_repeat):
+                self.iface.send(a[0], a[1])
+                alive = self.iface.wait_for_scan()
+                # On ROS a false scan means the bridge dropped and the episode is garbage;
+                # on f1tenth it means the episode ENDED normally. Only the interface knows
+                # which, so it says (B9). Guessing either way costs a real result.
+                if not alive and not getattr(self.iface, 'scan_false_is_episode_end', False):
+                    raise TimeoutError('no scan — simulator disconnected mid-episode')
+                st = self.iface.state()
+                reward += reward_fn(self.prev, st)
+                terminated = st['collisions'] > self.prev['collisions'] or not alive
+                self.prev = st
+                if terminated:
+                    break
             self.prev_action, self.steps = a, self.steps + 1
-            reward = reward_fn(self.prev, st)
-            terminated = st['collisions'] > self.prev['collisions'] or not alive
-            self.prev = st
             return (self._obs(st), reward, terminated, self.steps >= max_steps,
                     {'lap_time': st['lap_time'], 'laps': st['laps'],
                      'collisions': st['collisions']})
@@ -495,14 +514,25 @@ def selftest():
     # reward_progress pays arc-length, cannot be farmed by oscillating, and refuses to
     # guess a missing progress reading (D13).
     pb = {**base, 'progress': 0.20}
-    assert reward_progress(pb, pb) == 0.0, 'standing still must pay nothing'
-    assert np.isclose(reward_progress(pb, {**pb, 'progress': 0.30}), 10.0)
-    assert reward_progress(pb, {**pb, 'progress': 0.10}) == 0.0, 'backward must not be negative'
+    # step_cost=0 recovers the pre-B13 reward exactly, so these keep the original figures.
+    z = dict(step_cost=0.0)
+    assert reward_progress(pb, pb, **z) == 0.0, 'standing still must pay nothing'
+    assert np.isclose(reward_progress(pb, {**pb, 'progress': 0.30}, **z), 10.0)
+    assert reward_progress(pb, {**pb, 'progress': 0.10}, **z) == 0.0, 'backward must not be negative'
     # A collision costs exactly its penalty on the step. It is a marker, not the
     # deterrent: in f1tenth a collision ENDS the episode (R16), so what actually punishes
     # it is the progress forfeited -- up to 80 here against a penalty of 5.
-    assert np.isclose(reward_progress(pb, {**pb, 'progress': 0.30, 'collisions': 1}), 5.0)
-    assert reward_progress(pb, {**pb, 'collisions': 1}) == -5.0
+    assert np.isclose(reward_progress(pb, {**pb, 'progress': 0.30, 'collisions': 1}, **z), 5.0)
+    assert reward_progress(pb, {**pb, 'collisions': 1}, **z) == -5.0
+
+    # B13: with the default step cost, standing still is strictly WORSE than zero, which is
+    # what removes the immobility fixed point. Every other reward shifts by exactly it.
+    assert reward_progress(pb, pb) < 0.0, 'standing still must be strictly negative'
+    assert np.isclose(reward_progress(pb, pb), -0.01)
+    assert np.isclose(reward_progress(pb, {**pb, 'progress': 0.30}), 9.99)
+    # ...and it must stay small enough that finishing still dominates: a lap pays
+    # progress_scale over at most ~2040 decisions at action_repeat=5.
+    assert 0.01 * 2040 < 100.0, 'the living cost must not outweigh a lap'
 
     # B11: laps are counted from OUR position, because /lap_count jumps by two on the
     # start line. Driven here through _on_ips with a stub, no ROS needed.
@@ -570,7 +600,7 @@ def selftest():
     # A full lap is worth progress_scale however it was driven, so the lap is the target
     # and speed is only the means -- the defect in reward_mapfree over a long episode.
     assert np.isclose(sum(reward_progress({**pb, 'progress': i / 100},
-                                          {**pb, 'progress': (i + 1) / 100})
+                                          {**pb, 'progress': (i + 1) / 100}, **z)
                           for i in range(20, 100)), 80.0)
     try:
         reward_progress(base, base)

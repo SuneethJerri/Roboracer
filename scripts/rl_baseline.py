@@ -31,15 +31,25 @@ import spsa_racing as S                                          # noqa: E402
 
 LAP_BUDGET = 2.0        # episode truncates at this multiple of the circuit's baseline lap
 
+# One decision per ACTION_REPEAT simulator steps, i.e. 20 Hz at f1tenth's DT = 0.01.
+# Used by BOTH the training env and the evaluation closure: a policy trained at 20 Hz and
+# queried at 100 Hz is a different controller, and the mismatch would be invisible in the
+# scores (D18, and B1 is what a second path costs). AutoDRIVE's own rate is 18.2 Hz.
+ACTION_REPEAT = 5
+# Horizon = 1/(1-GAMMA) = 200 decisions = 10 s of track at 20 Hz. The default 0.99 gave
+# 1.0 s against a 33-102 s lap, so the lap was absent from the objective (B13).
+GAMMA = 0.995
 
-def max_steps_for(track, budget=LAP_BUDGET):
+
+def max_steps_for(track, budget=LAP_BUDGET, action_repeat=ACTION_REPEAT):
     """Truncation in STEPS, per circuit. A flat 3000 is 30 s at f1tenth's 0.01 s step
     while laps take 33-102 s, so every episode would end mid-lap and the policy would
     never once see a finished lap."""
-    return int(budget * circuits.baseline(track) / F1.DT)
+    return int(budget * circuits.baseline(track) / F1.DT / action_repeat)
 
 
-def make_track_env(track, reward_fn=RE.reward_progress, budget=LAP_BUDGET):
+def make_track_env(track, reward_fn=RE.reward_progress, budget=LAP_BUDGET,
+                   action_repeat=ACTION_REPEAT, random_start=False):
     import gymnasium as gym
     from stable_baselines3.common.monitor import Monitor
 
@@ -53,11 +63,12 @@ def make_track_env(track, reward_fn=RE.reward_progress, budget=LAP_BUDGET):
 
     # One constant feeds both the physical command mapping and the obs normalisation; if
     # they diverge the policy's speed channel stops meaning what it meant in training.
-    env = RE.make_env(max_steps=max_steps_for(track, budget),
+    env = RE.make_env(max_steps=max_steps_for(track, budget, action_repeat),
                       reward_fn=reward_fn,
                       iface_factory=F1.F1TenthInterface,
                       max_speed=F1.MAX_SPEED_MPS,
-                      map_name=track)
+                      action_repeat=action_repeat,
+                      map_name=track, random_start=random_start)
     # SB3's Monitor is what fills ep_rew_mean / ep_len_mean. Without it a run prints
     # losses and no episode statistics at all, so there is no way to tell a policy that
     # is learning from one standing still until the final evaluation.
@@ -75,18 +86,28 @@ def check_workers(venv, tracks):
     print(f'B7 check: {len(tracks)} workers, each on its own map')
 
 
-def policy_act(model, max_speed=F1.MAX_SPEED_MPS):
+def policy_act(model, max_speed=F1.MAX_SPEED_MPS, action_repeat=ACTION_REPEAT):
     """`act(iface)` for rollout(). Rebuilds the training observation exactly, including
     the previous action, so evaluation and training see the same input. One closure per
-    rollout: it carries state."""
+    rollout: it carries state.
+
+    `rollout()` calls this every simulator step, so the closure -- not the loop -- is what
+    holds the decision for `action_repeat` steps. It has to match training exactly: a
+    policy trained at 20 Hz and queried at 100 Hz commands a new action before the last
+    one has taken effect, which scores badly for a reason no column would show.
+    """
     prev = np.zeros(2)
+    held, n = (0.0, 0.0), 0
 
     def act(iface):
-        nonlocal prev
-        obs = RE.build_obs(iface.scan, iface.speed, prev, max_speed=max_speed)
-        a, _ = model.predict(obs, deterministic=True)
-        prev = np.clip(np.asarray(a, dtype=float), -1.0, 1.0)
-        return float(prev[0]), float(prev[1])
+        nonlocal prev, held, n
+        if n % action_repeat == 0:
+            obs = RE.build_obs(iface.scan, iface.speed, prev, max_speed=max_speed)
+            a, _ = model.predict(obs, deterministic=True)
+            prev = np.clip(np.asarray(a, dtype=float), -1.0, 1.0)
+            held = (float(prev[0]), float(prev[1]))
+        n += 1
+        return held
 
     return act
 
@@ -102,19 +123,30 @@ def worker_tracks(tracks=None, envs=0):
     return [tracks[i % len(tracks)] for i in range(n)]
 
 
-def train(steps, out, tracks=None, envs=0, seed=0, n_steps=512, warm_from=None):
+def train(steps, out, tracks=None, envs=0, seed=0, n_steps=512, warm_from=None,
+          gamma=GAMMA, batch_size=512, device='cpu', action_repeat=ACTION_REPEAT,
+          random_start=True):
     from stable_baselines3 import PPO
     from stable_baselines3.common.vec_env import SubprocVecEnv
     tracks = worker_tracks(tracks, envs)
-    venv = SubprocVecEnv([(lambda t=t: make_track_env(t)) for t in tracks])
+    venv = SubprocVecEnv([(lambda t=t: make_track_env(t, action_repeat=action_repeat,
+                                                      random_start=random_start))
+                          for t in tracks])
     check_workers(venv, tracks)
     if warm_from:
         # The curriculum step: carry the policy over, not just the hyperparameters.
         model = PPO.load(warm_from, env=venv, device='cpu')
         print(f'warm start from {warm_from}')
     else:
+        # gamma is passed explicitly and printed: it was never set before, so SB3's 0.99
+        # applied and the lap was outside the horizon (B13). A default is not a decision.
+        # device stays CPU by measurement, not assumption -- R33 puts the Amdahl ceiling
+        # for any accelerator at 2.04x and a CUDA launch above the CPU cost at batch 14.
         model = PPO('MlpPolicy', venv, n_steps=n_steps, seed=seed, verbose=1,
-                    device='cpu')      # the simulator is the bottleneck, not a 57-input MLP
+                    gamma=gamma, batch_size=batch_size, device=device)
+    print(f'gamma {gamma} -> horizon {1/(1-gamma):.0f} decisions = '
+          f'{1/(1-gamma)*F1.DT*action_repeat:.1f}s   action_repeat {action_repeat}   '
+          f'random_start {random_start}   device {device}', flush=True)
     model.learn(total_timesteps=steps)
     os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
     model.save(out)
@@ -122,7 +154,7 @@ def train(steps, out, tracks=None, envs=0, seed=0, n_steps=512, warm_from=None):
     print(f'saved {out}')
 
 
-def evaluate(path, test=False, timeout=250.0):
+def evaluate(path, test=False, timeout=250.0, action_repeat=ACTION_REPEAT):
     """Score a trained policy circuit by circuit, through rollout() and nothing else.
 
     The midpoint control rides along on every circuit: those gains ARE the frozen
@@ -137,7 +169,8 @@ def evaluate(path, test=False, timeout=250.0):
     rows = []
     for t in pool:
         iface = F1.F1TenthInterface(t)
-        r = S.rollout(iface, None, act=policy_act(model), timeout=timeout, normalize=True)
+        r = S.rollout(iface, None, act=policy_act(model, action_repeat=action_repeat),
+                      timeout=timeout, normalize=True)
         ctl = S.rollout(iface, np.full(S.P, 0.5), timeout=timeout, normalize=True)
         iface.close()
         if abs(ctl.score - 1.0) > 1e-3:
@@ -159,8 +192,34 @@ def selftest():
     assert len(worker_tracks()) == len(circuits.TRAIN)
     assert worker_tracks(['A', 'B'], 5) == ['A', 'B', 'A', 'B', 'A']
 
-    assert max_steps_for('IMS') == int(2.0 * 47.93 / 0.01)
+    assert max_steps_for('IMS', action_repeat=1) == int(2.0 * 47.93 / 0.01)
     assert max_steps_for('Shanghai') > max_steps_for('IMS'), 'per-circuit, not flat'
+    # D18: max_steps counts DECISIONS, so the repeat divides it -- otherwise an episode
+    # runs action_repeat times longer than the lap budget it was sized for.
+    assert max_steps_for('IMS', action_repeat=5) == int(2.0 * 47.93 / 0.01 / 5)
+    assert GAMMA < 1.0 and 1 / (1 - GAMMA) * 0.01 * ACTION_REPEAT > 5.0, \
+        'the horizon must be worth several seconds of track (B13)'
+
+    # policy_act must HOLD its decision for exactly ACTION_REPEAT calls, because rollout()
+    # calls it every simulator step. A stub model makes this checkable with no torch.
+    class _M:
+        def __init__(self):
+            self.calls = 0
+
+        def predict(self, obs, deterministic=True):
+            self.calls += 1
+            return np.array([0.1 * self.calls, 0.2]), None
+
+    class _If:
+        scan, speed = np.full(1080, 5.0), 3.0
+
+    m = _M()
+    act = policy_act(m, action_repeat=5)
+    out = [act(_If()) for _ in range(12)]
+    assert m.calls == 3, f'queried the policy {m.calls} times in 12 steps, want 3'
+    assert out[0] == out[4] and out[5] == out[9], 'the decision must be held'
+    assert out[0] != out[5], 'and must change when it is re-queried'
+    assert policy_act(_M(), action_repeat=1) is not None
 
     env = make_track_env('Spielberg')
     obs, _ = env.reset()
@@ -219,12 +278,23 @@ def main(argv):
                    help='continue from this policy instead of a fresh one')
     ap.add_argument('--test', action='store_true', help='evaluate on the HELD-OUT circuits')
     ap.add_argument('--timeout', type=float, default=250.0)
+    ap.add_argument('--gamma', type=float, default=GAMMA,
+                    help='discount factor; the horizon it buys is printed before training')
+    ap.add_argument('--action-repeat', type=int, default=ACTION_REPEAT,
+                    help='simulator steps per decision, in training AND evaluation')
+    ap.add_argument('--device', default='cpu', choices=['cpu', 'cuda'],
+                    help='cpu by measurement, not assumption (R33)')
+    ap.add_argument('--fixed-start', action='store_true',
+                    help='train from the start line only, as the pre-D18 runs did')
     o = ap.parse_args(argv)
     if o.train:
         train(o.steps, o.out, tracks=o.tracks.split(',') if o.tracks else None,
-              envs=o.envs, seed=o.seed, warm_from=o.warm_from)
+              envs=o.envs, seed=o.seed, warm_from=o.warm_from, gamma=o.gamma,
+              device=o.device, action_repeat=o.action_repeat,
+              random_start=not o.fixed_start)
     elif o.eval:
-        evaluate(o.eval, test=o.test, timeout=o.timeout)
+        evaluate(o.eval, test=o.test, timeout=o.timeout,
+                 action_repeat=o.action_repeat)
     else:
         ap.error('one of --selftest, --train, --eval')
 

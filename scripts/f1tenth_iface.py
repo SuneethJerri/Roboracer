@@ -52,7 +52,7 @@ class F1TenthInterface:
     """
 
     def __init__(self, map_name='Spielberg', max_speed=MAX_SPEED_MPS,
-                 max_steer=MAX_STEER_PHYS, seed=0):
+                 max_steer=MAX_STEER_PHYS, seed=0, random_start=False):
         import gymnasium as gym
         self.env = gym.make('f1tenth_gym:f1tenth-v0',
                             config={'num_agents': 1, 'map': map_name,
@@ -60,6 +60,11 @@ class F1TenthInterface:
                             render_mode=None)
         self.map_name = map_name        # rollout() keys normalisation off this
         self.max_speed, self.max_steer = max_speed, max_steer
+        # Training only, and never on the evaluation path: every rollout() in the project
+        # resets to the start line, so a measured score is always from the same pose.
+        # With it on, reset() draws a fresh point on the centreline each episode (D18).
+        self.random_start = bool(random_start)
+        self._srng = np.random.default_rng([seed, 3])
         self._start = self._start_pose()
         self._action = (0.0, 0.0)
         self._steps = 0
@@ -119,11 +124,19 @@ class F1TenthInterface:
         """
         return self.track_length() / self.max_speed
 
-    def _start_pose(self):
-        """First centreline point, heading toward the second."""
+    def _start_pose(self, i=0):
+        """Centreline point `i`, heading toward the next one.
+
+        `i=0` is the start line and is what every measured rollout uses. Other indices
+        exist for D18's random starts: a policy trained only from the line never sees the
+        rest of the circuit, so the back of every track is out-of-distribution at
+        evaluation -- B10's confound in another costume.
+        """
         c = self.env.unwrapped.track.centerline
         xs, ys = np.asarray(c.xs), np.asarray(c.ys)
-        return np.array([xs[0], ys[0], np.arctan2(ys[1] - ys[0], xs[1] - xs[0])])
+        i = int(i) % len(xs)
+        j = (i + 1) % len(xs)
+        return np.array([xs[i], ys[i], np.arctan2(ys[j] - ys[i], xs[j] - xs[i])])
 
     # ----------------------------------------------------------------- state
     def _absorb(self, obs):
@@ -224,6 +237,9 @@ class F1TenthInterface:
         from f1tenth_gym.envs.base_classes import RaceCar
         if RaceCar.scan_simulator.track.spec.name != self.map_name:
             RaceCar.scan_simulator.set_map(self.env.unwrapped.track)
+        if self.random_start:
+            n = len(self.env.unwrapped.track.centerline.xs)
+            self._start = self._start_pose(self._srng.integers(n))
         obs, _ = self.env.reset(options={'poses': self._start[None, :]})
         self._absorb(obs)
         self._action = (0.0, 0.0)
