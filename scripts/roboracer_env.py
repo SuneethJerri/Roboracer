@@ -428,12 +428,12 @@ def make_env(max_steps=3000, reward_fn=reward_mapfree,
 
             The repeat is what lets the discount horizon reach a lap (B13): it divides the
             steps per episode, so the same gamma buys that many times the real-time
-            lookahead. Rewards over the held steps are summed, so the return per unit of
-            simulated time is unchanged. Breaks early on termination rather than driving a
-            dead episode.
+            lookahead. The reward is scored once over the whole held block, so the living
+            cost is charged per decision as reward_progress promises. Breaks early on
+            termination rather than driving a dead episode.
             """
             a = np.clip(np.asarray(action, dtype=float), -1.0, 1.0)
-            reward, terminated, alive = 0.0, False, True
+            start, terminated, alive = self.prev, False, True
             for _ in range(action_repeat):
                 self.iface.send(a[0], a[1])
                 alive = self.iface.wait_for_scan()
@@ -443,11 +443,11 @@ def make_env(max_steps=3000, reward_fn=reward_mapfree,
                 if not alive and not getattr(self.iface, 'scan_false_is_episode_end', False):
                     raise TimeoutError('no scan — simulator disconnected mid-episode')
                 st = self.iface.state()
-                reward += reward_fn(self.prev, st)
                 terminated = st['collisions'] > self.prev['collisions'] or not alive
                 self.prev = st
                 if terminated:
                     break
+            reward = reward_fn(start, st)
             self.prev_action, self.steps = a, self.steps + 1
             return (self._obs(st), reward, terminated, self.steps >= max_steps,
                     {'lap_time': st['lap_time'], 'laps': st['laps'],
@@ -530,9 +530,6 @@ def selftest():
     assert reward_progress(pb, pb) < 0.0, 'standing still must be strictly negative'
     assert np.isclose(reward_progress(pb, pb), -0.01)
     assert np.isclose(reward_progress(pb, {**pb, 'progress': 0.30}), 9.99)
-    # ...and it must stay small enough that finishing still dominates: a lap pays
-    # progress_scale over at most ~2040 decisions at action_repeat=5.
-    assert 0.01 * 2040 < 100.0, 'the living cost must not outweigh a lap'
 
     # B11: laps are counted from OUR position, because /lap_count jumps by two on the
     # start line. Driven here through _on_ips with a stub, no ROS needed.

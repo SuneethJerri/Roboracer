@@ -135,7 +135,9 @@ def train(steps, out, tracks=None, envs=0, seed=0, n_steps=512, warm_from=None,
     check_workers(venv, tracks)
     if warm_from:
         # The curriculum step: carry the policy over, not just the hyperparameters.
-        model = PPO.load(warm_from, env=venv, device='cpu')
+        # Without the kwargs SB3 restores the zip's own gamma and batch (audit rl F4).
+        model = PPO.load(warm_from, env=venv, device=device, gamma=gamma,
+                         batch_size=batch_size)
         print(f'warm start from {warm_from}')
     else:
         # gamma is passed explicitly and printed: it was never set before, so SB3's 0.99
@@ -144,8 +146,9 @@ def train(steps, out, tracks=None, envs=0, seed=0, n_steps=512, warm_from=None,
         # for any accelerator at 2.04x and a CUDA launch above the CPU cost at batch 14.
         model = PPO('MlpPolicy', venv, n_steps=n_steps, seed=seed, verbose=1,
                     gamma=gamma, batch_size=batch_size, device=device)
-    print(f'gamma {gamma} -> horizon {1/(1-gamma):.0f} decisions = '
-          f'{1/(1-gamma)*F1.DT*action_repeat:.1f}s   action_repeat {action_repeat}   '
+    g = model.gamma
+    print(f'gamma {g} batch {model.batch_size} -> horizon {1/(1-g):.0f} decisions = '
+          f'{1/(1-g)*F1.DT*action_repeat:.1f}s   action_repeat {action_repeat}   '
           f'random_start {random_start}   device {device}', flush=True)
     model.learn(total_timesteps=steps)
     os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
@@ -220,6 +223,29 @@ def selftest():
     assert out[0] == out[4] and out[5] == out[9], 'the decision must be held'
     assert out[0] != out[5], 'and must change when it is re-queried'
     assert policy_act(_M(), action_repeat=1) is not None
+
+    # The living cost is per DECISION: standing still for one held block of 5 steps pays
+    # step_cost once, not five times (audit rl F3).
+    class _Still:
+        def __init__(self, **kw):
+            pass
+
+        def reset(self):
+            return self.state()
+
+        def state(self):
+            return {'scan': np.full(1080, 5.0), 'speed': 0.0, 'progress': 0.2,
+                    'collisions': 0, 'laps': 0, 'lap_time': 0.0}
+
+        def send(self, *a):
+            pass
+
+        def wait_for_scan(self):
+            return True
+
+    still = RE.make_env(reward_fn=RE.reward_progress, iface_factory=_Still, action_repeat=5)
+    still.reset()
+    assert np.isclose(still.step([0.0, -1.0])[1], -0.01), 'living cost charged per sim step'
 
     env = make_track_env('Spielberg')
     obs, _ = env.reset()
