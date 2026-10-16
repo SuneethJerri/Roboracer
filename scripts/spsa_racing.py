@@ -82,7 +82,11 @@ def score(lap_times, collisions, laps_wanted, t_max=T_MAX, penalty=PENALTY,
         # worst outcome scoring better than the best.
         ref = ref_lap if ref_lap is not None else t_max
         return ref * (2.0 - min(max(progress, 0.0), 1.0))
-    return float(np.mean(lap_times)) + penalty * collisions
+    # Clamped: a negative count would pay a BONUS. AutoDRIVE's reset zeroes its collision
+    # counter asynchronously, so a delta read across the reset can come out negative and a
+    # clean lap scored 10 s better than it drove (B3). Defence in depth -- rollout() also
+    # clamps -- because this is the one line where the sign could ever matter.
+    return float(np.mean(lap_times)) + penalty * max(0, collisions)
 
 
 PROG_FLOOR = 0.5    # below this, progress carries no usable magnitude -- only scale
@@ -237,7 +241,13 @@ def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None, normalize=False
     # t_max = timeout keeps the ordering sound: anything that FINISHED did so before
     # the deadline, so it necessarily scores below a rollout that did not.
     prog = getattr(iface, 'progress', lambda: 0.0)()
-    cols = iface.collisions - start_col
+    # Clamped at zero: B3. On AutoDRIVE the reset zeroes the simulator's collision counter
+    # but the topic update lands AFTER we read start_col, so the delta can come out
+    # negative -- a clean midpoint lap was credited -2 collisions, i.e. a 10 s BONUS under
+    # the graded penalty, which silently flattered whichever arm ran first. A negative
+    # count is physically impossible, so clamping is the honest reading; it is done here
+    # because every caller routes through this function.
+    cols = max(0, iface.collisions - start_col)
     sc = score(lap_times, cols, laps_wanted,
                t_max=timeout, progress=prog, ref_lap=ref_lap)
     imp = implied_lap(lap_times, timeout, prog, laps_wanted)
@@ -348,8 +358,15 @@ def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
     # across k is the entire point of the sigma knob (D3).
     rng = np.random.default_rng([seed, 0])          # perturbations
     trng = np.random.default_rng([seed, 1])         # circuit draws
+    # Reads Follow-the-Gap's own tuning as the start point, where the constrained loop
+    # defaults to the box midpoint instead. Both are deliberate and they are DIFFERENT
+    # points -- 8/17 feasible against 22/22 -- so a comparison across the two loops must
+    # pass --start on both arms (B10). Printed unconditionally: nothing in a log used to
+    # say where a run began, which is why that went unnoticed for nine days.
     u = to_unit([ftg.FOV, ftg.BUBBLE_R, ftg.GAP_THRESH, ftg.MAX_THROTTLE,
                  ftg.MAX_STEER, ftg.CLEARANCE])
+    print('start (unit):', np.round(u, 4), '= Follow-the-Gap module defaults'
+          if np.any(np.abs(u - 0.5) > 1e-9) else '= box midpoint', flush=True)
     # `channel` is constant within a file, and that is exactly why it is written: two CSV
     # families now exist whose y_plus means different quantities, and nothing else in the
     # row distinguishes them.
@@ -515,6 +532,8 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
     rng = np.random.default_rng([seed, 0])          # perturbations
     trng = np.random.default_rng([seed, 1])         # circuit draws (same streams as spsa)
     u = np.array([0.5] * P) if start is None else np.asarray(start, dtype=float)
+    print('start (unit):', np.round(u, 4),
+          '= box midpoint' if start is None else '= --start', flush=True)   # B10
     lam = float(lam0)
 
     fields = (['iter', 'a_n', 'b_n', 'c_n', 'lam'] + [n for n, _, _ in GAINS]
@@ -569,6 +588,11 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
 
 # ------------------------------------------------------------------------------ checks
 def selftest():
+    # B3: a collision counter that runs backwards must never reduce the score.
+    assert score([12.0], -2, 1, t_max=90.0) == score([12.0], 0, 1, t_max=90.0), \
+        'a negative collision count must not pay a bonus'
+    assert score([12.0], 2, 1, t_max=90.0) > score([12.0], 0, 1, t_max=90.0)
+
     mid = to_real([0.5] * P)
     assert np.isclose(mid[0], 1.30) and np.isclose(mid[3], 0.45)
     assert len(GAINS) == P == 6
