@@ -20,6 +20,8 @@ controller and both simulators are written against it:
     action = [steering, throttle], each in [-1, 1]
     obs    = [54 min-pooled LIDAR bins in [0,1]] + [speed/MAX_SPEED] + [prev action]
 """
+import csv
+import os
 import sys
 import threading
 import time
@@ -159,6 +161,9 @@ class RoboRacerInterface:
         self.lap_time = 0.0
         self.last_lap_time = 0.0
         self.start_pos = None   # learned on the first confirmed reset
+        self._left_start = False
+        self._prog_idx = 0
+        self.sim_lap_counts = 0
         self.laps = 0
         self.collisions = 0
         self._new_scan = threading.Event()
@@ -175,16 +180,13 @@ class RoboRacerInterface:
 
         self.node.create_subscription(LaserScan, SCAN_TOPIC, on_scan, qos)
         self.node.create_subscription(Odometry, ODOM_TOPIC, on_odom, qos)
-        self.node.create_subscription(
-            Point, IPS_TOPIC,
-            lambda m: setattr(self, 'position', np.array([m.x, m.y, m.z])), qos)
+        self.node.create_subscription(Point, IPS_TOPIC, self._on_ips, qos)
         self.node.create_subscription(
             Float32, LAPTIME_TOPIC, lambda m: setattr(self, 'lap_time', float(m.data)), qos)
         self.node.create_subscription(
             Float32, LASTLAP_TOPIC,
             lambda m: setattr(self, 'last_lap_time', float(m.data)), qos)
-        self.node.create_subscription(
-            Int32, LAPCOUNT_TOPIC, lambda m: setattr(self, 'laps', int(m.data)), qos)
+        self.node.create_subscription(Int32, LAPCOUNT_TOPIC, self._on_lapcount, qos)
         self.node.create_subscription(
             Int32, COLLISION_TOPIC, lambda m: setattr(self, 'collisions', int(m.data)), qos)
 
@@ -197,6 +199,106 @@ class RoboRacerInterface:
         self._executor.add_node(self.node)
         self._spin = threading.Thread(target=self._executor.spin, daemon=True)
         self._spin.start()
+
+    # Progress along a recorded reference lap (see scratch/autodrive_record_centerline.py).
+    # NOT cumulative distance travelled: this interface's f1tenth counterpart documents why
+    # odometry fails as progress -- a car circling inside one corner accumulates path
+    # without advancing -- so progress is the furthest INDEX reached along the polyline,
+    # which is the same quantity f1tenth gets from its centreline arc length.
+    CENTERLINE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              'data', 'autodrive_centerline.csv')
+    # The recorded lap is 362 points at 0.087 m spacing. At 18 Hz and up to 4 m/s the car
+    # advances under 3 indices per sample, so a 30-index window (2.7 m) is generous while
+    # still refusing to teleport across a point where the track passes near itself.
+    PROG_WINDOW = 30
+
+    # A lap is the SIMULATOR's line crossing, gated on having actually left the start.
+    # Reconstructing laps from geometry was worse than the signal it replaced: a radius
+    # test fires wherever the path passes near the start, and adding a travelled-distance
+    # gate just moved the false trigger to the gate's own threshold -- 0.7 of a 30.52 m lap
+    # is reached at 13.4 s, which is why "laps" came out at 13 s against a true 24.5 s and
+    # why the car visibly stopped before finishing (B11). The simulator knows where its
+    # line is; after the start-line artifact it ticks exactly once per lap.
+    #
+    # Measured for the gate: the car reaches 10.80 m from the line at its furthest, and the
+    # artifact fires at 0.09 s having moved 0.00 m. Requiring 5 m of separation discards it
+    # and nothing else. Per-scene; re-measure if the scene changes.
+    LAP_OUT_M = 5.0
+    # path/top_speed = 30.52 m / 8.70 m/s: the fastest lap physics allows here. A second
+    # line of defence only -- the gate above is what rejects the artifact.
+    MIN_PLAUSIBLE_LAP = 3.5
+
+    def min_plausible_lap(self):
+        """Kept as a second line of defence for `rollout()`; the position counter below is
+        the real guard. A per-scene constant, since AutoDRIVE's throttle is an effort rather
+        than a target speed and there is no track_length/max_speed to derive (B11)."""
+        return self.MIN_PLAUSIBLE_LAP
+
+    @classmethod
+    def _centerline(cls):
+        """Loaded once per process. Absent file means no progress measure, and
+        `progress()` then reports 0.0 -- which `rollout()` tolerates and D11's fourth
+        defect already accounts for, since shortfall keys off completion, not progress."""
+        if getattr(cls, '_cl_cache', None) is None:
+            try:
+                with open(cls.CENTERLINE) as fh:
+                    rows = [(float(r['x']), float(r['y'])) for r in csv.DictReader(fh)]
+                cls._cl_cache = np.asarray(rows) if len(rows) >= 20 else False
+            except (OSError, KeyError, ValueError):
+                cls._cl_cache = False
+        return cls._cl_cache
+
+    def progress(self):
+        """Furthest point reached around the reference lap, as a fraction.
+
+        Clipped to [0, 1]: unclamped progress once collapsed a score to 0.17 by making the
+        worst outcome look like the best (D2).
+        """
+        cl = self._centerline()
+        if cl is False or cl is None:
+            return 0.0
+        return float(min(1.0, self._prog_idx / (len(cl) - 1)))
+
+    def _on_lapcount(self, m):
+        """Count a lap only if the car has left the start region since the last one.
+
+        `/lap_count` jumps by TWO at t~0.09 s because the vehicle starts on the line, so
+        the raw topic is unusable as a lap signal (B11). The crossing itself is correct.
+        """
+        new = int(m.data)
+        if new > self.sim_lap_counts and self._left_start:
+            self._left_start = False
+            self._prog_idx = 0
+            self.laps += 1
+        self.sim_lap_counts = new
+
+    def _on_ips(self, m):
+        """Position, and our OWN lap count.
+
+        `/lap_count` is not usable as a lap signal: it jumps by TWO at t~0.09 s because the
+        vehicle starts on the line, so a rollout records a lap the car never drove (B11).
+        Counting ourselves mirrors what the f1tenth interface does with arc-length -- leave
+        a radius around the start, then return to it. The simulator's own counter is kept as
+        `sim_lap_counts` for comparison, exactly as on the other backend.
+        """
+        self.position = np.array([m.x, m.y, m.z])
+        if self.start_pos is None:
+            # The start line is learned on the first confirmed reset, so a caller that
+            # drives WITHOUT resetting never arms the counter. rollout() always resets
+            # first; anything else must too.
+            return
+        d = float(np.linalg.norm(self.position - np.asarray(self.start_pos, float)))
+        if d > self.LAP_OUT_M:
+            self._left_start = True
+        cl = self._centerline()
+        if cl is not False and cl is not None:
+            # Nearest point ahead of where we already are, so a track that passes close to
+            # itself cannot jump progress forwards.
+            lo = self._prog_idx
+            hi = min(len(cl), lo + self.PROG_WINDOW + 1)
+            win = cl[lo:hi]
+            j = lo + int(np.argmin(np.sum((win - self.position[:2]) ** 2, axis=1)))
+            self._prog_idx = max(self._prog_idx, j)
 
     def now(self):
         """Wall clock. AutoDRIVE runs at 1x real time, so this IS simulator time --
@@ -257,6 +359,11 @@ class RoboRacerInterface:
                                    start_pos=self.start_pos):
                     if self.start_pos is None:
                         self.start_pos = np.array(self.position)
+                    # A reset far from the line would otherwise leave the counter armed,
+                    # and the next return to the start would score a lap the car never
+                    # drove -- the same artifact as the simulator's own counter (B11).
+                    self._left_start = False
+                    self._prog_idx = 0
                     return self.state()
         finally:
             self._pub_r.publish(self._Bool(data=False))  # de-latch, always
@@ -396,6 +503,70 @@ def selftest():
     # it is the progress forfeited -- up to 80 here against a penalty of 5.
     assert np.isclose(reward_progress(pb, {**pb, 'progress': 0.30, 'collisions': 1}), 5.0)
     assert reward_progress(pb, {**pb, 'collisions': 1}) == -5.0
+
+    # B11: laps are counted from OUR position, because /lap_count jumps by two on the
+    # start line. Driven here through _on_ips with a stub, no ROS needed.
+    assert RoboRacerInterface.MIN_PLAUSIBLE_LAP > 1.0
+    assert RoboRacerInterface.LAP_OUT_M > 0.0
+
+    class _P:                                    # the Point message _on_ips expects
+        def __init__(self, x, y=0.0, z=0.0):
+            self.x, self.y, self.z = x, y, z
+
+    class _I:                                    # the Int32 message _on_lapcount expects
+        def __init__(self, data):
+            self.data = data
+
+    stub = RoboRacerInterface.__new__(RoboRacerInterface)
+    stub.start_pos, stub._left_start, stub.laps, stub.sim_lap_counts = None, False, 0, 0
+    stub.position, stub._prog_idx = np.zeros(3), 0
+    RoboRacerInterface._on_ips(stub, _P(0.0))    # no start_pos yet: position only
+    stub.start_pos = np.zeros(3)
+
+    # The artifact: the counter jumps by two on the line, before the car has gone anywhere.
+    RoboRacerInterface._on_lapcount(stub, _I(2))
+    assert stub.laps == 0, 'a crossing before leaving the start is the start-line artifact'
+    assert stub.sim_lap_counts == 2, 'but the simulator value is still tracked'
+
+    # A genuine lap: leave the start region, then cross.
+    RoboRacerInterface._on_ips(stub, _P(8.0))
+    RoboRacerInterface._on_lapcount(stub, _I(3))
+    assert stub.laps == 1
+    # Passing near the line again without leaving must not count a second lap.
+    RoboRacerInterface._on_ips(stub, _P(0.4))
+    RoboRacerInterface._on_lapcount(stub, _I(4))
+    assert stub.laps == 1, 'two crossings without leaving the start is one lap'
+    RoboRacerInterface._on_ips(stub, _P(3.0))    # out, but not past LAP_OUT_M
+    RoboRacerInterface._on_lapcount(stub, _I(5))
+    assert stub.laps == 1, 'a short excursion does not re-arm the counter'
+    RoboRacerInterface._on_ips(stub, _P(9.0))    # properly away
+    RoboRacerInterface._on_lapcount(stub, _I(6))
+    assert stub.laps == 2
+
+    # Progress along a synthetic centreline: monotone, clipped, and unable to jump across
+    # a point where the track passes near itself.
+    line = np.array([[float(i) * 0.1, 0.0] for i in range(100)])
+    RoboRacerInterface._cl_cache = line
+    pr = RoboRacerInterface.__new__(RoboRacerInterface)
+    pr.start_pos, pr._left_start, pr._prog_idx = np.zeros(3), False, 0
+    pr.position, pr.laps, pr.sim_lap_counts = np.zeros(3), 0, 0
+    assert pr.progress() == 0.0
+    for x in (0.0, 1.0, 2.0, 5.0):                   # walk along it
+        RoboRacerInterface._on_ips(pr, _P(x))
+    assert 0.49 < pr.progress() < 0.52, pr.progress()
+    RoboRacerInterface._on_ips(pr, _P(0.0))          # drive back to the start
+    assert 0.49 < pr.progress() < 0.52, 'progress must not go backwards'
+    was = pr._prog_idx
+    RoboRacerInterface._on_ips(pr, _P(9.9))          # a jump beyond the window
+    assert pr._prog_idx <= was + RoboRacerInterface.PROG_WINDOW, \
+        'one sample must not advance progress by more than the window'
+    assert pr.progress() < 1.0, 'and must not reach the end in one sample'
+    for _ in range(40):                              # but it can get there by driving
+        RoboRacerInterface._on_ips(pr, _P(9.9))
+    assert pr.progress() == 1.0
+    RoboRacerInterface._cl_cache = False             # absent file: no progress measure
+    assert pr.progress() == 0.0
+    RoboRacerInterface._cl_cache = None
     # A full lap is worth progress_scale however it was driven, so the lap is the target
     # and speed is only the means -- the defect in reward_mapfree over a long episode.
     assert np.isclose(sum(reward_progress({**pb, 'progress': i / 100},
