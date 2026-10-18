@@ -141,3 +141,26 @@ def test_hysteresis_does_not_make_the_car_ignore_a_much_better_gap():
     ctrl.prev_heading = ANG[ctrl.lo + 270]
     ctrl.act(scan)
     assert ctrl.lo + 400 <= ctrl.debug["target_idx"] <= ctrl.lo + 620
+
+
+# -------------------------------------------------- everything on, shipped config
+def test_shipped_repaired_yaml_with_all_options_is_robust():
+    import yaml
+    p = HERE.parents[3] / "configs" / "follow_gap_repaired.yaml"
+    if not p.exists():
+        pytest.skip("configs/follow_gap_repaired.yaml not found")
+    cfg = yaml.safe_load(open(p))
+    cfg.update(speed_mode="braking", disparity_threshold=1.0, w_depth=1.0, w_turn=0.3, w_switch=0.5)
+    ctrl = FollowGapRepaired(cfg)
+    rng = np.random.default_rng(0)
+    for i in range(300):
+        scan = rng.uniform(0.0, 8.0, N)
+        if i % 3 == 0:
+            scan[rng.integers(0, N, 40)] = np.nan
+        if i % 5 == 0:
+            scan[rng.integers(0, N, 40)] = np.inf
+        steer, speed = ctrl.act(scan)
+        assert np.isfinite(steer) and np.isfinite(speed)
+        assert abs(steer) <= cfg["max_steer"] + 1e-9
+        assert cfg["speed_min"] <= speed <= cfg["speed_max"]
+        assert ctrl.lo <= ctrl.debug["target_idx"] < ctrl.hi
