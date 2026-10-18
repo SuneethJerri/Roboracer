@@ -93,3 +93,51 @@ def test_extender_is_off_by_default():
     base.act(scan)
     ctrl.act(scan)
     assert base.debug["chosen_gap"] == ctrl.debug["chosen_gap"]
+
+
+# ------------------------------------------------------------------- hysteresis
+def _two_equal_gaps(ctrl):
+    scan = const(0.5)
+    scan[ctrl.lo + 250: ctrl.lo + 350] = 6.0           # gap A (right of centre)
+    scan[ctrl.lo + 450: ctrl.lo + 550] = 6.0           # gap B (left of centre), same width
+    return scan, ctrl.lo + 300, ctrl.lo + 500
+
+
+def test_hysteresis_keeps_the_previous_gap():
+    ctrl = rep(w_switch=1.0)
+    scan, a, b = _two_equal_gaps(ctrl)
+    ctrl.prev_heading = ANG[a]
+    ctrl.act(scan)
+    assert abs(ctrl.debug["target_idx"] - a) <= 3
+    ctrl.reset()
+    ctrl.prev_heading = ANG[b]
+    ctrl.act(scan)
+    assert abs(ctrl.debug["target_idx"] - b) <= 3
+
+
+def test_no_hysteresis_when_weight_is_zero():
+    ctrl = rep(w_switch=0.0)
+    scan, a, b = _two_equal_gaps(ctrl)
+    ctrl.prev_heading = ANG[b]                         # ignored: tie -> first gap
+    ctrl.act(scan)
+    assert abs(ctrl.debug["target_idx"] - a) <= 3
+
+
+def test_previous_heading_is_updated_and_reset():
+    ctrl = rep(w_switch=1.0)
+    scan, a, b = _two_equal_gaps(ctrl)
+    ctrl.act(scan)
+    assert ctrl.prev_heading == pytest.approx(ctrl.debug["heading"])
+    ctrl.reset()
+    assert ctrl.prev_heading == 0.0
+
+
+def test_hysteresis_does_not_make_the_car_ignore_a_much_better_gap():
+    """A small switching penalty must not beat a clearly wider gap."""
+    ctrl = rep(w_switch=0.2)
+    scan = const(0.5)
+    scan[ctrl.lo + 250: ctrl.lo + 290] = 6.0           # narrow gap near the previous heading
+    scan[ctrl.lo + 400: ctrl.lo + 620] = 6.0           # much wider gap elsewhere
+    ctrl.prev_heading = ANG[ctrl.lo + 270]
+    ctrl.act(scan)
+    assert ctrl.lo + 400 <= ctrl.debug["target_idx"] <= ctrl.lo + 620

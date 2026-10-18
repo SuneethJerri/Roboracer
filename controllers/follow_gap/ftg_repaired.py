@@ -24,15 +24,27 @@ class FollowGapRepaired(FollowGap):
         super().__init__(cfg)
 
     def choose_gap(self, gaps, win):
+        """score = w_width*width + w_depth*depth - w_turn*turn - w_switch*switch
+
+        width  gap width / search window width           (0..1)
+        depth  mean range inside the gap / max_range     (0..1)
+        turn   |angle to gap centre| / half search FOV    (0..1)
+        switch |gap centre - previous heading| / full search FOV (0..1)
+               -> hysteresis: discourages flipping between two gaps frame to frame
+        """
         c = self.cfg
         n = len(win)
         half_fov = np.deg2rad(c["fov_deg"]) / 2
+        w_switch = float(c.get("w_switch", 0.0))
         scores = []
         for s, e in gaps:
-            width = (e - s) / n                                     # 0..1
-            depth = float(np.mean(win[s:e])) / c["max_range"]       # 0..1
-            turn = abs(self.angles[self.lo + (s + e - 1) // 2]) / half_fov   # 0..1
-            scores.append(c["w_width"] * width + c["w_depth"] * depth - c["w_turn"] * turn)
+            centre = self.angles[self.lo + (s + e - 1) // 2]
+            width = (e - s) / n
+            depth = float(np.mean(win[s:e])) / c["max_range"]
+            turn = abs(centre) / half_fov
+            switch = abs(centre - self.prev_heading) / (2.0 * half_fov)
+            scores.append(c["w_width"] * width + c["w_depth"] * depth
+                          - c["w_turn"] * turn - w_switch * switch)
         self.extra["gap_scores"] = [float(x) for x in scores]
         return gaps[int(np.argmax(scores))]
 
