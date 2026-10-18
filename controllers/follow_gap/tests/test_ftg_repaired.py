@@ -52,3 +52,44 @@ def test_linear_mode_is_the_baseline_rule():
     base, r = FollowGap(CFG), rep()
     for rng, st in [(0.5, 0.0), (2.0, 0.2), (6.0, 0.4)]:
         assert r.speed_from_scan(rng, st) == pytest.approx(base.speed_from_scan(rng, st))
+
+
+# ------------------------------------------------------------- disparity extender
+def test_extender_widens_an_obstacle_by_the_car_half_width():
+    ctrl = rep(disparity_threshold=1.0, car_half_width=0.15)
+    s = const(3.0)
+    s[500:510] = 1.0
+    out = ctrl.extend_disparities(s)
+    k = int(np.ceil(np.arctan2(0.15, 1.0) / ctrl.inc))
+    assert np.all(out[500 - k: 510 + k] <= 1.0 + 1e-9)
+    assert out[500 - k - 1] == 3.0 and out[510 + k] == 3.0
+
+
+def test_extender_closes_an_opening_narrower_than_the_car():
+    base, ctrl = FollowGap(CFG), rep(disparity_threshold=1.0, car_half_width=0.15)
+    scan = const(0.5)
+    scan[base.lo + 300: base.lo + 360] = 6.0          # 60-beam slit: too narrow to drive through
+    base.act(scan)
+    ctrl.act(scan)
+    assert len(base.debug["gaps"]) == 1                # baseline happily sees a gap
+    assert ctrl.debug["gaps"] == []                    # repaired knows the car does not fit
+
+
+def test_extender_keeps_a_wide_gap_but_shrinks_its_edges():
+    base, ctrl = FollowGap(CFG), rep(disparity_threshold=1.0, car_half_width=0.15)
+    scan = const(0.5)
+    scan[base.lo + 300: base.lo + 600] = 6.0
+    base.act(scan)
+    ctrl.act(scan)
+    (b0, b1), (r0, r1) = base.debug["chosen_gap"], ctrl.debug["chosen_gap"]
+    assert 0 < (r1 - r0) < (b1 - b0) - 100
+    assert abs((b0 + b1) / 2 - (r0 + r1) / 2) <= 3     # still centred on the same opening
+
+
+def test_extender_is_off_by_default():
+    base, ctrl = FollowGap(CFG), rep()
+    scan = const(0.5)
+    scan[base.lo + 300: base.lo + 420] = 6.0
+    base.act(scan)
+    ctrl.act(scan)
+    assert base.debug["chosen_gap"] == ctrl.debug["chosen_gap"]

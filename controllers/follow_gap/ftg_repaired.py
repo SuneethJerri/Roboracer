@@ -36,6 +36,38 @@ class FollowGapRepaired(FollowGap):
         self.extra["gap_scores"] = [float(x) for x in scores]
         return gaps[int(np.argmax(scores))]
 
+    # ------------------------------------------------------------ disparity extender
+    def preprocess(self, scan):
+        """clean -> (optional) disparity extender -> smooth."""
+        s = self._clean(scan)
+        if float(self.cfg.get("disparity_threshold", 0.0)) > 0.0:
+            s = self.extend_disparities(s)
+        return self._smooth(s)
+
+    def extend_disparities(self, s):
+        """Widen every near obstacle edge by the car's half width.
+
+        Where the range jumps by more than disparity_threshold between neighbouring
+        beams, the nearer reading is copied over the beams on the far side that the
+        car's body would sweep (car_half_width at that distance). Openings narrower
+        than the car then close, and gap edges keep a clearance from corners.
+        """
+        thr = float(self.cfg["disparity_threshold"])
+        hw = float(self.cfg.get("car_half_width", 0.15))
+        out, n = s.copy(), len(s)
+        for i in np.where(np.abs(np.diff(s)) > thr)[0]:
+            if s[i] < s[i + 1]:                       # near edge at i, far side = higher index
+                near = max(float(s[i]), 0.05)
+                k = int(np.ceil(np.arctan2(hw, near) / self.inc))
+                j0, j1 = i + 1, min(n, i + 1 + k)
+                out[j0:j1] = np.minimum(out[j0:j1], s[i])
+            else:                                     # near edge at i+1, far side = lower index
+                near = max(float(s[i + 1]), 0.05)
+                k = int(np.ceil(np.arctan2(hw, near) / self.inc))
+                j0, j1 = max(0, i + 1 - k), i + 1
+                out[j0:j1] = np.minimum(out[j0:j1], s[i + 1])
+        return out
+
     # ------------------------------------------------------------ speed (scan-derived)
     def speed_from_scan(self, front_range, steer):
         """speed_mode: linear (baseline rule) | braking (stopping-distance rule).

@@ -37,3 +37,7 @@ w_turn: 0.0
 speed_mode: linear       # linear = baseline rule | braking = stopping-distance rule
 a_brake: 3.0             # [m/s^2] assumed braking deceleration (braking mode)
 stop_margin: 0.5         # [m] range kept free in front of the car (braking mode)
+
+# --- repair: disparity extender (0 = off) ---
+disparity_threshold: 0.0 # [m] range jump between neighbouring beams that counts as an edge; try 1.0
+car_half_width: 0.15     # [m] half of the vehicle width plus margin - CHECK against the real car
