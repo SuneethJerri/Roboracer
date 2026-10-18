@@ -17,12 +17,19 @@ Uses only the current 1080-beam LIDAR scan. Interface shared with the team:
 | `tests/test_ftg.py` | Unit tests on synthetic scans |
 | `data/runs, scans, plots` | Raw run logs, saved scans, report figures |
 
-## Setup (once)
+## Setup (once per machine) - team rules
+One venv and one `requirements.txt` for the whole repo (no per-part requirements file).
+If P2 needs a package, add it to the ROOT `requirements.txt`. P2 uses: numpy, pyyaml,
+matplotlib, pytest.
+
 ```powershell
-C:\Users\abhis\f1env\Scripts\Activate.ps1
-python -m pip install -r controllers\follow_gap\requirements.txt
-python -c "import numpy; print(numpy.__version__)"     # must still print 1.22.0
+py -3.11 -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\python -m common.fetch_tracks
 ```
+Python 3.11 is required (numba has no 3.13+ wheels). The simulator package is the NEW
+`f1tenth_gym` (gymnasium API, 5-value step/reset). P2 code never calls the gym API
+directly: it only implements `act(scan, pose=None)`.
 
 ## Everyday commands (from the repo root, f1env active)
 ```powershell
