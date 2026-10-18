@@ -32,4 +32,8 @@ k_steer: 2.0
 w_width: 1.0
 w_depth: 0.0
 w_turn: 0.0
-# P2 (you)
+
+# --- repair: scan-derived speed regulation ---
+speed_mode: linear       # linear = baseline rule | braking = stopping-distance rule
+a_brake: 3.0             # [m/s^2] assumed braking deceleration (braking mode)
+stop_margin: 0.5         # [m] range kept free in front of the car (braking mode)

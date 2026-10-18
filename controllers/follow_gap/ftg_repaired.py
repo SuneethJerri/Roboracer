@@ -35,3 +35,19 @@ class FollowGapRepaired(FollowGap):
             scores.append(c["w_width"] * width + c["w_depth"] * depth - c["w_turn"] * turn)
         self.extra["gap_scores"] = [float(x) for x in scores]
         return gaps[int(np.argmax(scores))]
+
+    # ------------------------------------------------------------ speed (scan-derived)
+    def speed_from_scan(self, front_range, steer):
+        """speed_mode: linear (baseline rule) | braking (stopping-distance rule).
+
+        braking: the car must be able to stop inside the free range ahead,
+        v_safe = sqrt(2 * a_brake * (front_range - stop_margin)),
+        then reduced by the steering term and clipped to [speed_min, speed_max].
+        """
+        c = self.cfg
+        if c.get("speed_mode", "linear") != "braking":
+            return super().speed_from_scan(front_range, steer)
+        a = float(c.get("a_brake", 3.0))
+        margin = float(c.get("stop_margin", 0.5))
+        v_safe = float(np.sqrt(2.0 * a * max(front_range - margin, 0.0)))
+        return float(np.clip(v_safe - c["k_steer"] * abs(steer), c["speed_min"], c["speed_max"]))
