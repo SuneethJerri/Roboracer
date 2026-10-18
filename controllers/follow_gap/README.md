@@ -7,22 +7,32 @@ Uses only the current 1080-beam LIDAR scan. Interface shared with the team:
 | File | Purpose |
 |---|---|
 | `ftg.py` | Baseline controller (widest gap, centre target) |
-| `ftg_repaired.py` | Repaired variant (gap scoring by width, depth, turn) - adapt after week 3 |
+| `ftg_repaired.py` | Repaired variant. Options (all in the yaml, all off/neutral by default): gap score weights `w_width/w_depth/w_turn`, hysteresis `w_switch`, disparity extender `disparity_threshold/car_half_width`, braking speed rule `speed_mode: braking`. Adapt after week 3 |
 | `../../configs/follow_gap.yaml` | Baseline parameters (nothing is hardcoded in the code) |
 | `../../configs/follow_gap_repaired.yaml` | Repaired parameters |
 | `tools/record_run.py` | Run in f1tenth_gym, log every step (`.npz`) + summary (`.json`) |
 | `tools/plot_scan.py` | Polar plots of scan, bubble, gaps, chosen heading (D1, D4) |
 | `tools/find_bad_moments.py` | Flag collisions, near-misses, steering flips, stuck moments |
 | `tools/summarize_runs.py` | All run summaries -> one provisional CSV |
-| `tests/test_ftg.py` | Unit tests on synthetic scans |
+| `tests/test_ftg.py` | Baseline unit tests on synthetic scans (D1) |
+| `tests/test_ftg_repaired.py` | Tests for each repair option |
+| `tests/test_constraints.py` | No `centreline/` import (team rule) + frozen baseline behaviour |
+| `tests/test_packaging.py` | Controllers import as a package for `scripts/run_gym.py` |
 | `data/runs, scans, plots` | Raw run logs, saved scans, report figures |
 
-## Setup (once)
+## Setup (once per machine) - team rules
+One venv and one `requirements.txt` for the whole repo (no per-part requirements file).
+If P2 needs a package, add it to the ROOT `requirements.txt`. P2 uses: numpy, pyyaml,
+matplotlib, pytest.
+
 ```powershell
-C:\Users\abhis\f1env\Scripts\Activate.ps1
-python -m pip install -r controllers\follow_gap\requirements.txt
-python -c "import numpy; print(numpy.__version__)"     # must still print 1.22.0
+py -3.11 -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\python -m common.fetch_tracks
 ```
+Python 3.11 is required (numba has no 3.13+ wheels). The simulator package is the NEW
+`f1tenth_gym` (gymnasium API, 5-value step/reset). P2 code never calls the gym API
+directly: it only implements `act(scan, pose=None)`.
 
 ## Everyday commands (from the repo root, f1env active)
 ```powershell
@@ -45,3 +55,9 @@ python controllers\follow_gap\tools\summarize_runs.py
 - Raw `.npz` run logs are git-ignored. Force-add the few scans used in the report:
   `git add -f controllers/follow_gap/data/scans/failure_case_1.npz`
 - Only edit your own folders; ask the team before touching `common/` or `sims/`.
+
+## Migration status (new f1tenth_gym, gymnasium API)
+- `act(scan, pose=None)` and the tests are simulator-independent and already work.
+- `tools/record_run.py` still uses the OLD `f110_gym` API and is being replaced by
+  `scripts/run_gym.py`. `plot_scan.py`, `find_bad_moments.py`, `summarize_runs.py`
+  only read saved `.npz`/`.json` files and are unaffected.

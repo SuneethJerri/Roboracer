@@ -29,7 +29,19 @@ k_steer: 2.0
 # width = gap width / search window width        (0..1)
 # depth = mean range inside the gap / max_range  (0..1)
 # turn  = |angle to gap centre| / half search FOV (0..1)
+# switch= |gap centre - previous heading| / full search FOV (0..1), set by w_switch (hysteresis)
 w_width: 1.0
 w_depth: 0.0
 w_turn: 0.0
-# P2 (you)
+
+# --- repair: scan-derived speed regulation ---
+speed_mode: linear       # linear = baseline rule | braking = stopping-distance rule
+a_brake: 3.0             # [m/s^2] assumed braking deceleration (braking mode)
+stop_margin: 0.5         # [m] range kept free in front of the car (braking mode)
+
+# --- repair: disparity extender (0 = off) ---
+disparity_threshold: 0.0 # [m] range jump between neighbouring beams that counts as an edge; try 1.0
+car_half_width: 0.15     # [m] half of the vehicle width plus margin - CHECK against the real car
+
+# --- repair: gap hysteresis (0 = off). Raise (try 0.3..1.0) if the car flips between two gaps ---
+w_switch: 0.0
