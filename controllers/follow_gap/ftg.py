@@ -34,6 +34,7 @@ class FollowGap:
         self.lo, self.hi = int(idx[0]), int(idx[-1]) + 1      # search window [lo, hi)
         self.front = np.abs(self.angles) <= np.deg2rad(cfg["front_cone_deg"])
         self.prev_steer = 0.0
+        self.prev_heading = 0.0       # heading chosen at the previous step [rad]
         self.extra = {}
         self.debug = {}
 
@@ -41,15 +42,19 @@ class FollowGap:
     def reset(self):
         """Call at the start of every run (clears steering smoothing memory)."""
         self.prev_steer = 0.0
+        self.prev_heading = 0.0
         self.extra = {}
         self.debug = {}
 
-    def preprocess(self, scan):
-        """Fix NaN/inf, clip far readings, smooth."""
+    def _clean(self, scan):
+        """Fix NaN/inf and clip far readings."""
         s = np.nan_to_num(np.asarray(scan, dtype=float),
                           nan=self.cfg["max_range"], posinf=self.cfg["max_range"],
                           neginf=0.0)
-        s = np.clip(s, 0.0, self.cfg["max_range"])
+        return np.clip(s, 0.0, self.cfg["max_range"])
+
+    def _smooth(self, s):
+        """Moving average over smooth_window beams."""
         w = int(self.cfg["smooth_window"])
         if w % 2 == 0:
             w += 1
@@ -57,6 +62,10 @@ class FollowGap:
             p = w // 2
             s = np.convolve(np.pad(s, (p, p), mode="edge"), np.ones(w) / w, mode="valid")
         return s
+
+    def preprocess(self, scan):
+        """Fix NaN/inf, clip far readings, smooth. (Subclasses may insert steps between.)"""
+        return self._smooth(self._clean(scan))
 
     def mask_bubble(self, win):
         """Zero the beams around the nearest obstacle. Returns (masked, index, half-width)."""
@@ -85,6 +94,12 @@ class FollowGap:
             return s + int(np.argmax(win[s:e]))
         return (s + e - 1) // 2                                   # gap centre
 
+    def speed_from_scan(self, front_range, steer):
+        """BASELINE speed rule: linear in forward range, reduced by steering."""
+        c = self.cfg
+        return float(np.clip(c["k_range"] * front_range - c["k_steer"] * abs(steer),
+                             c["speed_min"], c["speed_max"]))
+
     # ------------------------------------------------------------------- main
     def act(self, scan, pose=None):
         c = self.cfg
@@ -110,8 +125,8 @@ class FollowGap:
         self.prev_steer = steer
 
         front_range = float(proc[self.front].min())
-        speed = float(np.clip(c["k_range"] * front_range - c["k_steer"] * abs(steer),
-                              c["speed_min"], c["speed_max"]))
+        speed = self.speed_from_scan(front_range, steer)
+        self.prev_heading = float(self.angles[target])
 
         self.debug = dict(
             proc=proc, lo=self.lo, hi=self.hi,
@@ -122,4 +137,3 @@ class FollowGap:
             steer=steer, speed=speed, front_range=front_range, extra=self.extra,
         )
         return steer, speed
-# the controller
