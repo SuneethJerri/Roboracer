@@ -14,7 +14,7 @@
 #   3. gym 0.19 forces numpy 1.22, which pins matplotlib to 3.7.5 and blocks current
 #      scipy -- a tax on all five parts.
 # Cost: step()/reset() return 5 values, not 4. Only sims/gym_env.py calls them.
-f1tenth_gym @ git+https://github.com/f1tenth/f1tenth_gym.git
+f1tenth_gym @ git+https://github.com/f1tenth/f1tenth_gym.git@5a301bd0ae1ceaf7dec653e7549c8d099db58a6b
 gymnasium==0.29.1
 
 # --- numerics -------------------------------------------------------------------
