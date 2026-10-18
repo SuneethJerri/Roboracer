@@ -8,7 +8,10 @@ in corners, steering toward the deepest beam (target_mode: deepest).
 """
 import numpy as np
 
-from .ftg import FollowGap
+try:                      # imported as part of the package (shared runner)
+    from .ftg import FollowGap
+except ImportError:       # imported as a top-level module (tools, tests)
+    from ftg import FollowGap
 
 
 class FollowGapRepaired(FollowGap):
@@ -32,4 +35,3 @@ class FollowGapRepaired(FollowGap):
             scores.append(c["w_width"] * width + c["w_depth"] * depth - c["w_turn"] * turn)
         self.extra["gap_scores"] = [float(x) for x in scores]
         return gaps[int(np.argmax(scores))]
-# fixed version
