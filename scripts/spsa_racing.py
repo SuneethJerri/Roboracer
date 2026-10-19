@@ -543,7 +543,7 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
                      seed=0, out=None, max_step=0.10, timeout=250.0, alpha=0.02,
                      lam0=1.0, tracks_per_iter=2, start=None, lam_every=LAM_EVERY,
                      delta=DELTA, family='bernoulli', accumulate_g=False,
-                     graded_g=False, c_adapt=0.0):
+                     graded_g=False, c_adapt=0.0, restart=False, sf_m=0, sf_sigma=0.16):
     """Primal-dual SPSA on a constrained racing problem (notebook C3).
 
         minimise   J(theta)  = E_M[ implied_lap(theta, M) / baseline(M) ]
@@ -591,6 +591,15 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
     The multiplier is bounded (C_MULT_LO/HI) and no new column is written: the adapted
     radius IS `c_n` in the CSV, so a fixed-c run stays byte-comparable with the archive.
 
+    `restart` is C4's rival (D34): on the same certificate, `L+ == L-`, jump by spsa()'s
+    own N(0, 2 c_n) instead of stepping. Its own stream, so the perturbations stay paired
+    with a run that never restarts.
+
+    `sf_m` > 0 steps on the smoothed objective `J_sigma = E[L(theta + sigma d)]`, d ~ N(0, I),
+    with sigma FIXED (D36): one measurement at theta and `sf_m` one-sided probes, all on one
+    circuit draw, `ghat = sum d_i (L_i - L_0) / (sigma m)`. Probes are clipped to the box by
+    `to_real`, so near a face this is J_sigma of the clipped objective.
+
     ponytail: one constraint. Collisions are the obvious second (and `Rollout.collisions`
     is already carried for it), but D7's warning about interacting schedules is real --
     every extra multiplier is another timescale to separate. Add it when the completion
@@ -607,6 +616,9 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
 
     rng = np.random.default_rng([seed, 0])          # perturbations
     trng = np.random.default_rng([seed, 1])         # circuit draws (same streams as spsa)
+    jrng = np.random.default_rng([seed, 7])         # restart jumps (D34)
+    srng = np.random.default_rng([seed, 8])         # SF probes (D36)
+    assert not (sf_m and (c_adapt or restart)), 'sf_m is its own estimator (D36)'
     u = np.array([0.5] * P) if start is None else np.asarray(start, dtype=float)
     print('start (unit):', np.round(u, 4),
           '= box midpoint' if start is None else '= --start', flush=True)   # B10
@@ -625,23 +637,41 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
             cn = cmul * c / (n + 1) ** GAMMA
             d = pert(n, rng)
             tracks = circuits.sample(tracks_per_iter, trng)      # CRN, both arms (D4)
-            mp = measure(pool, u + cn * d, tracks, laps, timeout)
-            mm = measure(pool, u - cn * d, tracks, laps, timeout)
-
-            Gp, Gm = (violation(mp.rollouts, delta, graded_g),
-                      violation(mm.rollouts, delta, graded_g))
-            Lp = mp.cost + lam * (Gp - alpha)
-            Lm = mm.cost + lam * (Gm - alpha)
+            if sf_m:                                             # D36: J_sigma
+                cn = sf_sigma
+                mm = measure(pool, u, tracks, laps, timeout)
+                Gm = violation(mm.rollouts, delta, graded_g)
+                Lm = mm.cost + lam * (Gm - alpha)
+                ds = srng.standard_normal((sf_m, P))
+                ms = [measure(pool, u + cn * di, tracks, laps, timeout) for di in ds]
+                Gs = [violation(x.rollouts, delta, graded_g) for x in ms]
+                Ls = [x.cost + lam * (g - alpha) for x, g in zip(ms, Gs)]
+                g = sum(di * (Li - Lm) for di, Li in zip(ds, Ls)) / (cn * sf_m)
+                u = np.clip(u - np.clip(an * g, -max_step, max_step), 0.0, 1.0)
+                # Logged as the "+" arm: the probes' mean, all-of feasibility.
+                mp = ms[0]._replace(cost=float(np.mean([x.cost for x in ms])),
+                                    feasible=all(x.feasible for x in ms))
+                Gp, Lp = float(np.mean(Gs)), float(np.mean(Ls))
+            else:
+                mp = measure(pool, u + cn * d, tracks, laps, timeout)
+                mm = measure(pool, u - cn * d, tracks, laps, timeout)
+                Gp, Gm = (violation(mp.rollouts, delta, graded_g),
+                          violation(mm.rollouts, delta, graded_g))
+                Lp = mp.cost + lam * (Gp - alpha)
+                Lm = mm.cost + lam * (Gm - alpha)
             # No both-failed special case, and that reasoning was WRONG -- kept here with
             # its refutation because it is load-bearing. The claim was that implied_lap
             # keeps varying with how far each arm got, so the gradient stays informative
             # outside the feasible region. It does not: PROG_FLOOR and COST_CAP flatten it,
             # and B19 measured theta frozen for 147 iterations with L+ == L- every time.
-            # The unconstrained loop's random restart would have escaped it. C4's adaptive
-            # radius is the response (R49); a restart branch here is the cheaper rival and
-            # has not been measured.
-            u = np.clip(u - np.clip(an * grad(Lp - Lm, cn, d, is_sf),
-                                    -max_step, max_step), 0.0, 1.0)
+            # C4's radius is one response (R49); `restart` is cheaper and did as well (R53).
+            if sf_m:
+                pass                                             # stepped above
+            elif restart and Lp == Lm:
+                u = np.clip(u + jrng.normal(0, 2 * cn, size=P), 0.0, 1.0)
+            else:
+                u = np.clip(u - np.clip(an * grad(Lp - Lm, cn, d, is_sf),
+                                        -max_step, max_step), 0.0, 1.0)
             if c_adapt:                                          # C4 (D29)
                 # DEADNESS IS TESTED FIRST, and the order is the whole content of B30.
                 # The plateau is a SUBSET of the infeasible region -- `J` pinned at
@@ -1130,6 +1160,30 @@ def selftest():
                              timeout=250.0, out=os.path.join(td, 'c4_off.csv'))
             assert c_mults(os.path.join(td, 'c4_off.csv')) == [1.0] * 6
 
+            # D34: on the plateau the restart must MOVE theta where a plain step cannot,
+            # at a fixed radius, and leave the radius alone.
+            for tag, rs in (('plain', False), ('restart', True)):
+                spsa_constrained(CircuitPool(lambda t: _Bowl(t, prog=0.1, wall=-1.0)),
+                                 iters=4, seed=0, timeout=250.0, restart=rs,
+                                 out=os.path.join(td, f'rs_{tag}.csv'))
+            gk = [n for n, _, _ in GAINS]
+            th = {tag: [[float(r[k]) for k in gk] for r in
+                        csv.DictReader(open(os.path.join(td, f'rs_{tag}.csv')))]
+                  for tag in ('plain', 'restart')}
+            assert all(t == th['plain'][0] for t in th['plain']), 'plateau: plain is frozen'
+            assert th['restart'][-1] != th['restart'][0], 'the restart must move theta'
+            assert c_mults(os.path.join(td, 'rs_restart.csv')) == [1.0] * 4
+
+            # D36: the SF step must descend a bowl, and with sigma reaching past the
+            # plateau's edge it must move where SPSA at a small radius is frozen.
+            spsa_constrained(CircuitPool(lambda t: _Bowl(t)), iters=12, seed=0,
+                             timeout=250.0, sf_m=3, sf_sigma=0.1,
+                             out=os.path.join(td, 'sf_bowl.csv'))
+            sb = list(csv.DictReader(open(os.path.join(td, 'sf_bowl.csv'))))
+            assert float(sb[-1]['L_minus']) < float(sb[0]['L_minus']), \
+                'SF must descend the bowl (L_minus is the measurement AT theta)'
+            assert all(float(r['c_n']) == 0.1 for r in sb), 'sigma must stay fixed'
+
             # D27: --graded-g must reach the loop, not just the helper. A probe that times
             # out with progress 0.9 has shortfall 0.1, so the two objectives must differ by
             # exactly DELTA on iteration 0, where both runs still share an iterate.
@@ -1242,6 +1296,13 @@ def main(argv):
                    help='feasibility-aware probe radius (C4): shrink c by this fraction '
                         'when a probe fails, grow it when both probes return the SAME '
                         'Lagrangian (B19). 0 = the fixed schedule every run used')
+    q.add_argument('--restart', action='store_true',
+                   help="C4's rival (D34): jump N(0, 2 c_n) when L+ == L- instead of "
+                        'stepping. Same trigger as --c-adapt, a different response')
+    q.add_argument('--sf-m', type=int, default=0,
+                   help='D36: step on the smoothed objective with this many one-sided '
+                        'Gaussian probes per iteration, sigma fixed. 0 = SPSA')
+    q.add_argument('--sf-sigma', type=float, default=0.16, help='D36: fixed sigma, unit coords')
     q.add_argument('--gains', default=None,
                    help='comma-separated gain NAMES to tune, overriding --dim. The only '
                         'way to reach a gain outside the first 24, such as MIN_THROTTLE '
@@ -1318,7 +1379,8 @@ def main(argv):
                              tracks_per_iter=o.tracks_per_iter, start=start_u,
                              family=o.family, lam_every=o.lam_every,
                              accumulate_g=o.accumulate_g, graded_g=o.graded_g,
-                             c_adapt=o.c_adapt)
+                             c_adapt=o.c_adapt, restart=o.restart, sf_m=o.sf_m,
+                             sf_sigma=o.sf_sigma)
         else:
             spsa(iface, o.iters, o.laps, o.a, o.c, seed=o.seed, out=o.out,
                  max_step=o.max_step, timeout=o.timeout, ref_lap=o.ref_lap,
