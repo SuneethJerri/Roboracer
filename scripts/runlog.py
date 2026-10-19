@@ -9,12 +9,14 @@ Wraps a command instead of changing it, so no experiment script has to know this
     runlog.py verify
 
 Each run gets `runs/<UTC>_<name>/` holding `log.txt`, `meta.json` (argv, commit, dirty
-flag, package versions, a SHA-256 per tracked output) and `patch.diff` when the tree was
-dirty. A notebook entry names the run directory, and the result is citable.
+flag, package versions, a SHA-256 per tracked output), `patch.diff` when tracked files
+differ, and a copy of any untracked script named in the command. A notebook entry names the
+run directory, and the result is citable.
 
 `verify` re-hashes those outputs and, because the objective is deterministic (R1), reports
-any two runs of the same command at the same commit that produced different bytes -- which
-can only be hidden state, as in B7. The RL arm is exempt via `--nondeterministic`; PPO over
+any two runs of the same command on the same CODE -- commit plus patch plus untracked
+drivers, not the commit alone -- that produced different bytes, which can only be hidden
+state, as in B7. The RL arm is exempt via `--nondeterministic`; PPO over
 14 worker processes does not reproduce exactly.
 """
 import argparse
@@ -22,6 +24,7 @@ import hashlib
 import json
 import os
 import platform
+import shutil
 import socket
 import subprocess
 import sys
@@ -31,14 +34,20 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 RUNS = os.path.join(ROOT, 'runs')
 PKGS = ('numpy', 'gymnasium', 'f1tenth_gym', 'torch', 'stable_baselines3', 'scipy')
+# Extensions treated as code when they appear in the wrapped command: enough to catch the
+# untracked scratch drivers, and it keeps the interpreter out of the run directory.
+CODE_EXT = ('.py', '.sh')
 
 
-def _git(*args):
-    try:
-        return subprocess.run(('git',) + args, cwd=ROOT, capture_output=True,
-                              text=True, timeout=30).stdout.strip()
-    except Exception:
-        return ''
+def _git(*args, strip=True):
+    """Raise on failure. Swallowing the error returned '' , which recorded an
+    unattributable run as a CLEAN tree at commit '' -- and `verify` cannot flag that (B25).
+    """
+    p = subprocess.run(('git',) + args, cwd=ROOT, capture_output=True,
+                       text=True, timeout=30)
+    if p.returncode:
+        raise RuntimeError(f'git {" ".join(args)}: {p.stderr.strip()}')
+    return p.stdout.strip() if strip else p.stdout
 
 
 def sha256(path):
@@ -76,7 +85,7 @@ def canonical(argv):
             continue
         if a.startswith('--out='):
             continue
-        keep.append(os.path.basename(a) if os.sep in a else a)
+        keep.append(a)
     return keep
 
 
@@ -86,20 +95,44 @@ def do_run(name, cmd, track, note='', nondeterministic=False):
     d = os.path.join(RUNS, f'{stamp}_{name}')
     os.makedirs(d, exist_ok=True)
 
-    dirty = bool(_git('status', '--porcelain'))
-    if dirty:
-        # A result produced from uncommitted code is uncitable without the patch that
-        # produced it, and every run in this project so far has been from a dirty tree.
+    # A result produced from uncommitted code is uncitable without the patch that
+    # produced it, and every run in this project so far has been from a dirty tree.
+    # Written raw: .strip() took the trailing newline and no recorded patch applied (B25).
+    patch = _git('diff', 'HEAD', strip=False)
+    if patch:
         with open(os.path.join(d, 'patch.diff'), 'w') as fh:
-            fh.write(_git('diff', 'HEAD'))
+            fh.write(patch)
+
+    # Untracked code named on the command line is invisible to `git status` under this
+    # repo's deny-all .gitignore, so runs recorded `dirty: false` while executing scratch
+    # drivers that exist in no commit and no patch (B25). Hash it and keep a copy.
+    inputs = {}
+    for a in cmd:
+        f = a if os.path.isabs(a) else os.path.join(ROOT, a)
+        if not (a.endswith(CODE_EXT) and os.path.isfile(f)):
+            continue
+        rel = os.path.relpath(f, ROOT)
+        if rel.startswith('..') or _git('ls-files', '--', rel):
+            continue
+        inputs[rel] = sha256(f)
+        shutil.copy2(f, os.path.join(d, 'input_' + os.path.basename(f)))
+
+    dirty = bool(_git('status', '--porcelain')) or bool(inputs)
+    # The identity of the code that actually RAN. The commit alone groups every
+    # uncommitted variant together, so `verify` reported a code change as hidden state and
+    # an exact repeat as a dirty-tree problem (B25).
+    h = hashlib.sha256(patch.encode())
+    for rel in sorted(inputs):
+        h.update(f'{rel}={inputs[rel]}'.encode())
+    code = h.hexdigest() if dirty else ''
 
     meta = {
         'name': name, 'note': note, 'argv': cmd, 'canonical': canonical(cmd),
         'cwd': ROOT, 'host': socket.gethostname(), 'started': stamp,
-        'nondeterministic': nondeterministic,
+        'nondeterministic': nondeterministic, 'inputs': inputs,
         'git': {'commit': _git('rev-parse', 'HEAD'),
                 'branch': _git('rev-parse', '--abbrev-ref', 'HEAD'),
-                'dirty': dirty},
+                'dirty': dirty, 'code': code},
         'versions': versions(),
     }
     meta_path = os.path.join(d, 'meta.json')
@@ -107,6 +140,10 @@ def do_run(name, cmd, track, note='', nondeterministic=False):
         json.dump(meta, fh, indent=2, sort_keys=True)
 
     t0 = time.time()
+    # The freshness reference below is read off the FILESYSTEM, not time.time(): file
+    # timestamps come from the kernel's coarse clock, which lagged time.time() by 1.5 ms
+    # here, so a log created after t0 read as older than the run.
+    t_fs = os.path.getmtime(meta_path)
     log_path = os.path.join(d, 'log.txt')
     with open(log_path, 'wb') as log:
         proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE,
@@ -129,10 +166,16 @@ def do_run(name, cmd, track, note='', nondeterministic=False):
     meta['ended'] = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
     outs = []
     for pat in list(track) + [log_path]:
-        p = pat if os.path.isabs(pat) else os.path.join(ROOT, pat)
-        outs.append({'path': os.path.relpath(p, ROOT),
-                     'sha256': sha256(p) if os.path.exists(p) else None,
-                     'bytes': os.path.getsize(p) if os.path.exists(p) else None})
+        f = pat if os.path.isabs(pat) else os.path.join(ROOT, pat)
+        # isfile, not exists: `--track <dir>` raised IsADirectoryError here, AFTER the
+        # command had finished, and the finished run was then recorded as killed (B25).
+        got = os.path.isfile(f)
+        outs.append({'path': os.path.relpath(f, ROOT),
+                     'sha256': sha256(f) if got else None,
+                     'bytes': os.path.getsize(f) if got else None,
+                     # A file this run never wrote is the PREVIOUS run's result, and
+                     # hashing it had `verify` certify it as this one's (B25).
+                     'fresh': got and os.path.getmtime(f) >= t_fs})
     meta['outputs'] = outs
     with open(meta_path, 'w') as fh:
         json.dump(meta, fh, indent=2, sort_keys=True)
@@ -192,6 +235,9 @@ def do_verify():
                 problems.append(f'{m["_dir"]}: {o["path"]} is gone')
             elif sha256(p) != o['sha256']:
                 problems.append(f'{m["_dir"]}: {o["path"]} CHANGED since the run')
+            elif o.get('fresh') is False:
+                problems.append(f'{m["_dir"]}: {o["path"]} is STALE -- it predates the '
+                                f'run, so the recorded hash is an earlier run\'s output')
         if 'exit_code' not in m and alive(m.get('pid')):
             running.append(m['_dir'])
             continue
@@ -210,7 +256,13 @@ def do_verify():
     for m in runs:
         if m.get('nondeterministic') or m.get('exit_code') != 0:
             continue    # in-flight runs have no exit code and are skipped here too
-        key = (tuple(m['canonical']), m['git']['commit'], m['git']['dirty'])
+        # Keyed on the code, not the commit: 134 of 160 runs are dirty, where one commit
+        # covers every variant. Records written before `code` existed get a bucket to
+        # themselves so they never group (B25).
+        code = m['git'].get('code')
+        if code is None:
+            code = f'legacy:{m["_dir"]}' if m['git']['dirty'] else ''
+        key = (tuple(m['canonical']), m['git']['commit'], code)
         groups.setdefault(key, []).append(m)
     for key, ms in groups.items():
         if len(ms) < 2:
@@ -222,14 +274,16 @@ def do_verify():
                     for o in m['outputs'] if not o['path'].endswith('log.txt')}
         first = fingerprint(ms[0])
         for m in ms[1:]:
-            if fingerprint(m) != first:
+            # Only outputs BOTH runs tracked can be compared. `canonical()` deliberately
+            # drops --track from the identity, so two runs of one command may legitimately
+            # track different sets -- and comparing the sets reported an identical re-run
+            # as hidden state, which is the false positive this check exists to avoid.
+            fp = fingerprint(m)
+            shared = set(first) & set(fp)
+            if any(first[k] != fp[k] for k in shared):
                 problems.append(
                     f'DISCREPANCY: {ms[0]["_dir"]} and {m["_dir"]} ran the same command '
                     f'at the same commit and produced different bytes')
-            if key[2]:
-                problems.append(
-                    f'{m["_dir"]}: compared against {ms[0]["_dir"]} from a DIRTY tree, '
-                    f'so "same commit" does not mean same code')
 
     dirty = [m['_dir'] for m in runs if m['git']['dirty']]
     print(f'{len(runs)} runs checked, {len(dirty)} from a dirty tree'
@@ -254,6 +308,14 @@ def selftest():
         assert canonical(['python', 'a.py', '--out', 'x/y.csv', '--seed', '0']) == \
             ['python', 'a.py', '--seed', '0'], 'the output path is not part of identity'
         assert canonical(['p', '--out=z.csv', '--seed', '1']) == ['p', '--seed', '1']
+        assert canonical(['p', 'scratch/c2']) == ['p', 'scratch/c2'], \
+            'a path keeps its directory: two different inputs are not one identity'
+        try:
+            _git('rev-parse', 'definitely-not-a-ref')
+        except Exception:
+            pass
+        else:
+            raise AssertionError('a git failure must raise, not record a clean tree')
 
         cmd = [sys.executable, '-c', f'open({out!r},"w").write("same"); print("hi")']
         assert do_run('a', cmd, [out], note='first') == 0
@@ -261,6 +323,11 @@ def selftest():
         runs = load_all()
         assert len(runs) == 2 and all(r['exit_code'] == 0 for r in runs)
         assert runs[0]['outputs'][0]['sha256'] == runs[1]['outputs'][0]['sha256']
+        assert runs[0]['outputs'][0]['fresh'] is True
+        pf = os.path.join(RUNS, runs[0]['_dir'], 'patch.diff')
+        if os.path.exists(pf):
+            assert open(pf).read().endswith('\n'), \
+                'a patch stripped of its trailing newline cannot be applied'
 
         # A changed output must be caught.
         open(out, 'w').write('tampered')
@@ -320,6 +387,85 @@ def selftest():
         assert main(['run', '--name', 'wrapped', '--',
                      sys.executable, '-c', 'print("ok")', '--selftest']) == 0
         assert load_all()[0]['name'] == 'wrapped'
+
+        # A tracked file the command never wrote is the previous run's result.
+        RUNS = os.path.join(td, 'runs6')
+        stale = os.path.join(td, 'stale.txt')
+        open(stale, 'w').write('written before this run')
+        os.utime(stale, (0, 0))
+        assert do_run('stale', [sys.executable, '-c', 'print("wrote nothing")'],
+                      [stale]) == 0
+        assert load_all()[0]['outputs'][0]['fresh'] is False
+        assert do_verify() == 1, 'a stale tracked output must not be certified'
+
+        # Untracked code named in the command must be hashed, copied and make the run
+        # dirty: `git status` cannot see it under this repo's deny-all .gitignore.
+        RUNS = os.path.join(td, 'runs7')
+        drv = os.path.join(ROOT, 'scratch', '_runlog_selftest_driver.py')
+        try:
+            os.makedirs(os.path.dirname(drv), exist_ok=True)
+            open(drv, 'w').write('print("driver")\n')
+            assert do_run('untracked', [sys.executable, drv], []) == 0
+            m = load_all()[0]
+            assert m['inputs'] == {'scratch/_runlog_selftest_driver.py': sha256(drv)}, \
+                m['inputs']
+            assert m['git']['dirty'] and m['git']['code'], 'untracked code is not clean'
+            assert os.path.exists(os.path.join(RUNS, m['_dir'],
+                                               'input__runlog_selftest_driver.py'))
+        finally:
+            if os.path.exists(drv):
+                os.unlink(drv)
+
+        # Repeats from a dirty tree must COMPARE, and two different uncommitted trees must
+        # not be compared at all. Keying on the commit got both of these backwards.
+        RUNS = os.path.join(td, 'runs8')
+        rep = [sys.executable, '-c', f'open({out!r},"w").write("same")']
+        do_run('rep1', rep, [out])
+        do_run('rep2', rep, [out])
+        assert do_verify() == 0, 'identical repeats from a dirty tree must verify clean'
+        f = os.path.join(RUNS, load_all()[1]['_dir'], 'meta.json')
+        d = json.load(open(f))
+        d['git']['code'] = 'a different uncommitted patch'
+        json.dump(d, open(f, 'w'), indent=2, sort_keys=True)
+        assert do_verify() == 0, 'different uncommitted code is not a determinism failure'
+
+        # Two runs of one command may track different sets of outputs -- `canonical()`
+        # drops --track from the identity on purpose -- and that must not read as a
+        # discrepancy when nothing they BOTH tracked disagrees.
+        RUNS = os.path.join(td, 'runs10')
+        other = os.path.join(td, 'other.txt')
+        same = [sys.executable, '-c',
+                f'open({out!r},"w").write("x"); open({other!r},"w").write("y")']
+        do_run('tracks-both', same, [out, other])
+        do_run('tracks-one', same, [out])
+        assert do_verify() == 0, \
+            'a different --track set is not a determinism failure'
+
+        # ...but a shared output that really differs still is, and that has to be tested
+        # with BOTH records consistent with their own files. Zeroing a recorded hash only
+        # trips the "CHANGED since the run" check, so the discrepancy comparison itself
+        # goes untested -- which is how the first version of this block passed with the
+        # comparison disabled (B29's lesson, on today's own code).
+        RUNS = os.path.join(td, 'runs11')
+        da, db = os.path.join(td, 'a'), os.path.join(td, 'b')
+        os.makedirs(da, exist_ok=True)
+        os.makedirs(db, exist_ok=True)
+        pa, pb = os.path.join(da, 'out.txt'), os.path.join(db, 'out.txt')
+        do_run('left', [sys.executable, '-c', f'open({pa!r},"w").write("one")'], [pa])
+        do_run('right', [sys.executable, '-c', f'open({pb!r},"w").write("two")'], [pb])
+        f = os.path.join(RUNS, load_all()[1]['_dir'], 'meta.json')
+        d = json.load(open(f))
+        d['canonical'] = load_all()[0]['canonical']   # as if the command text were one
+        json.dump(d, open(f, 'w'), indent=2, sort_keys=True)
+        assert sha256(pa) != sha256(pb) and os.path.exists(pa) and os.path.exists(pb)
+        probs = do_verify()
+        assert probs == 1, 'one basename, two contents, both records honest: a discrepancy'
+
+        # The wrapped command keeps its own --, which used to be deleted from every run.
+        RUNS = os.path.join(td, 'runs9')
+        assert main(['run', '--name', 'dashdash', '--', sys.executable, '-c',
+                     'import sys; assert sys.argv[1:] == ["a", "--", "b"], sys.argv',
+                     'a', '--', 'b']) == 0, 'the wrapped command lost its own --'
     print('selftest OK')
 
 
@@ -340,7 +486,7 @@ def main(argv):
     sub.add_parser('verify', help='re-hash outputs and look for discrepancies')
     o = ap.parse_args(argv)
     if o.action == 'run':
-        cmd = [a for a in o.cmd if a != '--']
+        cmd = o.cmd[1:] if o.cmd[:1] == ['--'] else o.cmd
         if not cmd:
             ap.error('give the command after --')
         return do_run(o.name, cmd, o.track, o.note, o.nondeterministic)
