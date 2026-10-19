@@ -631,6 +631,11 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
     lam = float(lam0)
     gacc = []                       # constraint samples since the last dual update (D25)
     cmul = 1.0                      # C4's radius multiplier; stays 1.0 unless c_adapt
+    # Iterations each coordinate spent pinned to a box face (audit F5 / D42). The projection
+    # is silent otherwise: R30's infeasible arm spent 62% of 200 iterations on BUBBLE_R's
+    # floor and nothing in the log said so, which is how an unphysical bound went unnoticed
+    # for a fortnight.
+    face = np.zeros(P, dtype=int)
 
     fields = (['iter', 'a_n', 'b_n', 'c_n', 'lam'] + [n for n, _, _ in GAINS]
               + ['L_plus', 'L_minus', 'J_plus', 'J_minus', 'G_plus', 'G_minus',
@@ -695,6 +700,7 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
                     cmul = min(C_MULT_HI, cmul * (1.0 + c_adapt))
                 elif not (mp.feasible and mm.feasible):
                     cmul = max(C_MULT_LO, cmul / (1.0 + c_adapt))
+            face += (u <= 1e-12) | (u >= 1.0 - 1e-12)
             Ghat = 0.5 * (Gp + Gm)
             gacc.append(Ghat)
             g_in = ''                   # what the dual was handed, blank on a non-tick
@@ -727,6 +733,15 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
     print(f'\nfinal lambda {lam:.4f};  gains: ' +
           '  '.join(f'--{nm.lower().replace("_", "-")} {v:.3f}'
                     for (nm, _, _), v in zip(GAINS, to_real(u))))
+    # D42 (A): say which bounds the search leaned on, and flag the one coordinate whose
+    # overshoot is measured to cost out-of-sample feasibility (R62).
+    pinned = [(nm, c) for (nm, _, _), c in zip(GAINS, face) if c]
+    if pinned:
+        print('box faces touched: ' + ', '.join(f'{nm} {c}/{iters}' for nm, c in pinned))
+    real = dict(zip([nm for nm, _, _ in GAINS], to_real(u)))
+    if real.get('GAP_THRESH', 0) > 1.80:
+        print(f'NOTE GAP_THRESH {real["GAP_THRESH"]:.3f} > 1.80, which R62 measured as '
+              f'predicting out-of-sample failure; D42 caps it at SELECTION, not here')
     print(f'{iters} iterations -> {out}')
     return to_real(u), lam
 
@@ -1125,6 +1140,26 @@ def selftest():
             assert ticks == 2, f'10 iterations at lam_every=5 must tick twice, not {ticks}'
             assert differs, 'the block mean never differed from the tick sample, so this ' \
                             'case cannot tell accumulation from sampling'
+
+            # D42 (A): the box-face report must actually fire. Started AT the floor, so
+            # every coordinate is pinned on the first iteration whatever the bowl pulls
+            # toward, and the GAP_THRESH note must fire when it ends above 1.80.
+            import contextlib
+            import io
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                spsa_constrained(CircuitPool(lambda t: _Bowl(t)), iters=4, seed=0,
+                                 timeout=1e9, start=np.zeros(P),
+                                 out=os.path.join(td, 'face.csv'))
+            assert 'box faces touched' in buf.getvalue(), \
+                f'a run started on the floor must report it:\n{buf.getvalue()}'
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                spsa_constrained(CircuitPool(lambda t: _Bowl(t)), iters=2, seed=0,
+                                 timeout=1e9, start=np.ones(P),
+                                 out=os.path.join(td, 'gap.csv'))
+            assert 'NOTE GAP_THRESH' in buf.getvalue(), \
+                f'GAP_THRESH above 1.80 must be flagged (R62):\n{buf.getvalue()}'
 
             # C4 (D29): the radius must react to the two things a fixed c gets wrong,
             # and in opposite directions. Read off the recorded c_n, which IS the
