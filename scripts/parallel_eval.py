@@ -59,13 +59,21 @@ def evaluate(us, map_name='Spielberg', workers=None, laps=1, timeout=300.0,
             np.array([r[3] for r in rows]))
 
 
+def stratified(n, rng):
+    """n points in the unit box, stratified per dimension.
+
+    Plain uniform leaves clumps and holes at this sample size. A function rather than
+    three lines inside `search()` so the selftest drives THIS code: it asserted the
+    properties of a hand-copy, so editing the real sampler was untested (B29).
+    """
+    return np.stack([rng.permutation((np.arange(n) + rng.random(n)) / n)
+                     for _ in range(S.P)], axis=1)
+
+
 def search(n=400, map_name='Spielberg', workers=None, laps=1, timeout=300.0,
            seed=0, out=None, ref_lap=None, normalize=False):
     """Latin-hypercube-ish random search over the gain box, scored in parallel."""
-    rng = np.random.default_rng(seed)
-    # Stratified per dimension: plain uniform leaves clumps and holes at this sample size.
-    us = np.stack([rng.permutation((np.arange(n) + rng.random(n)) / n)
-                   for _ in range(S.P)], axis=1)
+    us = stratified(n, np.random.default_rng(seed))
 
     t0 = time.time()
     scores, ok, cols, prog = evaluate(us, map_name, workers, laps, timeout, ref_lap, normalize)
@@ -101,9 +109,7 @@ def search(n=400, map_name='Spielberg', workers=None, laps=1, timeout=300.0,
 
 
 def selftest():
-    rng = np.random.default_rng(0)
-    us = np.stack([rng.permutation((np.arange(50) + rng.random(50)) / 50)
-                   for _ in range(S.P)], axis=1)
+    us = stratified(50, np.random.default_rng(0))
     assert us.shape == (50, S.P)
     assert us.min() >= 0.0 and us.max() <= 1.0, 'samples must stay inside the unit box'
     # Stratification: every dimension covers each decile exactly once in 50 samples.
@@ -111,6 +117,54 @@ def selftest():
         counts = np.histogram(us[:, d], bins=10, range=(0, 1))[0]
         assert counts.min() >= 4, f'dim {d} poorly stratified: {counts}'
     assert np.allclose(S.to_unit(S.to_real(us[0])), us[0])
+    # Per-dimension stratification is not enough on its own: without the permutation
+    # every dimension takes the same ordering and the sample collapses onto the box
+    # diagonal while still passing the decile check above.
+    assert abs(np.corrcoef(us.T)[0, 1]) < 0.5, 'dimensions must be ordered independently'
+
+    # Each config's result must come back against THAT config. Every caller indexes by
+    # row, so a reordered gather would be invisible to all of them (B29). Driven on a
+    # stub by replacing the pool initialiser, which the workers inherit under fork.
+    global _init
+    real_init = _init
+
+    class _Stub:
+        def __init__(self, track):
+            self.map_name = track
+            self.laps = self.collisions = 0
+            self._t = 0.0
+            self.angle_min, self.angle_increment = -2.35, 0.00435
+            self.scan = np.full(1080, 5.0)
+
+        def reset(self):
+            self.laps, self._t = 0, 0.0
+
+        def now(self):
+            return self._t
+
+        def wait_for_scan(self, timeout=None):
+            # Lap time rises with FOV, so the scores must come back strictly increasing
+            # in the order the configs were passed in.
+            self._t += 10.0 * S.ftg.FOV
+            self.laps += 1
+            return True
+
+        def send(self, *a):
+            pass
+
+    saved = [getattr(S.ftg, nm) for nm, _, _ in S.GAINS]
+    try:
+        _init = lambda mn: globals().__setitem__('_IFACE', _Stub(mn))   # noqa: E731
+        probe = np.stack([np.full(S.P, 0.5)] * 4)
+        probe[:, 0] = (0.1, 0.4, 0.7, 0.9)                              # FOV, ascending
+        sc, ok, _, _ = evaluate(probe, map_name='IMS', workers=1, laps=1, timeout=1e9)
+        assert ok.all(), (sc, ok)
+        assert list(sc) == sorted(sc), f'evaluate() reordered its results: {sc}'
+        assert len(set(sc)) == 4, f'the probe must give four distinct scores: {sc}'
+    finally:
+        _init = real_init
+        for (nm, _, _), v in zip(S.GAINS, saved):
+            setattr(S.ftg, nm, v)
     print('selftest OK')
 
 

@@ -33,13 +33,70 @@ PENALTY = 5.0           # seconds charged per collision (the fixed Lagrange mult
 # name, lower, upper -- SPSA runs in normalised [0,1] coordinates so that one `c`
 # is meaningful across gains of very different magnitude. Spall calls this matrix
 # scaling; normalising the box is the cheap version of it.
-GAINS = [('FOV',          0.60, 2.00),
-         ('BUBBLE_R',     0.15, 0.80),
-         ('GAP_THRESH',   0.50, 3.00),
-         ('MAX_THROTTLE', 0.10, 0.80),
-         ('MAX_STEER',    0.25, 0.80),
-         ('CLEARANCE',    0.5,  6.00)]
+GAINS_ALL = [('FOV',          0.60, 2.00),
+             ('BUBBLE_R',     0.15, 0.80),
+             ('GAP_THRESH',   0.50, 3.00),
+             ('MAX_THROTTLE', 0.10, 0.80),
+             ('MAX_STEER',    0.25, 0.80),
+             ('CLEARANCE',    0.5,  6.00),
+             # --- C6 (D28): the dimension knob. Every box below is centred on the
+             # value at which that gain is a no-op, so the midpoint of the p = 24 box
+             # is the same controller as the midpoint of the p = 6 box -- the frozen
+             # baseline. Raising p adds coordinates without moving the start point,
+             # which is what makes the arms comparable across p.
+             ('GAP_S1', 0.50, 1.50), ('GAP_S2', 0.50, 1.50), ('GAP_S3', 0.50, 1.50),
+             ('GAP_S4', 0.50, 1.50), ('GAP_S5', 0.50, 1.50), ('GAP_S6', 0.50, 1.50),
+             ('RNG_S1', 0.70, 1.30), ('RNG_S2', 0.70, 1.30), ('RNG_S3', 0.70, 1.30),
+             ('RNG_S4', 0.70, 1.30), ('RNG_S5', 0.70, 1.30), ('RNG_S6', 0.70, 1.30),
+             ('THR_B1', 0.50, 1.50), ('THR_B2', 0.50, 1.50),
+             ('THR_B3', 0.50, 1.50), ('THR_B4', 0.50, 1.50),
+             ('STEER_EXP', 1.00, 3.00), ('CLR_EXP', 0.50, 1.50),
+             # --- O15/D31. Appended, never inserted: GAINS_ALL[:6], [:12] and [:24] are
+             # the dimensions O10 measured and must keep meaning the same thing.
+             # MIN_THROTTLE was always a fixed constant, and R50's mechanism probe is why
+             # it is here: the residual's whole gain is a throttle offset, and the six-gain
+             # box has no term that can raise the floor. The box is centred on the shipped
+             # 0.05 so the midpoint stays the frozen baseline; its lower half is inert by
+             # construction (a floor at or below 0 never binds), which is the price of
+             # keeping that invariant.
+             ('MIN_THROTTLE', -0.15, 0.25),
+             # O16: the additive offset R50's residual actually used. Centred on 0.0, so
+             # the midpoint is still the frozen baseline, and reaching the top of the box
+             # is exactly the residual's measured +0.2.
+             ('THR_OFFSET', -0.20, 0.20)]
+GAINS = GAINS_ALL[:6]       # the six gains every run before C6 used, in that order
 P = len(GAINS)
+DIMS = (6, 12, 24)          # p = 6 FTG's own gains; +6 sector thresholds; +12 more
+# GAINS_ALL beyond 24 is reachable only by name, through set_gains / --gains.
+
+
+def set_gains(names):
+    """Make exactly `names` the active gain vector, in that order.
+
+    Everything downstream reads `GAINS` and `P` at call time, so this is the whole
+    dimension knob. Gains NOT selected are reset to their neutral values, so a change
+    cannot leave a previous run's gains behind in the module -- the same class of hidden
+    shared state as B7.
+    """
+    global GAINS, P
+    table = {nm: (nm, lo, hi) for nm, lo, hi in GAINS_ALL}
+    unknown = [nm for nm in names if nm not in table]
+    if unknown:
+        raise ValueError(f'unknown gains {unknown}; have {sorted(table)}')
+    if len(set(names)) != len(names):
+        raise ValueError(f'repeated gain in {names}')
+    GAINS, P = [table[nm] for nm in names], len(names)
+    for nm, lo, hi in GAINS_ALL:
+        if nm not in set(names):
+            setattr(ftg, nm, 0.5 * (lo + hi))
+    return P
+
+
+def set_dim(p):
+    """The first `p` gains (C6). `p` = 6, 12, 24 are the dimensions O10 measured."""
+    if not 6 <= p <= len(GAINS_ALL):
+        raise ValueError(f'dim must be in [6, {len(GAINS_ALL)}], got {p}')
+    return set_gains([nm for nm, _, _ in GAINS_ALL[:p]])
 
 
 # --------------------------------------------------------------------------- pure logic
@@ -363,8 +420,7 @@ def spsa(iface, iters=40, laps=1, a=0.01, c=0.08, A_stab=None, seed=0, out=None,
     # points -- 8/17 feasible against 22/22 -- so a comparison across the two loops must
     # pass --start on both arms (B10). Printed unconditionally: nothing in a log used to
     # say where a run began, which is why that went unnoticed for nine days.
-    u = to_unit([ftg.FOV, ftg.BUBBLE_R, ftg.GAP_THRESH, ftg.MAX_THROTTLE,
-                 ftg.MAX_STEER, ftg.CLEARANCE])
+    u = to_unit([getattr(ftg, nm) for nm, _, _ in GAINS])
     print('start (unit):', np.round(u, 4), '= Follow-the-Gap module defaults'
           if np.any(np.abs(u - 0.5) > 1e-9) else '= box midpoint', flush=True)
     # `channel` is constant within a file, and that is exactly why it is written: two CSV
@@ -452,34 +508,42 @@ DELTA = 0.15    # a rollout stopping more than this fraction short counts as a f
                 # (R11) on steps of 0.023*b. Normalising by DELTA makes a real failure
                 # worth ~0.76 instead of 0.11 and keeps the channel graded, so the SPSA
                 # difference still carries magnitude.
-B_GAIN = 5.0    # lambda's step gain, sized to the HORIZON rather than taken from a
-                # table. Over 40 iterations the dual gets 40 // LAM_EVERY = 8 updates and
-                # sum_j b/j^0.85 = 3.14 b, so with a typical violation of ~0.3 lambda can
-                # travel ~0.94 b. R11 says it must be able to reach ~0.5 at k=5 and ~8 at
-                # k=17, which puts b at a few units, not the small constant a textbook
-                # asymptotic schedule would suggest. A gain that cannot cross the range
-                # it needs in the iterations available is not a slow schedule, it is a
-                # fixed penalty with extra steps.
-LAM_EVERY = 5   # theta steps per lambda step. THE timescale separation is structural, not
-                # asymptotic: b_n/a_n ~ n^(ALPHA-BETA) = n^-0.248 is still 0.51 at n=10000
-                # and about 2 at n=40, i.e. over any horizon we actually run, a step-size
-                # ratio puts lambda on the FASTER timescale -- the opposite of the intent.
-                # Subsampling the dual gives honest separation at 40 iterations.
+B_GAIN = 5.0    # lambda's step gain, sized to the HORIZON (R11, D11) rather than taken
+                # from a table: over 40 iterations the dual gets 8 updates totalling
+                # sum_j j^-0.85 = 3.090 b, and it has to be able to reach ~0.5 at k=5 and
+                # ~8 at k=17. See R43 for what that gain actually did.
+# C4 (D29): bounds on the feasibility-aware radius multiplier. BOUNDED on purpose --
+# c_n = m_n * c / n^GAMMA still goes to zero for any m_n in a fixed interval, so the
+# adapted radius keeps the schedule Robbins-Monro, which an unbounded rule would not.
+C_MULT_LO, C_MULT_HI = 0.125, 8.0
+LAM_EVERY = 5   # theta steps per lambda step. b_n/a_n -> 0 like n^-0.248, which is the
+                # Borkar condition, but its VALUE is 215 at n=40, so no horizon we run has
+                # lambda slower by step size alone. Subsampling buys theta K steps under a
+                # frozen lambda -- a finite-n property, not a timescale (D11 erratum).
 
 
-def violation(rollouts, delta=DELTA):
+def violation(rollouts, delta=DELTA, graded=False):
     """Mean constraint violation over a draw: 0 if every circuit finished, up to 1.
 
-    Graded, and normalised per circuit BEFORE averaging -- the cap has to apply to each
-    rollout, or one catastrophic circuit would be charged the same as one near-miss.
+    Normalised per circuit BEFORE averaging -- the cap has to apply to each rollout, or one
+    catastrophic circuit would be charged the same as one near-miss.
+
+    `graded` (D27) charges the raw shortfall instead, so the same endpoints hold -- a
+    completed lap is 0, a total failure is 1 -- and only the interior changes. It makes
+    `alpha` mean "2% mean shortfall" rather than "0.3%", which is the substance of the
+    change. It does NOT change how often the dual can act: 74% of iterations have both
+    probes completing, and grading leaves zero at zero (the premise check in D27).
     """
+    if graded:
+        return float(np.mean([min(1.0, r.shortfall) for r in rollouts]))
     return float(np.mean([min(1.0, r.shortfall / delta) for r in rollouts]))
 
 
 def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=None,
                      seed=0, out=None, max_step=0.10, timeout=250.0, alpha=0.02,
                      lam0=1.0, tracks_per_iter=2, start=None, lam_every=LAM_EVERY,
-                     delta=DELTA, family='bernoulli'):
+                     delta=DELTA, family='bernoulli', accumulate_g=False,
+                     graded_g=False, c_adapt=0.0):
     """Primal-dual SPSA on a constrained racing problem (notebook C3).
 
         minimise   J(theta)  = E_M[ implied_lap(theta, M) / baseline(M) ]
@@ -515,6 +579,18 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
     O(c_n^2) approximation of G(theta), the same order as SPSA's own bias, so it costs
     nothing in accuracy and keeps the iteration at two measurements.
 
+    `c_adapt` > 0 turns on C4's feasibility-aware radius (D29). The radius is multiplied
+    by `(1+c_adapt)` whenever the two Lagrangians come out EQUAL -- B19's zero-gradient
+    certificate, which is checked FIRST because the plateau is inside the infeasible
+    region (B30) -- and by `1/(1+c_adapt)` when they differ but a probe failed to
+    complete its draw. Those are the two ways a fixed `c` is wrong here and
+    they pull in opposite directions: R42 measured the variance jumping 33x once probes
+    straddle the feasibility cliff, and B19 measured a quarter of the box returning no
+    gradient at all at c = 0.08. The signal that separates them is `Meas.feasible`, which
+    costs nothing because D9 already reports it rather than inferring it from the score.
+    The multiplier is bounded (C_MULT_LO/HI) and no new column is written: the adapted
+    radius IS `c_n` in the CSV, so a fixed-c run stays byte-comparable with the archive.
+
     ponytail: one constraint. Collisions are the obvious second (and `Rollout.collisions`
     is already carried for it), but D7's warning about interacting schedules is real --
     every extra multiplier is another timescale to separate. Add it when the completion
@@ -535,41 +611,69 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
     print('start (unit):', np.round(u, 4),
           '= box midpoint' if start is None else '= --start', flush=True)   # B10
     lam = float(lam0)
+    gacc = []                       # constraint samples since the last dual update (D25)
+    cmul = 1.0                      # C4's radius multiplier; stays 1.0 unless c_adapt
 
     fields = (['iter', 'a_n', 'b_n', 'c_n', 'lam'] + [n for n, _, _ in GAINS]
               + ['L_plus', 'L_minus', 'J_plus', 'J_minus', 'G_plus', 'G_minus',
-                 'G_hat', 'feas_plus', 'feas_minus', 'circuits', 'family'])
+                 'G_hat', 'G_dual', 'feas_plus', 'feas_minus', 'circuits', 'family'])
     with open(out, 'w', newline='') as fh:
         w = csv.DictWriter(fh, fieldnames=fields)
         w.writeheader()
         for n in range(iters):
             an = a / (n + 1 + A_stab) ** ALPHA
-            cn = c / (n + 1) ** GAMMA
+            cn = cmul * c / (n + 1) ** GAMMA
             d = pert(n, rng)
             tracks = circuits.sample(tracks_per_iter, trng)      # CRN, both arms (D4)
             mp = measure(pool, u + cn * d, tracks, laps, timeout)
             mm = measure(pool, u - cn * d, tracks, laps, timeout)
 
-            Gp, Gm = violation(mp.rollouts, delta), violation(mm.rollouts, delta)
+            Gp, Gm = (violation(mp.rollouts, delta, graded_g),
+                      violation(mm.rollouts, delta, graded_g))
             Lp = mp.cost + lam * (Gp - alpha)
             Lm = mm.cost + lam * (Gm - alpha)
-            # No both-failed special case. The unconstrained loop needs one because its
-            # failure scalar saturates at 2*ref and the difference becomes exactly zero;
-            # implied_lap keeps varying with how far each arm got, so the gradient stays
-            # informative outside the feasible region and there is nothing to escape.
+            # No both-failed special case, and that reasoning was WRONG -- kept here with
+            # its refutation because it is load-bearing. The claim was that implied_lap
+            # keeps varying with how far each arm got, so the gradient stays informative
+            # outside the feasible region. It does not: PROG_FLOOR and COST_CAP flatten it,
+            # and B19 measured theta frozen for 147 iterations with L+ == L- every time.
+            # The unconstrained loop's random restart would have escaped it. C4's adaptive
+            # radius is the response (R49); a restart branch here is the cheaper rival and
+            # has not been measured.
             u = np.clip(u - np.clip(an * grad(Lp - Lm, cn, d, is_sf),
                                     -max_step, max_step), 0.0, 1.0)
+            if c_adapt:                                          # C4 (D29)
+                # DEADNESS IS TESTED FIRST, and the order is the whole content of B30.
+                # The plateau is a SUBSET of the infeasible region -- `J` pinned at
+                # COST_CAP is what "both probes failed" looks like -- so feasibility
+                # cannot tell "no gradient at this radius" from "straddling the cliff".
+                # With the branches the other way round the shrink shadowed the grow
+                # entirely and the radius went to its floor in exactly the regime the
+                # rule was written for. Feasibility only decides when the probes DIFFER.
+                if Lp == Lm:
+                    cmul = min(C_MULT_HI, cmul * (1.0 + c_adapt))
+                elif not (mp.feasible and mm.feasible):
+                    cmul = max(C_MULT_LO, cmul / (1.0 + c_adapt))
             Ghat = 0.5 * (Gp + Gm)
+            gacc.append(Ghat)
+            g_in = ''                   # what the dual was handed, blank on a non-tick
             if n % lam_every == lam_every - 1:                   # the slow timescale
                 j = n // lam_every + 1
                 bn = b / j ** BETA
-                lam = max(0.0, lam + bn * (Ghat - alpha))        # projection onto [0, inf)
+                # The dual sees either the tick's own sample or the mean over the block it
+                # waited through. Tick-sampling makes `lam_every` set how BLIND the dual is
+                # as well as how slow, which confounded R31 (R43); accumulating is the fast
+                # averaging recursion D19 names. Default off so recorded runs reproduce.
+                g_in = float(np.mean(gacc)) if accumulate_g else Ghat
+                lam = max(0.0, lam + bn * (g_in - alpha))        # projection onto [0, inf)
+                gacc.clear()
             else:
                 bn = 0.0
 
             row = {'iter': n, 'a_n': an, 'b_n': bn, 'c_n': cn, 'lam': lam,
                    'L_plus': Lp, 'L_minus': Lm, 'J_plus': mp.cost, 'J_minus': mm.cost,
-                   'G_plus': Gp, 'G_minus': Gm, 'G_hat': Ghat, 'family': family,
+                   'G_plus': Gp, 'G_minus': Gm, 'G_hat': Ghat, 'G_dual': g_in,
+                   'family': family,
                    'feas_plus': int(mp.feasible), 'feas_minus': int(mm.feasible),
                    'circuits': ';'.join(tracks)}
             row.update({nm: v for (nm, _, _), v in zip(GAINS, to_real(u))})
@@ -596,6 +700,50 @@ def selftest():
     mid = to_real([0.5] * P)
     assert np.isclose(mid[0], 1.30) and np.isclose(mid[3], 0.45)
     assert len(GAINS) == P == 6
+    # C6 (D28). The six original gains must stay first and unchanged, or no recorded run
+    # reproduces; and every ADDED gain's box must be centred on the value at which it is
+    # a no-op, which is what makes the p=24 midpoint the same controller as the p=6 one.
+    assert GAINS == GAINS_ALL[:6] and len(GAINS_ALL) == 26
+    for nm, lo, hi in GAINS_ALL[6:]:
+        assert 0.5 * (lo + hi) == getattr(ftg, nm), \
+            f'{nm}: box centre {0.5*(lo+hi)} is not the neutral value {getattr(ftg, nm)}'
+    try:
+        set_dim(24)
+        assert P == 24 and len(GAINS) == 24
+        assert np.allclose(to_real([0.5] * 24)[6:],
+                           [getattr(ftg, nm) for nm, _, _ in GAINS_ALL[6:24]])
+        rt24 = np.linspace(0.05, 0.95, 24)
+        assert np.allclose(to_unit(to_real(rt24)), rt24)
+        # An abandoned coordinate must not survive a dimension change (B7's class of bug).
+        apply_gains(to_real(np.full(24, 0.9)))
+        set_dim(6)
+        assert P == 6 and all(getattr(ftg, nm) == 0.5 * (lo + hi)
+                              for nm, lo, hi in GAINS_ALL[6:]), \
+            'set_dim left a previous run\'s gains in the inactive coordinates'
+        for bad in (5, len(GAINS_ALL) + 1):
+            try:
+                set_dim(bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'set_dim({bad}) must raise')
+        # O15: selection BY NAME, which is the only way to reach MIN_THROTTLE. The six
+        # original gains plus it, and the unselected ones back at neutral.
+        set_gains(['FOV', 'BUBBLE_R', 'GAP_THRESH', 'MAX_THROTTLE', 'MAX_STEER',
+                   'CLEARANCE', 'MIN_THROTTLE'])
+        assert P == 7 and GAINS[-1][0] == 'MIN_THROTTLE'
+        assert np.isclose(to_real([0.5] * 7)[-1], 0.05), \
+            'the MIN_THROTTLE box must be centred on the shipped 0.05'
+        assert ftg.GAP_S1 == 1.0 and ftg.STEER_EXP == 2.0, 'unselected must be neutral'
+        for bad in (['FOV', 'FOV'], ['NOPE']):
+            try:
+                set_gains(bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'set_gains({bad}) must raise')
+    finally:
+        set_dim(6)
     rt = [0.2, 0.4, 0.6, 0.8, 1.0, 0.3]
     assert np.allclose(to_unit(to_real(rt)), rt), 'round trip must be exact'
     assert np.allclose(to_real([-1, 2, .5, .5, .5, .5])[:2], [0.60, 0.80]), 'must clip'
@@ -840,6 +988,204 @@ def selftest():
     else:
         raise AssertionError('an unknown family must raise, not fall back to bernoulli')
 
+    # ---- The loops themselves, not just arithmetic about their constants (B29).
+    # Until this block the selftest never executed spsa() or spsa_constrained(), so 13 of
+    # 14 number-changing mutations survived it (audit quality F10). A bowl in the gains,
+    # read back through the ftg module the optimiser writes to, is enough to catch a sign
+    # flip, an unpaired probe, a dropped projection or a swapped probe.
+    import tempfile
+
+    class _Bowl(_Stub):
+        """Lap time is a bowl with its minimum at unit 0.3, read back through `ftg`."""
+
+        def __init__(self, track, prog=None, floor=0.0, wall=2.0):
+            super().__init__(track)
+            self._prog, self._floor, self._wall = prog, floor, wall
+            if prog is not None:
+                self.progress = lambda: self._prog
+            self.min_plausible_lap = lambda: self._floor
+
+        def wait_for_scan(self, timeout=None):
+            cur = to_unit([getattr(ftg, nm) for nm, _, _ in GAINS])
+            self._lap = circuits.baseline(self.map_name) * (1 + np.sum((cur - 0.3) ** 2))
+            if cur[0] > self._wall:            # a FOV past the wall never finishes
+                self._t += 1e3
+                return True
+            return super().wait_for_scan(timeout)
+
+    saved = [getattr(ftg, nm) for nm, _, _ in GAINS]
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            drawn = []
+            bp = CircuitPool(lambda t: _Bowl(t))
+            inner = bp.get
+            bp.get = lambda t: (drawn.append(t), inner(t))[1]
+            spsa(None, iters=30, a=0.05, c=0.05, seed=0, pool=bp, tracks_per_iter=2,
+                 timeout=1e9, normalize=True, out=os.path.join(td, 'u.csv'))
+            assert drawn[:2] == drawn[2:4], \
+                f'CRN (D4): both probes must see the same draw, got {drawn[:4]}'
+            rows = list(csv.DictReader(open(os.path.join(td, 'u.csv'))))
+            fin = to_unit([float(rows[-1][nm]) for nm, _, _ in GAINS])
+            assert np.linalg.norm(fin - 0.3) < np.linalg.norm(np.full(P, 0.5 - 0.3)), \
+                f'unconstrained SPSA must DESCEND a bowl: ended {fin.round(3)}'
+
+            spsa_constrained(CircuitPool(lambda t: _Bowl(t)), iters=30, a=0.05, c=0.05,
+                             seed=0, timeout=1e9, lam0=0.05,
+                             out=os.path.join(td, 'c.csv'))
+            rows = list(csv.DictReader(open(os.path.join(td, 'c.csv'))))
+            fin = to_unit([float(rows[-1][nm]) for nm, _, _ in GAINS])
+            assert np.linalg.norm(fin - 0.3) < np.linalg.norm(np.full(P, 0.5 - 0.3)), \
+                f'constrained SPSA must descend a feasible bowl: ended {fin.round(3)}'
+            assert all(float(r['lam']) >= 0.0 for r in rows), 'dual projected onto [0, inf)'
+            assert float(rows[-1]['lam']) == 0.0, \
+                'an always-feasible run with alpha > 0 must drive lambda to 0'
+
+            # C6: the same loop must run and descend at p = 24, where 18 of the 24
+            # coordinates are the neutral extra structure. Catches a length mismatch
+            # between the perturbation, the row and the gain vector.
+            set_dim(24)
+            try:
+                spsa_constrained(CircuitPool(lambda t: _Bowl(t)), iters=30, a=0.05,
+                                 c=0.05, seed=0, timeout=1e9, lam0=0.05,
+                                 out=os.path.join(td, 'c24.csv'))
+                r24 = list(csv.DictReader(open(os.path.join(td, 'c24.csv'))))
+                assert all(nm in r24[-1] for nm, _, _ in GAINS), \
+                    'the row must carry every active gain'
+                f24 = to_unit([float(r24[-1][nm]) for nm, _, _ in GAINS])
+                assert np.linalg.norm(f24 - 0.3) < np.linalg.norm(np.full(24, 0.2)), \
+                    f'SPSA must descend the bowl at p=24 too: ended {f24.round(3)}'
+            finally:
+                set_dim(6)
+
+            # The Lagrangian bookkeeping, on a run where the two probes' violations differ.
+            spsa_constrained(CircuitPool(lambda t: _Bowl(t, wall=0.5)), iters=10, seed=0,
+                             timeout=250.0, out=os.path.join(td, 'c2.csv'))
+            rows2 = list(csv.DictReader(open(os.path.join(td, 'c2.csv'))))
+            assert any(r['G_plus'] != r['G_minus'] for r in rows2), \
+                'this case must actually exercise the constraint channel'
+
+            # D25: with --accumulate-g the dual must be handed the MEAN over the block it
+            # waited through, not the tick's own sample. Measured off the recorded rows
+            # rather than asserted, and it must differ from the tick value somewhere or
+            # the flag is doing nothing.
+            spsa_constrained(CircuitPool(lambda t: _Bowl(t, wall=0.5)), iters=10, seed=0,
+                             timeout=250.0, lam_every=5, accumulate_g=True,
+                             out=os.path.join(td, 'c3.csv'))
+            rows3 = list(csv.DictReader(open(os.path.join(td, 'c3.csv'))))
+            ticks, differs = 0, 0
+            for i, r in enumerate(rows3):
+                if r['G_dual'] == '':
+                    continue
+                ticks += 1
+                blk = [float(x['G_hat']) for x in rows3[i - 4:i + 1]]
+                assert np.isclose(float(r['G_dual']), np.mean(blk)), \
+                    f'row {i}: dual got {r["G_dual"]}, block mean is {np.mean(blk)}'
+                differs += not np.isclose(float(r['G_dual']), float(r['G_hat']))
+            assert ticks == 2, f'10 iterations at lam_every=5 must tick twice, not {ticks}'
+            assert differs, 'the block mean never differed from the tick sample, so this ' \
+                            'case cannot tell accumulation from sampling'
+
+            # C4 (D29): the radius must react to the two things a fixed c gets wrong,
+            # and in opposite directions. Read off the recorded c_n, which IS the
+            # adapted radius -- there is no second column to drift out of step.
+            def c_mults(path):
+                rr = list(csv.DictReader(open(path)))
+                return [float(r['c_n']) * (i + 1) ** GAMMA / 0.08
+                        for i, r in enumerate(rr)]
+
+            # B30 regression, and the case the rule exists for: both probes INFEASIBLE
+            # and identical, which is what B19's plateau is. The radius must GROW -- with
+            # the branches ordered the other way it shrank to its floor here, and six
+            # plateau cells measured theta frozen at 0.0000 displacement.
+            spsa_constrained(CircuitPool(lambda t: _Bowl(t, prog=0.1, wall=-1.0)),
+                             iters=8, seed=0, timeout=250.0, c_adapt=0.5,
+                             out=os.path.join(td, 'c4_plateau.csv'))
+            pr = list(csv.DictReader(open(os.path.join(td, 'c4_plateau.csv'))))
+            assert all(float(r['L_plus']) == float(r['L_minus']) for r in pr), \
+                'this case must be a plateau: both Lagrangians identical'
+            assert all(not int(r['feas_plus']) and not int(r['feas_minus']) for r in pr), \
+                '...and both probes must be INFEASIBLE, which is what makes it B30'
+            mp_ = [float(r['c_n']) * (i + 1) ** GAMMA / 0.08 for i, r in enumerate(pr)]
+            assert mp_[-1] > 4.0, \
+                f'a dead probe must grow the radius even when both arms failed: {mp_}'
+
+            # A flat objective returns L+ == L- every iteration: B19's certificate, and
+            # the case where the radius should REACH FURTHER.
+            spsa_constrained(CircuitPool(lambda t: _Stub(t)), iters=12, seed=0,
+                             timeout=1e9, c_adapt=0.5,
+                             out=os.path.join(td, 'c4_dead.csv'))
+            mm_ = c_mults(os.path.join(td, 'c4_dead.csv'))
+            assert mm_[0] == 1.0 and mm_[-1] > 4.0, f'dead probes must grow c: {mm_}'
+            assert max(mm_) <= C_MULT_HI + 1e-9, 'the multiplier must stay bounded'
+            # An infeasible probe should PULL BACK instead.
+            spsa_constrained(CircuitPool(lambda t: _Bowl(t, wall=0.5)), iters=12, seed=0,
+                             timeout=250.0, c_adapt=0.5,
+                             out=os.path.join(td, 'c4_infeas.csv'))
+            mi = c_mults(os.path.join(td, 'c4_infeas.csv'))
+            assert mi[-1] < 1.0, f'a failed probe must shrink c: {mi}'
+            assert min(mi) >= C_MULT_LO - 1e-9, 'the multiplier must stay bounded'
+            # ...and with the flag off, nothing moves: the schedule is exactly c/n^GAMMA,
+            # which is what keeps every archived run byte-reproducible.
+            spsa_constrained(CircuitPool(lambda t: _Bowl(t, wall=0.5)), iters=6, seed=0,
+                             timeout=250.0, out=os.path.join(td, 'c4_off.csv'))
+            assert c_mults(os.path.join(td, 'c4_off.csv')) == [1.0] * 6
+
+            # D27: --graded-g must reach the loop, not just the helper. A probe that times
+            # out with progress 0.9 has shortfall 0.1, so the two objectives must differ by
+            # exactly DELTA on iteration 0, where both runs still share an iterate.
+            for tag, gr in (('clip', False), ('grad', True)):
+                spsa_constrained(CircuitPool(lambda t: _Bowl(t, prog=0.9, wall=0.5)),
+                                 iters=2, seed=0, timeout=250.0, graded_g=gr,
+                                 out=os.path.join(td, f'g_{tag}.csv'))
+            c0 = list(csv.DictReader(open(os.path.join(td, 'g_clip.csv'))))[0]
+            g0 = list(csv.DictReader(open(os.path.join(td, 'g_grad.csv'))))[0]
+            pair = [(float(c0[k]), float(g0[k])) for k in ('G_plus', 'G_minus')]
+            assert any(c > 0 for c, _ in pair), f'this case must produce a shortfall: {pair}'
+            for c, g in pair:
+                assert np.isclose(g, c * DELTA), \
+                    f'graded G must be DELTA times the clipped one on iter 0: {c} -> {g}'
+            assert any(c != g for c, g in pair), \
+                'the flag never reached spsa_constrained: the two objectives agree'
+            lam_in = 1.0
+            for r in rows2:
+                f = {k: float(r[k]) for k in ('L_plus', 'L_minus', 'J_plus', 'J_minus',
+                                              'G_plus', 'G_minus', 'lam')}
+                assert np.isclose(f['L_plus'], f['J_plus'] + lam_in * (f['G_plus'] - 0.02)), r
+                assert np.isclose(f['L_minus'],
+                                  f['J_minus'] + lam_in * (f['G_minus'] - 0.02)), r
+                lam_in = f['lam']
+    finally:
+        for (nm, _, _), v in zip(GAINS, saved):
+            setattr(ftg, nm, v)
+
+    # Each lap is timed from the previous crossing, not from the start of the rollout.
+    m3 = measure(CircuitPool(lambda t: _Stub(t)), [0.5] * P, ('IMS',), 2, 1e9)
+    assert abs(m3.score - 1.1) < 1e-9, f'a 2-lap mean must still be 1.1, got {m3.score}'
+    # A real progress() is read, and it drives shortfall.
+    r = rollout(_Bowl('IMS', prog=0.9), [0.5] * P, timeout=100.0, normalize=True,
+                laps_wanted=10 ** 6)
+    assert abs(r.shortfall - 0.1) < 1e-9 and r.progress == 0.9, r
+    # min_plausible_lap rejects a lap faster than physics allows (B11).
+    r = rollout(_Bowl('IMS', floor=1e6), [0.5] * P, timeout=1e3, normalize=True)
+    assert r.laps == 0 and not r.feasible, 'an implausibly fast lap must not count'
+
+    class _Z:                                  # one total failure is one unit, not 1/DELTA
+        shortfall = 1.0
+    assert violation([_Z()]) == 1.0
+
+    # D27: grading keeps the endpoints and regrades the interior. Measured, not asserted.
+    class _S:
+        def __init__(self, s):
+            self.shortfall = s
+    assert violation([_S(0.0)], graded=True) == 0.0, 'a completed lap is still exactly 0'
+    assert violation([_S(1.0)], graded=True) == 1.0, 'a total failure is still 1'
+    assert violation([_S(0.30)]) == 1.0, 'clipped: 30% short saturates'
+    assert np.isclose(violation([_S(0.30)], graded=True), 0.30), 'graded: it does not'
+    assert np.isclose(violation([_S(0.03)], graded=True) * (1 / DELTA),
+                      violation([_S(0.03)])), 'below DELTA the two differ by exactly 1/DELTA'
+    assert violation([_S(0.03)], graded=True) < violation([_S(0.03)]), \
+        'grading must weaken the channel, which is what D27 is testing'
+
     print('selftest OK')
 
 
@@ -873,21 +1219,47 @@ def main(argv):
     q.add_argument('--lam0', type=float, default=1.0, help='initial multiplier (C3)')
     q.add_argument('-b', type=float, default=5.0,
                    help="lambda's step gain (C3); sized to the HORIZON -- see B_GAIN")
+    q.add_argument('--graded-g', action='store_true',
+                   help='charge the raw shortfall rather than min(1, s/DELTA) (D27). A '
+                        'DIFFERENT OBJECTIVE: results are not comparable to recorded C3 '
+                        'numbers (D20 point 2).')
+    q.add_argument('--accumulate-g', action='store_true',
+                   help='dual sees the MEAN constraint over the block, not the tick '
+                        'sample (D25). Off by default so recorded runs reproduce.')
     q.add_argument('--lam-every', type=int, default=LAM_EVERY,
                    help='theta steps per dual step (C3). Separation is by subsampling '
-                        'because the textbook step-size ratio is about 2 at n=40, i.e. '
-                        'backwards over any horizon we run (D11)')
+                        'because b_n/a_n is 215 at n=40 -- the step-size ratio puts lambda '
+                        'on the faster timescale over any horizon we run (D11 erratum)')
     q.add_argument('--alpha', type=float, default=0.02,
                    help='allowed mean constraint violation (C3); must stay > 0 so that '
                         'lambda can retreat once the constraint holds')
     q.add_argument('--start', default=None,
-                   help="comma-separated starting gains in GAINS order, or 'random' for a "
+                   help="comma-separated starting gains in GAINS order (fewer than --dim "
+                        "values are extended with the neutral coordinates), or 'random' for a "
                         "uniform draw in the box (seeded separately, so it does not shift "
                         "the perturbation or circuit streams)")
+    q.add_argument('--c-adapt', type=float, default=0.0,
+                   help='feasibility-aware probe radius (C4): shrink c by this fraction '
+                        'when a probe fails, grow it when both probes return the SAME '
+                        'Lagrangian (B19). 0 = the fixed schedule every run used')
+    q.add_argument('--gains', default=None,
+                   help='comma-separated gain NAMES to tune, overriding --dim. The only '
+                        'way to reach a gain outside the first 24, such as MIN_THROTTLE '
+                        '(O15)')
+    q.add_argument('--dim', type=int, default=P,
+                   help='how many gains to tune (C6). 6 is every run before C6; the '
+                        'extra coordinates are no-ops at the box midpoint, so the start '
+                        'point does not move with p')
     q.add_argument('--backend', default='autodrive', choices=['autodrive', 'f1tenth'])
     q.add_argument('--map', default='Spielberg', help='f1tenth backend only')
     q.add_argument('--out', default=None)
     o = q.parse_args(argv)
+    if o.gains:
+        set_gains([n.strip() for n in o.gains.split(',')])
+        print(f'dim {P}: ' + ' '.join(nm for nm, _, _ in GAINS), flush=True)
+    elif o.dim != P:
+        set_dim(o.dim)
+        print(f'dim {P}: ' + ' '.join(nm for nm, _, _ in GAINS), flush=True)
     # --start is REAL gain values, on both paths. It used to be real gains for the
     # unconstrained loop (which carries them in via apply_gains, since spsa() reads the
     # module globals for its start point) and unit-box coordinates for the constrained
@@ -908,6 +1280,14 @@ def main(argv):
         print('start (unit):', np.round(start_u, 4), '= random, seed', o.seed)
     elif o.start:
         vals = [float(x) for x in o.start.split(',')]
+        # A start given for the first k gains EXTENDS with the neutral values of the rest
+        # (C6/D28). That is what makes one start point mean the same controller at every
+        # p, so a start can be shared across dimensions -- B19's plateau start is a
+        # six-vector and has to be usable at p = 24 unchanged.
+        if 6 <= len(vals) < P:
+            vals += [0.5 * (lo + hi) for _, lo, hi in GAINS_ALL[len(vals):P]]
+            print(f'--start extended from {len(o.start.split(","))} to {P} values '
+                  f'with the neutral coordinates', flush=True)
         assert len(vals) == P, f'--start needs {P} values, got {len(vals)}'
         apply_gains(np.array(vals))
         start_u = to_unit(vals)
@@ -936,7 +1316,9 @@ def main(argv):
                              out=o.out, max_step=o.max_step, timeout=o.timeout,
                              alpha=o.alpha, lam0=o.lam0,
                              tracks_per_iter=o.tracks_per_iter, start=start_u,
-                             family=o.family, lam_every=o.lam_every)
+                             family=o.family, lam_every=o.lam_every,
+                             accumulate_g=o.accumulate_g, graded_g=o.graded_g,
+                             c_adapt=o.c_adapt)
         else:
             spsa(iface, o.iters, o.laps, o.a, o.c, seed=o.seed, out=o.out,
                  max_step=o.max_step, timeout=o.timeout, ref_lap=o.ref_lap,

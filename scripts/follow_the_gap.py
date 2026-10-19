@@ -30,6 +30,24 @@ MIN_THROTTLE = 0.05
 STEER_SIGN = +1.0   # flip to -1.0 if the car steers the wrong way
 LOG_PATH = None     # set by --log; every completed lap is appended
 
+# --- extra structure, tuned only above p = 6 (C6/D28) ---------------------
+# Each of these is EXACTLY NEUTRAL at the value below, which is the midpoint of its
+# box in spsa_racing.GAINS_ALL. So the p = 12 and p = 24 box midpoints are the same
+# controller as the p = 6 midpoint -- the frozen baseline (D5) -- and raising p cannot
+# move the start point. Sectors are index slices of the forward window, so they scale
+# with FOV rather than cutting across it.
+SECTORS = 6
+GAP_S1 = GAP_S2 = GAP_S3 = GAP_S4 = GAP_S5 = GAP_S6 = 1.0   # per-sector GAP_THRESH scale
+RNG_S1 = RNG_S2 = RNG_S3 = RNG_S4 = RNG_S5 = RNG_S6 = 1.0   # per-sector range weight
+THR_B1 = THR_B2 = THR_B3 = THR_B4 = 1.0   # throttle scale per |steer| quartile
+STEER_EXP = 2.0     # exponent in (1 - |steer|)^e
+CLR_EXP = 1.0       # exponent on the clearance factor
+# O16/R51: an UNCONDITIONAL throttle offset, applied after the MAX_THROTTLE ceiling and
+# bounded only by the command range. Every other throttle term in this file is
+# multiplicative or clearance-scaled, so none of them can express what R50's residual
+# measured itself doing: +0.2 on every command, including above the ceiling.
+THR_OFFSET = 0.0
+
 SCAN_TOPIC = '/autodrive/roboracer_1/lidar'
 LAPCOUNT_TOPIC = '/autodrive/roboracer_1/lap_count'
 LASTLAP_TOPIC = '/autodrive/roboracer_1/last_lap_time'
@@ -62,6 +80,13 @@ def plan(ranges, angle_min, angle_increment):
 
     scan = np.convolve(scan, np.ones(SMOOTH) / SMOOTH, mode='same')
 
+    # C6's extra structure. Every factor is 1.0 at the box midpoint, so this block is
+    # bit-for-bit a no-op for the six-gain controller -- asserted in selftest().
+    sec = np.arange(scan.size) * SECTORS // scan.size
+    scan = scan * np.array([RNG_S1, RNG_S2, RNG_S3, RNG_S4, RNG_S5, RNG_S6])[sec]
+    thresh = GAP_THRESH * np.array([GAP_S1, GAP_S2, GAP_S3,
+                                    GAP_S4, GAP_S5, GAP_S6])[sec]
+
     # Zero a safety bubble subtending BUBBLE_R at the nearest obstacle. Skip it when
     # nothing is close: argmin ties to index 0 on a uniform scan, which would carve the
     # bubble out of one edge of the window and bias steering on an open straight.
@@ -70,7 +95,7 @@ def plan(ranges, angle_min, angle_increment):
         half = int(np.ceil(np.arctan2(BUBBLE_R, max(scan[closest], 1e-3)) / angle_increment))
         scan[max(0, closest - half):closest + half + 1] = 0.0
 
-    start, end = largest_gap(scan > GAP_THRESH)
+    start, end = largest_gap(scan > thresh)
     if end - start < 2:          # boxed in — stop rather than guess
         return 0.0, 0.0
 
@@ -83,11 +108,19 @@ def plan(ranges, angle_min, angle_increment):
     mid = scan.size // 2
     ahead = float(np.min(scan[max(0, mid - 20):mid + 20])) if scan.size > 40 else 0.0
     clearance = float(np.clip(ahead / CLEARANCE, 0.0, 1.0))
-    throttle = MAX_THROTTLE * (1.0 - abs(steer_cmd)) ** 2 * clearance
+    # The bin multiplier scales the FLOOR as well as the ceiling: at full steering lock
+    # (1-|steer|)^e is 0, so a multiplier applied only to the ceiling would be erased by
+    # the floor and the top bin would be a dead coordinate.
+    thr_b = (THR_B1, THR_B2, THR_B3, THR_B4)[min(3, int(abs(steer_cmd) * 4))]
+    throttle = (MAX_THROTTLE * (1.0 - abs(steer_cmd)) ** STEER_EXP
+                * clearance ** CLR_EXP * thr_b)
     # The floor exists to beat static friction, so it must FADE with clearance. A fixed
     # floor vetoes the very braking that avoids the wall -- and if MIN >= MAX it pins the
     # throttle constant and disables speed control entirely.
-    return steer_cmd, float(np.clip(throttle, MIN_THROTTLE * clearance, MAX_THROTTLE))
+    t = float(np.clip(throttle, MIN_THROTTLE * clearance * thr_b, MAX_THROTTLE))
+    # Adding exactly 0.0 and clipping a value already inside [0, 1] is the identity, so
+    # this is bit-for-bit the old return when the offset is neutral.
+    return steer_cmd, float(np.clip(t + THR_OFFSET, 0.0, 1.0))
 
 
 def selftest():
@@ -129,6 +162,64 @@ def selftest():
 
     assert largest_gap(np.array([0, 1, 1, 0, 1, 1, 1, 0], bool)) == (4, 7)
     assert largest_gap(np.zeros(5, bool)) == (0, 0)
+
+    # C6: the extra knobs must be a BIT-FOR-BIT no-op at their neutral values, or the
+    # p = 12 / p = 24 midpoint stops being the frozen baseline and every dimension
+    # compared would be a different start point (D28). Measured on scans that exercise
+    # every branch -- a sector-local wall, the bubble, and a cornering throttle.
+    rng = np.random.default_rng(0)
+    # A ramp puts beams on BOTH sides of the gap threshold in every sector, which is what
+    # makes a per-sector threshold observable at all; uniform-8.0 scans clear every
+    # threshold in the box and would hide an inert knob.
+    edge_l, edge_r = np.full(n, 0.3), np.full(n, 0.3)
+    edge_l[255:330] = 9.0        # the only gap is at the window's left edge, so the
+    edge_r[750:825] = 9.0        # steering command saturates and the top |steer| bin runs
+    cases = [np.full(n, 8.0), r, close, edge_l, edge_r, np.linspace(0.1, 3.0, n),
+             np.linspace(3.0, 0.1, n)] + [
+        np.clip(rng.uniform(0.2, 9.0, n), 0.0, 10.0) for _ in range(10)] + [
+        np.clip(rng.uniform(0.1, 2.0, n), 0.0, 10.0) for _ in range(10)]
+    want = [plan(s, amin, inc) for s in cases]
+    g = globals()
+    try:
+        for i in range(1, SECTORS + 1):          # neutral, re-stated explicitly
+            g[f'GAP_S{i}'], g[f'RNG_S{i}'] = 1.0, 1.0
+        for i in range(1, 5):
+            g[f'THR_B{i}'] = 1.0
+        g['STEER_EXP'], g['CLR_EXP'] = 2.0, 1.0
+        got = [plan(s, amin, inc) for s in cases]
+        assert got == want, 'the neutral values are not a no-op'
+
+        # ...and each group must be LIVE: a knob that changes nothing is not a dimension.
+        g['GAP_S1'] = 0.5
+        assert [plan(s, amin, inc) for s in cases] != want, 'GAP_S is inert'
+        g['GAP_S1'] = 1.0
+        g['RNG_S6'] = 1.3
+        assert [plan(s, amin, inc) for s in cases] != want, 'RNG_S is inert'
+        g['RNG_S6'] = 1.0
+        for bin_ in ('THR_B1', 'THR_B4'):     # both ends, so the binning is exercised
+            g[bin_] = 0.5
+            assert [plan(s, amin, inc) for s in cases] != want, f'{bin_} is inert'
+            g[bin_] = 1.0
+        g['STEER_EXP'] = 3.0
+        assert [plan(s, amin, inc) for s in cases] != want, 'STEER_EXP is inert'
+        g['STEER_EXP'] = 2.0
+        g['CLR_EXP'] = 0.5
+        assert [plan(s, amin, inc) for s in cases] != want, 'CLR_EXP is inert'
+        g['CLR_EXP'] = 1.0
+        # O16: the offset must raise the command ABOVE MAX_THROTTLE, which is the whole
+        # point -- every other throttle term is bounded by that ceiling.
+        g['THR_OFFSET'] = 0.2
+        got2 = [plan(s, amin, inc) for s in cases]
+        assert got2 != want, 'THR_OFFSET is inert'
+        assert max(t for _, t in got2) > MAX_THROTTLE, \
+            'the offset must be able to exceed the MAX_THROTTLE ceiling'
+        g['THR_OFFSET'] = 0.0
+    finally:
+        for i in range(1, SECTORS + 1):
+            g[f'GAP_S{i}'], g[f'RNG_S{i}'] = 1.0, 1.0
+        for i in range(1, 5):
+            g[f'THR_B{i}'] = 1.0
+        g['STEER_EXP'], g['CLR_EXP'], g['THR_OFFSET'] = 2.0, 1.0, 0.0
     print('selftest OK')
 
 
