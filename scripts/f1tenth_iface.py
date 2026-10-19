@@ -52,7 +52,7 @@ class F1TenthInterface:
     """
 
     def __init__(self, map_name='Spielberg', max_speed=MAX_SPEED_MPS,
-                 max_steer=MAX_STEER_PHYS, seed=0):
+                 max_steer=MAX_STEER_PHYS, seed=0, random_start=False):
         import gymnasium as gym
         self.env = gym.make('f1tenth_gym:f1tenth-v0',
                             config={'num_agents': 1, 'map': map_name,
@@ -60,6 +60,11 @@ class F1TenthInterface:
                             render_mode=None)
         self.map_name = map_name        # rollout() keys normalisation off this
         self.max_speed, self.max_steer = max_speed, max_steer
+        # Training only, and never on the evaluation path: every rollout() in the project
+        # resets to the start line, so a measured score is always from the same pose.
+        # With it on, reset() draws a fresh point on the centreline each episode (D18).
+        self.random_start = bool(random_start)
+        self._srng = np.random.default_rng([seed, 3])
         self._start = self._start_pose()
         self._action = (0.0, 0.0)
         self._steps = 0
@@ -94,6 +99,14 @@ class F1TenthInterface:
                 float(self._obs['poses_x'][0]), float(self._obs['poses_y'][0]),
                 float(self._obs['poses_theta'][0]))
         except Exception:
+            # A transient failure is tolerable; never succeeding is not -- progress would
+            # read 0.0 for the whole rollout and `implied_lap` would charge the floor
+            # without anything saying why (B29).
+            self._arc_fails = getattr(self, '_arc_fails', 0) + 1
+            if self._last_s is None and self._arc_fails > 10:
+                raise RuntimeError(
+                    f'cartesian_to_frenet failed {self._arc_fails} times and has never '
+                    f'succeeded on {self.map_name}: progress cannot be measured')
             return
         if self._last_s is not None:
             ds = s - self._last_s
@@ -119,11 +132,19 @@ class F1TenthInterface:
         """
         return self.track_length() / self.max_speed
 
-    def _start_pose(self):
-        """First centreline point, heading toward the second."""
+    def _start_pose(self, i=0):
+        """Centreline point `i`, heading toward the next one.
+
+        `i=0` is the start line and is what every measured rollout uses. Other indices
+        exist for D18's random starts: a policy trained only from the line never sees the
+        rest of the circuit, so the back of every track is out-of-distribution at
+        evaluation -- B10's confound in another costume.
+        """
         c = self.env.unwrapped.track.centerline
         xs, ys = np.asarray(c.xs), np.asarray(c.ys)
-        return np.array([xs[0], ys[0], np.arctan2(ys[1] - ys[0], xs[1] - xs[0])])
+        i = int(i) % len(xs)
+        j = (i + 1) % len(xs)
+        return np.array([xs[i], ys[i], np.arctan2(ys[j] - ys[i], xs[j] - xs[i])])
 
     # ----------------------------------------------------------------- state
     def _absorb(self, obs):
@@ -224,6 +245,9 @@ class F1TenthInterface:
         from f1tenth_gym.envs.base_classes import RaceCar
         if RaceCar.scan_simulator.track.spec.name != self.map_name:
             RaceCar.scan_simulator.set_map(self.env.unwrapped.track)
+        if self.random_start:
+            n = len(self.env.unwrapped.track.centerline.xs)
+            self._start = self._start_pose(self._srng.integers(n))
         obs, _ = self.env.reset(options={'poses': self._start[None, :]})
         self._absorb(obs)
         self._action = (0.0, 0.0)
@@ -267,6 +291,23 @@ def selftest():
             f'{RaceCar.scan_simulator.track.spec.name}, not {want}')
     assert abs(a.track_length() - b.track_length()) > 50.0, 'these two differ by >50 m'
     a.close(), b.close()
+
+    # The midpoint control (D5) through the real scoring path, which is the only check
+    # that sees progress() at all -- a wrapped or silently-zero arc reads here and
+    # nowhere else in this file (B29). One rollout, ~3 s.
+    import spsa_racing as S
+    saved = [getattr(S.ftg, nm) for nm, _, _ in S.GAINS]
+    ifc = F1TenthInterface('Spielberg')
+    try:
+        r = S.rollout(ifc, np.full(S.P, 0.5), timeout=250.0, normalize=True)
+        assert r.feasible and abs(r.score - 1.0) < 1e-3, \
+            f'the box midpoint IS the frozen baseline, so it must score 1.0000: {r}'
+        assert 0.98 < r.progress < 1.05, \
+            f'a completed lap must read about one lap of progress: {r.progress}'
+    finally:
+        ifc.close()
+        for (nm, _, _), v in zip(S.GAINS, saved):
+            setattr(S.ftg, nm, v)
 
     print('selftest OK')
 

@@ -117,16 +117,22 @@ def reward_mapfree(prev, cur, collision_penalty=5.0, lap_bonus=10.0):
     return r
 
 
-def reward_progress(prev, cur, collision_penalty=5.0, progress_scale=100.0):
+def reward_progress(prev, cur, collision_penalty=5.0, progress_scale=100.0,
+                    step_cost=0.01):
     """Arc-length gained, not instantaneous speed. The reward `reward_mapfree`'s docstring
     promised; see D13 for why speed-per-step is the wrong objective over a 6000-step episode.
 
     Requires `progress` in the state dict and raises without it rather than defaulting to
     zero -- a silent fallback here is B1's failure mode (D9).
+
+    `step_cost` makes standing still strictly negative, and the size of it decides whether
+    driving beats ending the episode: break-even speed is `track_length * step_cost / scale`,
+    so 0.01 puts it near 0.5-1.0 m/s against Follow-the-Gap's 4.9-5.7 (B22). The caller
+    charges it once per DECISION; `make_env`'s loop is what guarantees that.
     """
     r = progress_scale * max(0.0, float(cur['progress']) - float(prev['progress']))
     r -= collision_penalty * max(0, cur['collisions'] - prev['collisions'])
-    return r
+    return r - step_cost
 
 
 # ----------------------------------------------------------------- ROS 2 interface
@@ -211,6 +217,16 @@ class RoboRacerInterface:
     # advances under 3 indices per sample, so a 30-index window (2.7 m) is generous while
     # still refusing to teleport across a point where the track passes near itself.
     PROG_WINDOW = 30
+    # How far off the recorded lap a sample may be and still count as progress along it.
+    # Without this the window's FAR end is the argmin whenever the car is far from all of
+    # it, so progress ratchets a window per sample and walks round the loop from the other
+    # side: a car driving the wrong way read 0.92 of a lap (B26). Per-scene, and a real
+    # knob -- it is the corridor the car is allowed to deviate by, so a racing line that
+    # cuts further from the recorded lap than this under-reports its progress. Measured:
+    # 0.5 m of lateral offset still reads a full lap, 1.0 m does not. The cost is that a
+    # gap over PROG_WINDOW * spacing + this (3.4 m here) between processed IPS samples
+    # freezes progress, which under-reports -- the safe direction for a failure scalar.
+    PROG_MAX_DEV = 0.75
 
     # A lap is the SIMULATOR's line crossing, gated on having actually left the start.
     # Reconstructing laps from geometry was worse than the signal it replaced: a radius
@@ -297,8 +313,12 @@ class RoboRacerInterface:
             lo = self._prog_idx
             hi = min(len(cl), lo + self.PROG_WINDOW + 1)
             win = cl[lo:hi]
-            j = lo + int(np.argmin(np.sum((win - self.position[:2]) ** 2, axis=1)))
-            self._prog_idx = max(self._prog_idx, j)
+            d2 = np.sum((win - self.position[:2]) ** 2, axis=1)
+            k = int(np.argmin(d2))
+            if d2[k] <= self.PROG_MAX_DEV ** 2:
+                # Off the corridor there is no evidence of progress, and crediting the
+                # argmin anyway is what let a wrong-way car walk round the loop (B26).
+                self._prog_idx = max(self._prog_idx, lo + k)
 
     def now(self):
         """Wall clock. AutoDRIVE runs at 1x real time, so this IS simulator time --
@@ -386,11 +406,19 @@ class RoboRacerInterface:
 
 # ------------------------------------------------------------------ gymnasium env
 def make_env(max_steps=3000, reward_fn=reward_mapfree,
-             iface_factory=RoboRacerInterface, max_speed=MAX_SPEED, **kw):
+             iface_factory=RoboRacerInterface, max_speed=MAX_SPEED,
+             action_repeat=1, base_act=None, resid_scale=0.2, **kw):
     """Built lazily so this module imports without gymnasium installed.
 
     `iface_factory` is what lets the learning methods run on f1tenth (D1): F1TenthInterface
     presents the same API surface, so only the constructor differs.
+
+    `base_act(iface) -> (steering, throttle)` turns the action into a bounded RESIDUAL on
+    that controller (C5/D30): the command sent is `clip(base + resid_scale * action)`. The
+    base is re-evaluated every SIMULATOR step, because Follow-the-Gap is reactive at the
+    scan rate, while the residual is held for the whole decision block like any other
+    action. With `base_act=None` nothing changes, which is what keeps the from-scratch
+    arm (R41) comparable.
     """
     import gymnasium as gym
 
@@ -417,19 +445,39 @@ def make_env(max_steps=3000, reward_fn=reward_mapfree,
             return self._obs(st), {}
 
         def step(self, action):
+            """One DECISION, held for `action_repeat` simulator steps.
+
+            The repeat is what lets the discount horizon reach a lap (B13): it divides the
+            steps per episode, so the same gamma buys that many times the real-time
+            lookahead. The reward is computed ONCE over the whole held block, not summed per
+            simulator step -- `progress` and the collision counter are both monotone, so the
+            block difference is the same quantity, and the per-step sum charged `step_cost`
+            `action_repeat` times over (B22). Breaks early on termination.
+            """
             a = np.clip(np.asarray(action, dtype=float), -1.0, 1.0)
-            self.iface.send(a[0], a[1])
-            alive = self.iface.wait_for_scan()
-            # On ROS a false scan means the bridge dropped and the episode is garbage; on
-            # f1tenth it means the episode ENDED normally. Only the interface knows which,
-            # so it says (B9). Guessing either way costs a real result.
-            if not alive and not getattr(self.iface, 'scan_false_is_episode_end', False):
-                raise TimeoutError('no scan — simulator disconnected mid-episode')
-            st = self.iface.state()
-            self.prev_action, self.steps = a, self.steps + 1
-            reward = reward_fn(self.prev, st)
-            terminated = st['collisions'] > self.prev['collisions'] or not alive
-            self.prev = st
+            start, terminated, alive = self.prev, False, True
+            cmd = a
+            for _ in range(action_repeat):
+                if base_act is not None:
+                    cmd = np.clip(np.asarray(base_act(self.iface), dtype=float)
+                                  + resid_scale * a, -1.0, 1.0)
+                self.iface.send(cmd[0], cmd[1])
+                alive = self.iface.wait_for_scan()
+                # On ROS a false scan means the bridge dropped and the episode is garbage;
+                # on f1tenth it means the episode ENDED normally. Only the interface knows
+                # which, so it says (B9). Guessing either way costs a real result.
+                if not alive and not getattr(self.iface, 'scan_false_is_episode_end', False):
+                    raise TimeoutError('no scan — simulator disconnected mid-episode')
+                st = self.iface.state()
+                terminated = st['collisions'] > self.prev['collisions'] or not alive
+                self.prev = st
+                if terminated:
+                    break
+            reward = reward_fn(start, st)
+            # The COMMAND, not the raw action: in residual mode the policy's own output is
+            # not what the car did, and the observation has to say what the car did or
+            # training and evaluation see different inputs (the B13/D18 lesson).
+            self.prev_action, self.steps = cmd, self.steps + 1
             return (self._obs(st), reward, terminated, self.steps >= max_steps,
                     {'lap_time': st['lap_time'], 'laps': st['laps'],
                      'collisions': st['collisions']})
@@ -495,14 +543,64 @@ def selftest():
     # reward_progress pays arc-length, cannot be farmed by oscillating, and refuses to
     # guess a missing progress reading (D13).
     pb = {**base, 'progress': 0.20}
-    assert reward_progress(pb, pb) == 0.0, 'standing still must pay nothing'
-    assert np.isclose(reward_progress(pb, {**pb, 'progress': 0.30}), 10.0)
-    assert reward_progress(pb, {**pb, 'progress': 0.10}) == 0.0, 'backward must not be negative'
+    # step_cost=0 recovers the pre-B13 reward exactly, so these keep the original figures.
+    z = dict(step_cost=0.0)
+    assert reward_progress(pb, pb, **z) == 0.0, 'standing still must pay nothing'
+    assert np.isclose(reward_progress(pb, {**pb, 'progress': 0.30}, **z), 10.0)
+    assert reward_progress(pb, {**pb, 'progress': 0.10}, **z) == 0.0, 'backward must not be negative'
     # A collision costs exactly its penalty on the step. It is a marker, not the
     # deterrent: in f1tenth a collision ENDS the episode (R16), so what actually punishes
     # it is the progress forfeited -- up to 80 here against a penalty of 5.
-    assert np.isclose(reward_progress(pb, {**pb, 'progress': 0.30, 'collisions': 1}), 5.0)
-    assert reward_progress(pb, {**pb, 'collisions': 1}) == -5.0
+    assert np.isclose(reward_progress(pb, {**pb, 'progress': 0.30, 'collisions': 1}, **z), 5.0)
+    assert reward_progress(pb, {**pb, 'collisions': 1}, **z) == -5.0
+
+    # B13: with the default step cost, standing still is strictly WORSE than zero, which is
+    # what removes the immobility fixed point. Every other reward shifts by exactly it.
+    assert reward_progress(pb, pb) < 0.0, 'standing still must be strictly negative'
+    assert np.isclose(reward_progress(pb, pb), -0.01)
+    assert np.isclose(reward_progress(pb, {**pb, 'progress': 0.30}), 9.99)
+    # ...and it must be charged ONCE PER DECISION however long the decision is held. The
+    # constant expression that used to stand here tested nothing in the code, and what it
+    # was guarding silently charged 5x (B22). Driven through make_env on a stub, so the
+    # assertion fails if the loop ever sums per simulator step again.
+    class _StubIface:
+        scan_false_is_episode_end = True
+
+        def __init__(self, **kw):
+            self.n = 0
+
+        def _st(self):
+            return dict(scan=np.zeros(1080), speed=0.0, progress=0.0, collisions=0,
+                        laps=0, lap_time=0.0)
+
+        def reset(self):
+            return self._st()
+
+        def send(self, steer, throttle):
+            self.n += 1
+
+        def wait_for_scan(self, timeout=None):
+            return True
+
+        def state(self):
+            return self._st()
+
+        def close(self):
+            pass
+
+    for repeat in (1, 5, 17):
+        e = make_env(max_steps=10, reward_fn=reward_progress, iface_factory=_StubIface,
+                     action_repeat=repeat)
+        e.reset()
+        r = e.step(np.zeros(2))[1]
+        assert np.isclose(r, -0.01), f'living cost at repeat {repeat} was {r}, want -0.01'
+        assert e.iface.n == repeat, f'repeat {repeat} sent {e.iface.n} commands'
+        e.close()
+
+    # The size of it is what decides whether driving beats ending the episode: break-even
+    # speed is length * step_cost / progress_scale, so 0.01 sits near 0.5-1.0 m/s on these
+    # circuits against Follow-the-Gap's 4.9-5.7 (B22). At 0.05 it reached FTG pace itself.
+    assert 500.0 * 0.01 / 100.0 < 1.0, 'break-even speed must stay well under racing pace'
 
     # B11: laps are counted from OUR position, because /lap_count jumps by two on the
     # start line. Driven here through _on_ips with a stub, no ROS needed.
@@ -561,16 +659,43 @@ def selftest():
     assert pr._prog_idx <= was + RoboRacerInterface.PROG_WINDOW, \
         'one sample must not advance progress by more than the window'
     assert pr.progress() < 1.0, 'and must not reach the end in one sample'
-    for _ in range(40):                              # but it can get there by driving
-        RoboRacerInterface._on_ips(pr, _P(9.9))
+    for x in range(50, 100):                         # but it can get there by driving
+        RoboRacerInterface._on_ips(pr, _P(x * 0.1))
     assert pr.progress() == 1.0
     RoboRacerInterface._cl_cache = False             # absent file: no progress measure
     assert pr.progress() == 0.0
     RoboRacerInterface._cl_cache = None
+
+    # The wrong-way attack, on the recorded lap it was measured against (B26). Skipped if
+    # the CSV is absent, since it is not a committed file. Replayed with the corridor
+    # widened as well, so the test can see the gate rather than assert around it.
+    cl = RoboRacerInterface._centerline()
+    if cl is not False and cl is not None and len(cl) > 200:
+        half = (len(cl) - 1) // 2
+
+        def wrong_way(dev):
+            w = RoboRacerInterface.__new__(RoboRacerInterface)
+            w.start_pos, w._left_start, w._prog_idx = np.zeros(3), False, 0
+            w.position, w.laps, w.sim_lap_counts = np.zeros(3), 0, 0
+            w.PROG_MAX_DEV = dev                     # shadows the class constant
+            for i in range(half + 1):                # forward, one sample per index
+                RoboRacerInterface._on_ips(w, _P(*cl[i]))
+            out = w.progress()
+            for i in range(half, -1, -1):            # then turn round and drive back
+                RoboRacerInterface._on_ips(w, _P(*cl[i]))
+            return out, w.progress()
+
+        fwd, back = wrong_way(RoboRacerInterface.PROG_MAX_DEV)
+        assert abs(fwd - 0.5) < 0.01, f'the gate must not block honest driving: {fwd}'
+        assert back == fwd, f'driving the wrong way must add no progress: {back} vs {fwd}'
+        assert wrong_way(1e9)[1] > 0.9, \
+            'without the corridor this replay must read 0.92 of a lap the car never ' \
+            'drove -- if it stops doing so, the assertion above no longer sees the gate'
+        RoboRacerInterface._cl_cache = None
     # A full lap is worth progress_scale however it was driven, so the lap is the target
     # and speed is only the means -- the defect in reward_mapfree over a long episode.
     assert np.isclose(sum(reward_progress({**pb, 'progress': i / 100},
-                                          {**pb, 'progress': (i + 1) / 100})
+                                          {**pb, 'progress': (i + 1) / 100}, **z)
                           for i in range(20, 100)), 80.0)
     try:
         reward_progress(base, base)

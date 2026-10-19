@@ -26,20 +26,62 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import circuits                                                  # noqa: E402
 import f1tenth_iface as F1                                       # noqa: E402
+import follow_the_gap as ftg                                     # noqa: E402
 import roboracer_env as RE                                       # noqa: E402
 import spsa_racing as S                                          # noqa: E402
 
 LAP_BUDGET = 2.0        # episode truncates at this multiple of the circuit's baseline lap
 
+# One decision per ACTION_REPEAT simulator steps, i.e. 20 Hz at f1tenth's DT = 0.01.
+# Used by BOTH the training env and the evaluation closure: a policy trained at 20 Hz and
+# queried at 100 Hz is a different controller, and the mismatch would be invisible in the
+# scores (D18, and B1 is what a second path costs). AutoDRIVE's own rate is 18.2 Hz.
+ACTION_REPEAT = 5
+# Horizon = 1/(1-GAMMA) = 200 decisions = 10 s of track at 20 Hz. The default 0.99 gave
+# 1.0 s against a 33-102 s lap, so the lap was absent from the objective (B13).
+STEP_COST = 0.01    # per DECISION; break-even speed length*cost/100 ~ 0.5-1.0 m/s (B22)
+GAMMA = 0.995
 
-def max_steps_for(track, budget=LAP_BUDGET):
+
+# C5 (D30): how far the residual may move the base controller's command, per axis, in
+# normalised units. 0.2 of full lock is a correction, not a second driver -- at 1.0 the
+# policy could override the base entirely and the arm would just be R41 again with a
+# slower first episode.
+RESID_SCALE = 0.2
+# The project's best 17/17 controller: the final gains of rs500 s9 (R34, holdout in R46),
+# 0.6586 mean|feas on TRAIN. Written out rather than read from the CSV so the base is
+# pinned to a number, not to a file that a later run could overwrite.
+BASE_GAINS = (1.5392873617356948, 0.30731531707848736, 2.5950320180206417,
+              0.627093332505378, 0.6064912812544725, 2.1160942312123527)
+
+
+class FtgBase:
+    """Follow-the-Gap at fixed gains, as C5's base controller.
+
+    A class rather than a closure because SubprocVecEnv pickles the env factory -- and
+    everything it closes over -- to every worker. Gains are pushed in on every call
+    rather than once at construction, because the module globals are shared state and
+    `rollout()`'s own midpoint control writes to them between episodes (B7's class).
+    """
+
+    def __init__(self, gains=BASE_GAINS):
+        self.gains = np.asarray(gains, dtype=float)
+
+    def __call__(self, iface):
+        S.apply_gains(self.gains)
+        return ftg.plan(iface.scan, iface.angle_min, iface.angle_increment)
+
+
+def max_steps_for(track, budget=LAP_BUDGET, action_repeat=ACTION_REPEAT):
     """Truncation in STEPS, per circuit. A flat 3000 is 30 s at f1tenth's 0.01 s step
     while laps take 33-102 s, so every episode would end mid-lap and the policy would
     never once see a finished lap."""
-    return int(budget * circuits.baseline(track) / F1.DT)
+    return int(budget * circuits.baseline(track) / F1.DT / action_repeat)
 
 
-def make_track_env(track, reward_fn=RE.reward_progress, budget=LAP_BUDGET):
+def make_track_env(track, reward_fn=RE.reward_progress, budget=LAP_BUDGET,
+                   action_repeat=ACTION_REPEAT, random_start=False, seed=0,
+                   base_act=None, resid_scale=RESID_SCALE):
     import gymnasium as gym
     from stable_baselines3.common.monitor import Monitor
 
@@ -53,11 +95,13 @@ def make_track_env(track, reward_fn=RE.reward_progress, budget=LAP_BUDGET):
 
     # One constant feeds both the physical command mapping and the obs normalisation; if
     # they diverge the policy's speed channel stops meaning what it meant in training.
-    env = RE.make_env(max_steps=max_steps_for(track, budget),
+    env = RE.make_env(max_steps=max_steps_for(track, budget, action_repeat),
                       reward_fn=reward_fn,
                       iface_factory=F1.F1TenthInterface,
                       max_speed=F1.MAX_SPEED_MPS,
-                      map_name=track)
+                      action_repeat=action_repeat,
+                      base_act=base_act, resid_scale=resid_scale,
+                      map_name=track, random_start=random_start, seed=seed)
     # SB3's Monitor is what fills ep_rew_mean / ep_len_mean. Without it a run prints
     # losses and no episode statistics at all, so there is no way to tell a policy that
     # is learning from one standing still until the final evaluation.
@@ -75,18 +119,38 @@ def check_workers(venv, tracks):
     print(f'B7 check: {len(tracks)} workers, each on its own map')
 
 
-def policy_act(model, max_speed=F1.MAX_SPEED_MPS):
+def policy_act(model, max_speed=F1.MAX_SPEED_MPS, action_repeat=ACTION_REPEAT,
+               base=None, resid_scale=RESID_SCALE):
     """`act(iface)` for rollout(). Rebuilds the training observation exactly, including
     the previous action, so evaluation and training see the same input. One closure per
-    rollout: it carries state."""
+    rollout: it carries state.
+
+    `rollout()` calls this every simulator step, so the closure -- not the loop -- is what
+    holds the decision for `action_repeat` steps. It has to match training exactly: a
+    policy trained at 20 Hz and queried at 100 Hz commands a new action before the last
+    one has taken effect, which scores badly for a reason no column would show.
+    """
     prev = np.zeros(2)
+    held, n = np.zeros(2), 0
 
     def act(iface):
-        nonlocal prev
-        obs = RE.build_obs(iface.scan, iface.speed, prev, max_speed=max_speed)
-        a, _ = model.predict(obs, deterministic=True)
-        prev = np.clip(np.asarray(a, dtype=float), -1.0, 1.0)
-        return float(prev[0]), float(prev[1])
+        nonlocal prev, held, n
+        if n % action_repeat == 0:
+            obs = RE.build_obs(iface.scan, iface.speed, prev, max_speed=max_speed)
+            a, _ = model.predict(obs, deterministic=True)
+            held = np.clip(np.asarray(a, dtype=float), -1.0, 1.0)
+            if base is None:
+                prev = held
+        n += 1
+        if base is None:
+            return float(held[0]), float(held[1])
+        # C5: the same composition the training env applies, in the same order, with the
+        # base re-evaluated every step and the residual held. `prev` carries the COMMAND,
+        # because that is what the car did and what the env's observation reports.
+        cmd = np.clip(np.asarray(base(iface), dtype=float) + resid_scale * held,
+                      -1.0, 1.0)
+        prev = cmd
+        return float(cmd[0]), float(cmd[1])
 
     return act
 
@@ -102,19 +166,49 @@ def worker_tracks(tracks=None, envs=0):
     return [tracks[i % len(tracks)] for i in range(n)]
 
 
-def train(steps, out, tracks=None, envs=0, seed=0, n_steps=512, warm_from=None):
+def train(steps, out, tracks=None, envs=0, seed=0, n_steps=512, warm_from=None,
+          gamma=GAMMA, batch_size=512, device='cpu', action_repeat=ACTION_REPEAT,
+          random_start=True, step_cost=STEP_COST, base=None,
+          resid_scale=RESID_SCALE):
+    import functools
     from stable_baselines3 import PPO
     from stable_baselines3.common.vec_env import SubprocVecEnv
     tracks = worker_tracks(tracks, envs)
-    venv = SubprocVecEnv([(lambda t=t: make_track_env(t)) for t in tracks])
+    # partial, not a closure: SubprocVecEnv pickles the factory to each worker.
+    reward_fn = functools.partial(RE.reward_progress, step_cost=step_cost)
+    # Each worker gets its own start-pose stream, keyed off the run's seed, or every
+    # worker draws the identical sequence of poses and --seed never reaches them (B23).
+    venv = SubprocVecEnv([(lambda t=t, i=i: make_track_env(t, action_repeat=action_repeat,
+                                                           random_start=random_start,
+                                                           seed=1000 * seed + i,
+                                                           reward_fn=reward_fn,
+                                                           base_act=base,
+                                                           resid_scale=resid_scale))
+                          for i, t in enumerate(tracks)])
     check_workers(venv, tracks)
     if warm_from:
-        # The curriculum step: carry the policy over, not just the hyperparameters.
-        model = PPO.load(warm_from, env=venv, device='cpu')
+        # The curriculum step: carry the policy over, not just the hyperparameters. The
+        # kwargs are what make that true -- SB3 restores gamma, batch_size and n_steps from
+        # the zip, so without them a warm start silently reverts to whatever the checkpoint
+        # was trained with while this function prints the values it was asked for (B23).
+        model = PPO.load(warm_from, env=venv, device=device, gamma=gamma,
+                         batch_size=batch_size, n_steps=n_steps)
         print(f'warm start from {warm_from}')
     else:
+        # gamma is passed explicitly and printed: it was never set before, so SB3's 0.99
+        # applied and the lap was outside the horizon (B13). A default is not a decision.
+        # device stays CPU by measurement, not assumption -- R33 puts the Amdahl ceiling
+        # for any accelerator at 2.04x and a CUDA launch above the CPU cost at batch 14.
         model = PPO('MlpPolicy', venv, n_steps=n_steps, seed=seed, verbose=1,
-                    device='cpu')      # the simulator is the bottleneck, not a 57-input MLP
+                    gamma=gamma, batch_size=batch_size, device=device)
+    gamma = float(model.gamma)      # read back from the model: the argument is a request
+    print(f'gamma {gamma} -> horizon {1/(1-gamma):.0f} decisions = '
+          f'{1/(1-gamma)*F1.DT*action_repeat:.1f}s   action_repeat {action_repeat}   '
+          f'random_start {random_start}   device {device}   '
+          f'batch {model.batch_size}   n_steps {model.n_steps}   '
+          f'step_cost {step_cost}   '
+          f'base {"FTG " + str(np.round(base.gains, 4)) if base else "none"}'
+          f'{f" resid_scale {resid_scale}" if base else ""}', flush=True)
     model.learn(total_timesteps=steps)
     os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
     model.save(out)
@@ -122,7 +216,8 @@ def train(steps, out, tracks=None, envs=0, seed=0, n_steps=512, warm_from=None):
     print(f'saved {out}')
 
 
-def evaluate(path, test=False, timeout=250.0):
+def evaluate(path, test=False, timeout=250.0, action_repeat=ACTION_REPEAT,
+             base=None, resid_scale=RESID_SCALE):
     """Score a trained policy circuit by circuit, through rollout() and nothing else.
 
     The midpoint control rides along on every circuit: those gains ARE the frozen
@@ -137,7 +232,10 @@ def evaluate(path, test=False, timeout=250.0):
     rows = []
     for t in pool:
         iface = F1.F1TenthInterface(t)
-        r = S.rollout(iface, None, act=policy_act(model), timeout=timeout, normalize=True)
+        r = S.rollout(iface, None,
+                      act=policy_act(model, action_repeat=action_repeat, base=base,
+                                     resid_scale=resid_scale),
+                      timeout=timeout, normalize=True)
         ctl = S.rollout(iface, np.full(S.P, 0.5), timeout=timeout, normalize=True)
         iface.close()
         if abs(ctl.score - 1.0) > 1e-3:
@@ -159,8 +257,34 @@ def selftest():
     assert len(worker_tracks()) == len(circuits.TRAIN)
     assert worker_tracks(['A', 'B'], 5) == ['A', 'B', 'A', 'B', 'A']
 
-    assert max_steps_for('IMS') == int(2.0 * 47.93 / 0.01)
+    assert max_steps_for('IMS', action_repeat=1) == int(2.0 * 47.93 / 0.01)
     assert max_steps_for('Shanghai') > max_steps_for('IMS'), 'per-circuit, not flat'
+    # D18: max_steps counts DECISIONS, so the repeat divides it -- otherwise an episode
+    # runs action_repeat times longer than the lap budget it was sized for.
+    assert max_steps_for('IMS', action_repeat=5) == int(2.0 * 47.93 / 0.01 / 5)
+    assert GAMMA < 1.0 and 1 / (1 - GAMMA) * 0.01 * ACTION_REPEAT > 5.0, \
+        'the horizon must be worth several seconds of track (B13)'
+
+    # policy_act must HOLD its decision for exactly ACTION_REPEAT calls, because rollout()
+    # calls it every simulator step. A stub model makes this checkable with no torch.
+    class _M:
+        def __init__(self):
+            self.calls = 0
+
+        def predict(self, obs, deterministic=True):
+            self.calls += 1
+            return np.array([0.1 * self.calls, 0.2]), None
+
+    class _If:
+        scan, speed = np.full(1080, 5.0), 3.0
+
+    m = _M()
+    act = policy_act(m, action_repeat=5)
+    out = [act(_If()) for _ in range(12)]
+    assert m.calls == 3, f'queried the policy {m.calls} times in 12 steps, want 3'
+    assert out[0] == out[4] and out[5] == out[9], 'the decision must be held'
+    assert out[0] != out[5], 'and must change when it is re-queried'
+    assert policy_act(_M(), action_repeat=1) is not None
 
     env = make_track_env('Spielberg')
     obs, _ = env.reset()
@@ -193,6 +317,36 @@ def selftest():
     ctl = S.rollout(iface, np.full(S.P, 0.5), timeout=90.0, normalize=True)
     assert abs(ctl.score - 1.0) < 1e-3, f'control {ctl.score:.4f} must be 1.0000'
 
+    # C5 (D30). The composition has to be exact in both directions, so it is checked
+    # against the one number that cannot be argued with: at resid_scale = 0 the residual
+    # policy IS Follow-the-Gap at the base gains, so with the MIDPOINT as base it must
+    # score the frozen baseline, 1.0000, through the same rollout() the gains use.
+    mid = FtgBase(S.to_real(np.full(S.P, 0.5)))
+    r0 = S.rollout(iface, None, act=policy_act(_M(), base=mid, resid_scale=0.0),
+                   timeout=90.0, normalize=True)
+    assert abs(r0.score - 1.0) < 1e-9, \
+        f'a zero residual on the midpoint base must read 1.0000, got {r0.score:.6f}'
+    # ...and the residual must actually be added, bounded by resid_scale, on top of the
+    # base's own command rather than replacing it.
+    class _Full:
+        def predict(self, obs, deterministic=True):
+            return np.array([1.0, -1.0]), None
+
+    class _If2:
+        scan = np.full(1080, 5.0)
+        speed, angle_min, angle_increment = 3.0, -2.35619, 0.004363323
+
+    ifc2 = _If2()
+    want = ftg.plan(ifc2.scan, ifc2.angle_min, ifc2.angle_increment)
+    got = policy_act(_Full(), base=FtgBase(S.to_real(np.full(S.P, 0.5))),
+                     resid_scale=0.2)(ifc2)
+    assert np.allclose(got, np.clip(np.array(want) + 0.2 * np.array([1.0, -1.0]),
+                                    -1.0, 1.0)), f'{got} is not base {want} + residual'
+    assert not np.allclose(got, want), 'the residual must move the command'
+    # The base must be pickled to a worker as the SubprocVecEnv factory is (B23's class).
+    import pickle
+    assert np.allclose(pickle.loads(pickle.dumps(mid)).gains, mid.gains)
+
     for bad in (dict(u=None, act=None), dict(u=np.full(S.P, 0.5), act=lambda _: (0, 0))):
         try:
             S.rollout(iface, timeout=90.0, **bad)
@@ -219,12 +373,43 @@ def main(argv):
                    help='continue from this policy instead of a fresh one')
     ap.add_argument('--test', action='store_true', help='evaluate on the HELD-OUT circuits')
     ap.add_argument('--timeout', type=float, default=250.0)
+    ap.add_argument('--gamma', type=float, default=GAMMA,
+                    help='discount factor; the horizon it buys is printed before training')
+    ap.add_argument('--action-repeat', type=int, default=ACTION_REPEAT,
+                    help='simulator steps per decision, in training AND evaluation')
+    ap.add_argument('--device', default='cpu', choices=['cpu', 'cuda'],
+                    help='cpu by measurement, not assumption (R33)')
+    ap.add_argument('--fixed-start', action='store_true',
+                    help='train from the start line only, as the pre-D18 runs did')
+    ap.add_argument('--batch-size', type=int, default=512,
+                    help='PPO minibatch; recorded because a warm start used to inherit it '
+                         'from the checkpoint without saying so (B23)')
+    ap.add_argument('--base-gains', default=None, metavar='G1,..,G6',
+                    help="C5 (D30): drive a bounded residual on Follow-the-Gap at these "
+                         "gains instead of commanding the car directly. 'best' takes the "
+                         "project's best 17/17 controller (rs500 s9, R34). Must be passed "
+                         "to --eval as well, or the policy is scored on a different "
+                         "controller than it trained on")
+    ap.add_argument('--resid-scale', type=float, default=RESID_SCALE,
+                    help='how far the residual may move the base command, per axis (C5)')
+    ap.add_argument('--step-cost', type=float, default=STEP_COST,
+                    help='living cost per DECISION. Break-even speed is '
+                         'length*cost/100, so 0.05 reaches racing pace itself (B22)')
     o = ap.parse_args(argv)
+    base = None
+    if o.base_gains:
+        base = FtgBase(BASE_GAINS if o.base_gains == 'best'
+                       else [float(x) for x in o.base_gains.split(',')])
+        assert len(base.gains) == S.P, f'--base-gains needs {S.P} values'
     if o.train:
         train(o.steps, o.out, tracks=o.tracks.split(',') if o.tracks else None,
-              envs=o.envs, seed=o.seed, warm_from=o.warm_from)
+              envs=o.envs, seed=o.seed, warm_from=o.warm_from, gamma=o.gamma,
+              device=o.device, action_repeat=o.action_repeat,
+              random_start=not o.fixed_start, batch_size=o.batch_size,
+              step_cost=o.step_cost, base=base, resid_scale=o.resid_scale)
     elif o.eval:
-        evaluate(o.eval, test=o.test, timeout=o.timeout)
+        evaluate(o.eval, test=o.test, timeout=o.timeout,
+                 action_repeat=o.action_repeat, base=base, resid_scale=o.resid_scale)
     else:
         ap.error('one of --selftest, --train, --eval')
 
