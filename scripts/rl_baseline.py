@@ -217,7 +217,7 @@ def train(steps, out, tracks=None, envs=0, seed=0, n_steps=512, warm_from=None,
 
 
 def evaluate(path, test=False, timeout=250.0, action_repeat=ACTION_REPEAT,
-             base=None, resid_scale=RESID_SCALE, fresh=False):
+             base=None, resid_scale=RESID_SCALE, fresh=False, rev=False):
     """Score a trained policy circuit by circuit, through rollout() and nothing else.
 
     The midpoint control rides along on every circuit: those gains ARE the frozen
@@ -226,7 +226,7 @@ def evaluate(path, test=False, timeout=250.0, action_repeat=ACTION_REPEAT,
     """
     from stable_baselines3 import PPO
     model = PPO.load(path, device='cpu')
-    label = 'FRESH' if fresh else 'TEST' if test else 'TRAIN'
+    label = 'REVERSED' if rev else 'FRESH' if fresh else 'TEST' if test else 'TRAIN'
     pool = getattr(circuits, label)
     print(f'{os.path.basename(path)} on {len(pool)} {label} circuits')
     rows = []
@@ -373,6 +373,8 @@ def main(argv):
                    help='continue from this policy instead of a fresh one')
     ap.add_argument('--fresh', action='store_true',
                     help='evaluate on circuits outside the 22 (D38)')
+    ap.add_argument('--reversed', action='store_true', dest='rev',
+                    help='evaluate on the 17 reversed TRAIN circuits (D39)')
     ap.add_argument('--test', action='store_true', help='evaluate on the HELD-OUT circuits')
     ap.add_argument('--timeout', type=float, default=250.0)
     ap.add_argument('--gamma', type=float, default=GAMMA,
@@ -411,7 +413,7 @@ def main(argv):
               step_cost=o.step_cost, base=base, resid_scale=o.resid_scale)
     elif o.eval:
         evaluate(o.eval, test=o.test, timeout=o.timeout, action_repeat=o.action_repeat,
-                 base=base, resid_scale=o.resid_scale, fresh=o.fresh)
+                 base=base, resid_scale=o.resid_scale, fresh=o.fresh, rev=o.rev)
     else:
         ap.error('one of --selftest, --train, --eval')
 
