@@ -543,7 +543,8 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
                      seed=0, out=None, max_step=0.10, timeout=250.0, alpha=0.02,
                      lam0=1.0, tracks_per_iter=2, start=None, lam_every=LAM_EVERY,
                      delta=DELTA, family='bernoulli', accumulate_g=False,
-                     graded_g=False, c_adapt=0.0, restart=False, sf_m=0, sf_sigma=0.16):
+                     graded_g=False, c_adapt=0.0, restart=False, sf_m=0, sf_sigma=0.16,
+                     one_meas=False):
     """Primal-dual SPSA on a constrained racing problem (notebook C3).
 
         minimise   J(theta)  = E_M[ implied_lap(theta, M) / baseline(M) ]
@@ -600,6 +601,10 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
     circuit draw, `ghat = sum d_i (L_i - L_0) / (sigma m)`. Probes are clipped to the box by
     `to_real`, so near a face this is J_sigma of the clipped objective.
 
+    `one_meas` (D37) is one-measurement SPSA, `ghat = L(theta + c_n d) / (c_n d)`, as in
+    BhatnagarFuMarcusWang2003. With `family='hadamard'` the `L(theta)` term cancels exactly
+    over each period; with Bernoulli only in expectation.
+
     ponytail: one constraint. Collisions are the obvious second (and `Rollout.collisions`
     is already carried for it), but D7's warning about interacting schedules is real --
     every extra multiplier is another timescale to separate. Add it when the completion
@@ -619,6 +624,7 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
     jrng = np.random.default_rng([seed, 7])         # restart jumps (D34)
     srng = np.random.default_rng([seed, 8])         # SF probes (D36)
     assert not (sf_m and (c_adapt or restart)), 'sf_m is its own estimator (D36)'
+    assert not (one_meas and (sf_m or c_adapt or restart)), 'one_meas is its own (D37)'
     u = np.array([0.5] * P) if start is None else np.asarray(start, dtype=float)
     print('start (unit):', np.round(u, 4),
           '= box midpoint' if start is None else '= --start', flush=True)   # B10
@@ -652,6 +658,11 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
                 mp = ms[0]._replace(cost=float(np.mean([x.cost for x in ms])),
                                     feasible=all(x.feasible for x in ms))
                 Gp, Lp = float(np.mean(Gs)), float(np.mean(Ls))
+            elif one_meas:                                       # D37
+                mp = mm = measure(pool, u + cn * d, tracks, laps, timeout)
+                Gp = Gm = violation(mp.rollouts, delta, graded_g)
+                Lp, Lm = mp.cost + lam * (Gp - alpha), float('nan')
+                u = np.clip(u - np.clip(an * Lp / (cn * d), -max_step, max_step), 0.0, 1.0)
             else:
                 mp = measure(pool, u + cn * d, tracks, laps, timeout)
                 mm = measure(pool, u - cn * d, tracks, laps, timeout)
@@ -665,7 +676,7 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
             # outside the feasible region. It does not: PROG_FLOOR and COST_CAP flatten it,
             # and B19 measured theta frozen for 147 iterations with L+ == L- every time.
             # C4's radius is one response (R49); `restart` is cheaper and did as well (R53).
-            if sf_m:
+            if sf_m or one_meas:
                 pass                                             # stepped above
             elif restart and Lp == Lm:
                 u = np.clip(u + jrng.normal(0, 2 * cn, size=P), 0.0, 1.0)
@@ -1184,6 +1195,15 @@ def selftest():
                 'SF must descend the bowl (L_minus is the measurement AT theta)'
             assert all(float(r['c_n']) == 0.1 for r in sb), 'sigma must stay fixed'
 
+            # D37: one measurement per iteration, and with Hadamard it must still descend.
+            spsa_constrained(CircuitPool(lambda t: _Bowl(t)), iters=48, seed=0,
+                             timeout=250.0, one_meas=True, family='hadamard',
+                             out=os.path.join(td, 'om.csv'))
+            om = list(csv.DictReader(open(os.path.join(td, 'om.csv'))))
+            assert all(r['L_minus'] == 'nan' for r in om), 'one measurement, not two'
+            assert np.mean([float(r['L_plus']) for r in om[-8:]]) < \
+                np.mean([float(r['L_plus']) for r in om[:8]]), 'one-meas must descend'
+
             # D27: --graded-g must reach the loop, not just the helper. A probe that times
             # out with progress 0.9 has shortfall 0.1, so the two objectives must differ by
             # exactly DELTA on iteration 0, where both runs still share an iterate.
@@ -1303,6 +1323,9 @@ def main(argv):
                    help='D36: step on the smoothed objective with this many one-sided '
                         'Gaussian probes per iteration, sigma fixed. 0 = SPSA')
     q.add_argument('--sf-sigma', type=float, default=0.16, help='D36: fixed sigma, unit coords')
+    q.add_argument('--one-meas', action='store_true',
+                   help='D37: one-measurement SPSA, L(theta + c d) / (c d). Pair with '
+                        '--family hadamard for exact cancellation over a period')
     q.add_argument('--gains', default=None,
                    help='comma-separated gain NAMES to tune, overriding --dim. The only '
                         'way to reach a gain outside the first 24, such as MIN_THROTTLE '
@@ -1380,7 +1403,7 @@ def main(argv):
                              family=o.family, lam_every=o.lam_every,
                              accumulate_g=o.accumulate_g, graded_g=o.graded_g,
                              c_adapt=o.c_adapt, restart=o.restart, sf_m=o.sf_m,
-                             sf_sigma=o.sf_sigma)
+                             sf_sigma=o.sf_sigma, one_meas=o.one_meas)
         else:
             spsa(iface, o.iters, o.laps, o.a, o.c, seed=o.seed, out=o.out,
                  max_step=o.max_step, timeout=o.timeout, ref_lap=o.ref_lap,

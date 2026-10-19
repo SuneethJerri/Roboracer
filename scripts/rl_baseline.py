@@ -217,7 +217,7 @@ def train(steps, out, tracks=None, envs=0, seed=0, n_steps=512, warm_from=None,
 
 
 def evaluate(path, test=False, timeout=250.0, action_repeat=ACTION_REPEAT,
-             base=None, resid_scale=RESID_SCALE):
+             base=None, resid_scale=RESID_SCALE, fresh=False):
     """Score a trained policy circuit by circuit, through rollout() and nothing else.
 
     The midpoint control rides along on every circuit: those gains ARE the frozen
@@ -226,9 +226,9 @@ def evaluate(path, test=False, timeout=250.0, action_repeat=ACTION_REPEAT,
     """
     from stable_baselines3 import PPO
     model = PPO.load(path, device='cpu')
-    pool = circuits.TEST if test else circuits.TRAIN
-    print(f'{os.path.basename(path)} on {len(pool)} '
-          f'{"TEST" if test else "TRAIN"} circuits')
+    label = 'FRESH' if fresh else 'TEST' if test else 'TRAIN'
+    pool = getattr(circuits, label)
+    print(f'{os.path.basename(path)} on {len(pool)} {label} circuits')
     rows = []
     for t in pool:
         iface = F1.F1TenthInterface(t)
@@ -371,6 +371,8 @@ def main(argv):
                    help='worker count; cycles --tracks if larger (single-circuit curriculum)')
     ap.add_argument('--warm-from', default=None, metavar='MODEL',
                    help='continue from this policy instead of a fresh one')
+    ap.add_argument('--fresh', action='store_true',
+                    help='evaluate on circuits outside the 22 (D38)')
     ap.add_argument('--test', action='store_true', help='evaluate on the HELD-OUT circuits')
     ap.add_argument('--timeout', type=float, default=250.0)
     ap.add_argument('--gamma', type=float, default=GAMMA,
@@ -408,8 +410,8 @@ def main(argv):
               random_start=not o.fixed_start, batch_size=o.batch_size,
               step_cost=o.step_cost, base=base, resid_scale=o.resid_scale)
     elif o.eval:
-        evaluate(o.eval, test=o.test, timeout=o.timeout,
-                 action_repeat=o.action_repeat, base=base, resid_scale=o.resid_scale)
+        evaluate(o.eval, test=o.test, timeout=o.timeout, action_repeat=o.action_repeat,
+                 base=base, resid_scale=o.resid_scale, fresh=o.fresh)
     else:
         ap.error('one of --selftest, --train, --eval')
 

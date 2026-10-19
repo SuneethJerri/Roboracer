@@ -36,6 +36,9 @@ TRACKS = ('Austin', 'BrandsHatch', 'Budapest', 'Catalunya', 'Hockenheim', 'IMS',
 # existing work out of distribution.
 TEST = ('IMS', 'Hockenheim', 'Monza', 'Sochi', 'Spa')
 TRAIN = tuple(t for t in TRACKS if t not in TEST)
+# Outside the 22 entirely: TEST was spent by R46 (D26), so further out-of-sample numbers come
+# from here (D38). Never sampled; f1tenth_racetracks@b95c4ef, baseline measured as R6 did.
+FRESH = ('Montreal',)
 
 _baselines = None
 
@@ -79,8 +82,9 @@ def selftest():
     assert set(TEST) | set(TRAIN) == set(TRACKS)
     assert 'Spielberg' in TRAIN, 'the development circuit must stay in train'
 
-    b = baselines()
-    assert len(b) == 22, f'expected 22 frozen baselines, got {len(b)}'
+    b = {t: baseline(t) for t in TRACKS}
+    assert set(baselines()) == set(TRACKS) | set(FRESH), 'one baseline per circuit'
+    assert not set(FRESH) & set(TRACKS), 'FRESH must be outside the 22'
     assert abs(baseline('IMS') - 47.93) < 1e-6
     assert abs(baseline('Shanghai') - 101.81) < 1e-6
     assert abs(max(b.values()) / min(b.values()) - 2.124) < 1e-2, 'the 2.12x spread (R6)'
