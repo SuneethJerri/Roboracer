@@ -72,6 +72,17 @@ class FtgBase:
         return ftg.plan(iface.scan, iface.angle_min, iface.angle_increment)
 
 
+ALIGN_K = 100.0     # D49: scale of both the potential and the terminal cost, = progress_scale
+
+
+def aligned_cost(progress, elapsed, budget_s, baseline, ran_out):
+    """D49: the episode's measured cost, as `rollout()` would charge it. A crash or an
+    exhausted budget is charged the whole budget over progress (`implied_lap`'s failure
+    case); a clean finish its own elapsed time. Normalised and capped the same way."""
+    t = budget_s if ran_out else elapsed
+    return min(S.COST_CAP, t / max(progress, S.PROG_FLOOR) / baseline)
+
+
 def max_steps_for(track, budget=LAP_BUDGET, action_repeat=ACTION_REPEAT):
     """Truncation in STEPS, per circuit. A flat 3000 is 30 s at f1tenth's 0.01 s step
     while laps take 33-102 s, so every episode would end mid-lap and the policy would
@@ -81,7 +92,7 @@ def max_steps_for(track, budget=LAP_BUDGET, action_repeat=ACTION_REPEAT):
 
 def make_track_env(track, reward_fn=RE.reward_progress, budget=LAP_BUDGET,
                    action_repeat=ACTION_REPEAT, random_start=False, seed=0,
-                   base_act=None, resid_scale=RESID_SCALE):
+                   base_act=None, resid_scale=RESID_SCALE, aligned=False, gamma=GAMMA):
     import gymnasium as gym
     from stable_baselines3.common.monitor import Monitor
 
@@ -92,6 +103,31 @@ def make_track_env(track, reward_fn=RE.reward_progress, budget=LAP_BUDGET,
             from f1tenth_gym.envs.base_classes import RaceCar
             iface = self.env.unwrapped.iface
             return (iface.map_name, RaceCar.scan_simulator.track.spec.name)
+
+    class Aligned(gym.Wrapper):
+        """D49: replace the reward with gamma*Phi(s') - Phi(s), Phi = ALIGN_K * progress
+        (0 after a terminal step), plus -ALIGN_K * aligned_cost at the episode's end."""
+        baseline = circuits.baseline(track)
+        budget_s = budget * circuits.baseline(track)
+
+        def reset(self, **kw):
+            out = self.env.reset(**kw)
+            self.phi = ALIGN_K * self.env.unwrapped.iface.progress()
+            return out
+
+        def step(self, action):
+            obs, _, term, trunc, info = self.env.step(action)
+            iface = self.env.unwrapped.iface
+            p = iface.progress()
+            phi = ALIGN_K * p
+            r = (0.0 if term else gamma * phi) - self.phi
+            self.phi = phi
+            if term or trunc:
+                c = aligned_cost(p, iface.now(), self.budget_s, self.baseline,
+                                 ran_out=trunc or info['collisions'] > 0)
+                r -= ALIGN_K * c
+                info['aligned_cost'] = c
+            return obs, r, term, trunc, info
 
     # One constant feeds both the physical command mapping and the obs normalisation; if
     # they diverge the policy's speed channel stops meaning what it meant in training.
@@ -105,7 +141,7 @@ def make_track_env(track, reward_fn=RE.reward_progress, budget=LAP_BUDGET,
     # SB3's Monitor is what fills ep_rew_mean / ep_len_mean. Without it a run prints
     # losses and no episode statistics at all, so there is no way to tell a policy that
     # is learning from one standing still until the final evaluation.
-    return MapCheck(Monitor(env))
+    return MapCheck(Monitor(Aligned(env) if aligned else env))
 
 
 def check_workers(venv, tracks):
@@ -169,7 +205,7 @@ def worker_tracks(tracks=None, envs=0):
 def train(steps, out, tracks=None, envs=0, seed=0, n_steps=512, warm_from=None,
           gamma=GAMMA, batch_size=512, device='cpu', action_repeat=ACTION_REPEAT,
           random_start=True, step_cost=STEP_COST, base=None,
-          resid_scale=RESID_SCALE):
+          resid_scale=RESID_SCALE, reward='progress'):
     import functools
     from stable_baselines3 import PPO
     from stable_baselines3.common.vec_env import SubprocVecEnv
@@ -183,7 +219,9 @@ def train(steps, out, tracks=None, envs=0, seed=0, n_steps=512, warm_from=None,
                                                            seed=1000 * seed + i,
                                                            reward_fn=reward_fn,
                                                            base_act=base,
-                                                           resid_scale=resid_scale))
+                                                           resid_scale=resid_scale,
+                                                           aligned=reward == 'aligned',
+                                                           gamma=gamma))
                           for i, t in enumerate(tracks)])
     check_workers(venv, tracks)
     if warm_from:
@@ -206,7 +244,8 @@ def train(steps, out, tracks=None, envs=0, seed=0, n_steps=512, warm_from=None,
           f'{1/(1-gamma)*F1.DT*action_repeat:.1f}s   action_repeat {action_repeat}   '
           f'random_start {random_start}   device {device}   '
           f'batch {model.batch_size}   n_steps {model.n_steps}   '
-          f'step_cost {step_cost}   '
+          f'reward {reward}   '
+          f'{"" if reward == "aligned" else f"step_cost {step_cost}   "}'
           f'base {"FTG " + str(np.round(base.gains, 4)) if base else "none"}'
           f'{f" resid_scale {resid_scale}" if base else ""}', flush=True)
     model.learn(total_timesteps=steps)
@@ -264,6 +303,17 @@ def selftest():
     assert max_steps_for('IMS', action_repeat=5) == int(2.0 * 47.93 / 0.01 / 5)
     assert GAMMA < 1.0 and 1 / (1 - GAMMA) * 0.01 * ACTION_REPEAT > 5.0, \
         'the horizon must be worth several seconds of track (B13)'
+
+    # D49: the aligned terminal cost IS rollout()'s cost -- a failure must equal
+    # implied_lap's failure case, a clean finish its own pace, both capped the same way.
+    b = 47.93
+    for p in (0.6, 1.0, 1.7):
+        assert np.isclose(aligned_cost(p, 30.0, 2 * b, b, ran_out=True),
+                          min(S.COST_CAP, S.implied_lap([], 2 * b, p, 1) / b))
+    assert np.isclose(aligned_cost(2.0, 1.6 * b, 2 * b, b, ran_out=False), 0.8), \
+        'two laps in 1.6 baselines is a 0.8 ratio'
+    assert aligned_cost(0.1, 5.0, 2 * b, b, ran_out=True) == S.COST_CAP
+    assert aligned_cost(2.0, 1.6 * b, 2 * b, b, False) < aligned_cost(2.0, 2 * b, 2 * b, b, False)
 
     # policy_act must HOLD its decision for exactly ACTION_REPEAT calls, because rollout()
     # calls it every simulator step. A stub model makes this checkable with no torch.
@@ -399,6 +449,9 @@ def main(argv):
     ap.add_argument('--step-cost', type=float, default=STEP_COST,
                     help='living cost per DECISION. Break-even speed is '
                          'length*cost/100, so 0.05 reaches racing pace itself (B22)')
+    ap.add_argument('--reward', default='progress', choices=['progress', 'aligned'],
+                    help='aligned (D49): progress as a potential plus the measured cost '
+                         'at the end, so the return\'s optimum is the objective\'s')
     o = ap.parse_args(argv)
     base = None
     if o.base_gains:
@@ -410,7 +463,8 @@ def main(argv):
               envs=o.envs, seed=o.seed, warm_from=o.warm_from, gamma=o.gamma,
               device=o.device, action_repeat=o.action_repeat,
               random_start=not o.fixed_start, batch_size=o.batch_size,
-              step_cost=o.step_cost, base=base, resid_scale=o.resid_scale)
+              step_cost=o.step_cost, base=base, resid_scale=o.resid_scale,
+              reward=o.reward)
     elif o.eval:
         evaluate(o.eval, test=o.test, timeout=o.timeout, action_repeat=o.action_repeat,
                  base=base, resid_scale=o.resid_scale, fresh=o.fresh, rev=o.rev)
