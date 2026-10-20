@@ -77,9 +77,21 @@ def set_gains(names):
     dimension knob. Gains NOT selected are reset to their neutral values, so a change
     cannot leave a previous run's gains behind in the module -- the same class of hidden
     shared state as B7.
+
+    `NAME:lo:hi` overrides one box for this run only, and must keep its midpoint, which
+    is where the frozen baseline was measured (D42 part 4).
     """
     global GAINS, P
     table = {nm: (nm, lo, hi) for nm, lo, hi in GAINS_ALL}
+    over = {}
+    for s in [s for s in names if ':' in s]:
+        nm, lo, hi = s.split(':')
+        lo, hi = float(lo), float(hi)
+        if nm not in table or not lo < hi or 0.5 * (lo + hi) != 0.5 * sum(table[nm][1:]):
+            raise ValueError(f'{s}: box override must name a gain and keep its midpoint')
+        over[nm] = (nm, lo, hi)
+    names = [s.split(':')[0] for s in names]
+    table.update(over)
     unknown = [nm for nm in names if nm not in table]
     if unknown:
         raise ValueError(f'unknown gains {unknown}; have {sorted(table)}')
@@ -791,7 +803,15 @@ def selftest():
         assert np.isclose(to_real([0.5] * 7)[-1], 0.05), \
             'the MIN_THROTTLE box must be centred on the shipped 0.05'
         assert ftg.GAP_S1 == 1.0 and ftg.STEER_EXP == 2.0, 'unselected must be neutral'
-        for bad in (['FOV', 'FOV'], ['NOPE']):
+        # D42 part 4: a symmetric override widens the box and leaves the midpoint alone,
+        # and it does not outlive the call.
+        set_gains(['FOV', 'THR_OFFSET:-0.40:0.40'])
+        assert GAINS[-1] == ('THR_OFFSET', -0.40, 0.40) and to_real([0.5, 0.5])[-1] == 0.0
+        assert np.isclose(to_real([0.5, 1.0])[-1], 0.40)
+        set_gains(['FOV', 'THR_OFFSET'])
+        assert GAINS[-1] == ('THR_OFFSET', -0.20, 0.20), 'an override must not persist'
+        for bad in (['FOV', 'FOV'], ['NOPE'], ['THR_OFFSET:-0.4:0.2'], ['NOPE:0:1'],
+                    ['THR_OFFSET:0.4:-0.4'], ['THR_OFFSET', 'THR_OFFSET:-0.4:0.4']):
             try:
                 set_gains(bad)
             except ValueError:
