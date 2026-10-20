@@ -245,6 +245,7 @@ class Rollout(NamedTuple):
     circuit: str
     cost: float = float('nan')          # implied normalised lap time (C3's objective)
     shortfall: float = float('nan')     # 1 - progress (C3's constraint channel)
+    contacts: int = 0                   # scan-derived wall contacts, AutoDRIVE only (D57)
 
 
 def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None, normalize=False,
@@ -283,6 +284,7 @@ def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None, normalize=False
         apply_gains(to_real(u))
     iface.reset()
     start_laps, start_col = iface.laps, iface.collisions
+    start_ct = getattr(iface, 'contacts', 0)
     # Time laps OURSELVES rather than trusting the simulator's last_lap_time. Resetting
     # mid-lap corrupts its bookkeeping -- it has been observed returning NEGATIVE
     # durations -- and every rollout here begins with a reset. The simulator runs at 1x
@@ -333,7 +335,8 @@ def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None, normalize=False
                    # whose progress lags or is unreported -- caught by the stub, which
                    # completes laps without reporting progress at all.
                    shortfall=0.0 if len(lap_times) >= laps_wanted
-                   else 1.0 - min(prog, 1.0))
+                   else 1.0 - min(prog, 1.0),
+                   contacts=getattr(iface, 'contacts', 0) - start_ct)
 
 
 # -------------------------------------------------------------- multi-circuit measurement

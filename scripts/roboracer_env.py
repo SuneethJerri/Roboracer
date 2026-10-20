@@ -136,6 +136,36 @@ def reward_progress(prev, cur, collision_penalty=5.0, progress_scale=100.0,
 
 
 # ----------------------------------------------------------------- ROS 2 interface
+class ContactCounter:
+    """D57: wall contacts derived from the scan, because the simulator's counter is dead on
+    the v4 track copies (R78). One event per rising edge of `min(scan) < on_m`, released
+    only after the minimum stays above `off_m` for `hold_s`, so a held contact is one event.
+    """
+
+    def __init__(self, on_m=0.20, off_m=0.25, hold_s=0.5):
+        self.on_m, self.off_m, self.hold_s = on_m, off_m, hold_s
+        self.events, self.times = 0, []
+        self._in, self._clear_since = False, None
+
+    def update(self, ranges, t):
+        r = np.asarray(ranges, dtype=float)
+        r = r[np.isfinite(r) & (r > 0)]
+        if not r.size:
+            return
+        m = float(r.min())
+        if not self._in:
+            if m < self.on_m:
+                self._in, self._clear_since = True, None
+                self.events += 1
+                self.times.append(t)
+        elif m <= self.off_m:
+            self._clear_since = None
+        elif self._clear_since is None:
+            self._clear_since = t
+        elif t - self._clear_since >= self.hold_s:
+            self._in = False
+
+
 class RoboRacerInterface:
     """Latest-message cache over the bridge topics, plus the reset handshake."""
 
@@ -172,10 +202,12 @@ class RoboRacerInterface:
         self.sim_lap_counts = 0
         self.laps = 0
         self.collisions = 0
+        self._contact = ContactCounter()
         self._new_scan = threading.Event()
 
         def on_scan(m):
             self.scan = np.asarray(m.ranges, dtype=float)
+            self._contact.update(self.scan, time.time())
             self.angle_min = float(m.angle_min)
             self.angle_increment = float(m.angle_increment)
             self._new_scan.set()
@@ -332,6 +364,12 @@ class RoboRacerInterface:
                 # Off the corridor there is no evidence of progress, and crediting the
                 # argmin anyway is what let a wrong-way car walk round the loop (B26).
                 self._prog_idx = max(self._prog_idx, lo + k)
+
+    @property
+    def contacts(self):
+        """Scan-derived contact events since the interface started (D57). Monotone, like
+        `collisions`; rollout() takes the difference."""
+        return self._contact.events
 
     def now(self):
         """Wall clock. AutoDRIVE runs at 1x real time, so this IS simulator time --
@@ -730,6 +768,32 @@ def selftest():
         assert RoboRacerInterface.CENTERLINE == keep, 'a failed switch must not move it'
     finally:
         RoboRacerInterface.CENTERLINE, RoboRacerInterface._cl_cache = keep, None
+
+    # D57: a held contact is one event, two separated contacts are two, and a dip that
+    # clears for less than hold_s does not re-arm.
+    far, near = np.full(10, 3.0), np.r_[np.full(9, 3.0), 0.15]
+    cc = ContactCounter()
+    for i in range(30):                       # 0.0-2.9 s, pinned to the wall the whole time
+        cc.update(near, i * 0.1)
+    assert cc.events == 1, f'a held contact must count once, got {cc.events}'
+    cc = ContactCounter()
+    seq = [near] * 3 + [far] * 10 + [near] * 3        # clear for 1.0 s between the two
+    for i, sc in enumerate(seq):
+        cc.update(sc, i * 0.1)
+    assert cc.events == 2 and cc.times == [0.0, 1.3], (cc.events, cc.times)
+    cc = ContactCounter()
+    seq = [near] * 3 + [far] * 3 + [near] * 3         # clear for only 0.3 s
+    for i, sc in enumerate(seq):
+        cc.update(sc, i * 0.1)
+    assert cc.events == 1, 'a brief clearance must not count a second contact'
+    cc = ContactCounter()
+    band = np.r_[np.full(9, 3.0), 0.22]               # inside the hysteresis band, 1.0 s
+    for i, sc in enumerate([near] * 3 + [band] * 10 + [near] * 3):
+        cc.update(sc, i * 0.1)
+    assert cc.events == 1, 'scraping along between on_m and off_m is one contact'
+    cc = ContactCounter()
+    cc.update(np.r_[np.full(9, np.inf), 0.0], 0.0)    # no-return beams are not contact
+    assert cc.events == 0
 
     print('selftest OK')
 
