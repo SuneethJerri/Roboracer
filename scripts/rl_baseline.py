@@ -72,6 +72,28 @@ class FtgBase:
         return ftg.plan(iface.scan, iface.angle_min, iface.angle_increment)
 
 
+CURV_WIN = ((0.0, 5.0), (5.0, 10.0), (10.0, 20.0))   # D51: metres ahead, R67's windows
+CURV_SCALE = 0.2    # tanh(k / 0.2): R67's eased-off steps sat at max |k| ~0.5
+
+
+def curv_feats(iface):
+    """D51, a fork of the frozen 57-dim contract: signed centreline curvature, mean over
+    each window ahead of the car, squashed into [-1, 1]. f1tenth only -- the ROS stack has
+    no centreline."""
+    tr = iface.env.unwrapped.track
+    if not hasattr(iface, '_curv'):
+        c = tr.centerline
+        iface._curv = (np.asarray(c.ss, float), np.asarray(c.ks, float), iface.track_length())
+    ss, ks, L = iface._curv
+    x, y, th = (float(iface._obs[k][0]) for k in ('poses_x', 'poses_y', 'poses_theta'))
+    s, _, _ = tr.cartesian_to_frenet(x, y, th)
+    ds = float(np.median(np.diff(ss)))
+    i = int(np.searchsorted(ss, s % L))
+    return np.array([np.tanh(ks[(i + np.arange(int(a / ds), max(int(b / ds), int(a / ds) + 1)))
+                                 % len(ks)].mean() / CURV_SCALE) for a, b in CURV_WIN],
+                    dtype=np.float32)
+
+
 ALIGN_K = 100.0     # D49: scale of both the potential and the terminal cost, = progress_scale
 
 
@@ -92,7 +114,8 @@ def max_steps_for(track, budget=LAP_BUDGET, action_repeat=ACTION_REPEAT):
 
 def make_track_env(track, reward_fn=RE.reward_progress, budget=LAP_BUDGET,
                    action_repeat=ACTION_REPEAT, random_start=False, seed=0,
-                   base_act=None, resid_scale=RESID_SCALE, aligned=False, gamma=GAMMA):
+                   base_act=None, resid_scale=RESID_SCALE, aligned=False, gamma=GAMMA,
+                   curv=False):
     import gymnasium as gym
     from stable_baselines3.common.monitor import Monitor
 
@@ -103,6 +126,17 @@ def make_track_env(track, reward_fn=RE.reward_progress, budget=LAP_BUDGET,
             from f1tenth_gym.envs.base_classes import RaceCar
             iface = self.env.unwrapped.iface
             return (iface.map_name, RaceCar.scan_simulator.track.spec.name)
+
+    class Curv(gym.ObservationWrapper):
+        """D51: the 57-dim observation plus `curv_feats`, the same function policy_act uses."""
+
+        def __init__(self, env):
+            super().__init__(env)
+            n = env.observation_space.shape[0] + len(CURV_WIN)
+            self.observation_space = gym.spaces.Box(-1.0, 1.0, (n,), dtype=np.float32)
+
+        def observation(self, obs):
+            return np.concatenate([obs, curv_feats(self.env.unwrapped.iface)]).astype(np.float32)
 
     class Aligned(gym.Wrapper):
         """D49: replace the reward with gamma*Phi(s') - Phi(s), Phi = ALIGN_K * progress
@@ -141,6 +175,8 @@ def make_track_env(track, reward_fn=RE.reward_progress, budget=LAP_BUDGET,
     # SB3's Monitor is what fills ep_rew_mean / ep_len_mean. Without it a run prints
     # losses and no episode statistics at all, so there is no way to tell a policy that
     # is learning from one standing still until the final evaluation.
+    if curv:
+        env = Curv(env)
     return MapCheck(Monitor(Aligned(env) if aligned else env))
 
 
@@ -156,7 +192,7 @@ def check_workers(venv, tracks):
 
 
 def policy_act(model, max_speed=F1.MAX_SPEED_MPS, action_repeat=ACTION_REPEAT,
-               base=None, resid_scale=RESID_SCALE):
+               base=None, resid_scale=RESID_SCALE, curv=False):
     """`act(iface)` for rollout(). Rebuilds the training observation exactly, including
     the previous action, so evaluation and training see the same input. One closure per
     rollout: it carries state.
@@ -173,6 +209,8 @@ def policy_act(model, max_speed=F1.MAX_SPEED_MPS, action_repeat=ACTION_REPEAT,
         nonlocal prev, held, n
         if n % action_repeat == 0:
             obs = RE.build_obs(iface.scan, iface.speed, prev, max_speed=max_speed)
+            if curv:
+                obs = np.concatenate([obs, curv_feats(iface)]).astype(np.float32)
             a, _ = model.predict(obs, deterministic=True)
             held = np.clip(np.asarray(a, dtype=float), -1.0, 1.0)
             if base is None:
@@ -205,7 +243,8 @@ def worker_tracks(tracks=None, envs=0):
 def train(steps, out, tracks=None, envs=0, seed=0, n_steps=512, warm_from=None,
           gamma=GAMMA, batch_size=512, device='cpu', action_repeat=ACTION_REPEAT,
           random_start=True, step_cost=STEP_COST, base=None,
-          resid_scale=RESID_SCALE, reward='progress', collision_penalty=5.0, algo='ppo'):
+          resid_scale=RESID_SCALE, reward='progress', collision_penalty=5.0, algo='ppo',
+          curv=False):
     import functools
     from stable_baselines3 import PPO, SAC
     if algo != 'ppo' and warm_from:
@@ -224,7 +263,7 @@ def train(steps, out, tracks=None, envs=0, seed=0, n_steps=512, warm_from=None,
                                                            base_act=base,
                                                            resid_scale=resid_scale,
                                                            aligned=reward == 'aligned',
-                                                           gamma=gamma))
+                                                           gamma=gamma, curv=curv))
                           for i, t in enumerate(tracks)])
     check_workers(venv, tracks)
     if warm_from:
@@ -250,7 +289,7 @@ def train(steps, out, tracks=None, envs=0, seed=0, n_steps=512, warm_from=None,
           f'random_start {random_start}   device {device}   '
           f'algo {algo}   batch {model.batch_size}   '
           f'{f"n_steps {model.n_steps}   " if algo == "ppo" else ""}'
-          f'reward {reward}   '
+          f'reward {reward}   obs {"curv" if curv else "base"}   '
           f'{"" if reward == "aligned" else f"step_cost {step_cost}   "}'
           f'{"" if reward == "aligned" else f"collision_penalty {collision_penalty}   "}'
           f'base {"FTG " + str(np.round(base.gains, 4)) if base else "none"}'
@@ -263,7 +302,8 @@ def train(steps, out, tracks=None, envs=0, seed=0, n_steps=512, warm_from=None,
 
 
 def evaluate(path, test=False, timeout=250.0, action_repeat=ACTION_REPEAT,
-             base=None, resid_scale=RESID_SCALE, fresh=False, rev=False, algo='ppo'):
+             base=None, resid_scale=RESID_SCALE, fresh=False, rev=False, algo='ppo',
+             curv=False):
     """Score a trained policy circuit by circuit, through rollout() and nothing else.
 
     The midpoint control rides along on every circuit: those gains ARE the frozen
@@ -280,7 +320,7 @@ def evaluate(path, test=False, timeout=250.0, action_repeat=ACTION_REPEAT,
         iface = F1.F1TenthInterface(t)
         r = S.rollout(iface, None,
                       act=policy_act(model, action_repeat=action_repeat, base=base,
-                                     resid_scale=resid_scale),
+                                     resid_scale=resid_scale, curv=curv),
                       timeout=timeout, normalize=True)
         ctl = S.rollout(iface, np.full(S.P, 0.5), timeout=timeout, normalize=True)
         iface.close()
@@ -456,6 +496,9 @@ def main(argv):
     ap.add_argument('--step-cost', type=float, default=STEP_COST,
                     help='living cost per DECISION. Break-even speed is '
                          'length*cost/100, so 0.05 reaches racing pace itself (B22)')
+    ap.add_argument('--obs', default='base', choices=['base', 'curv'],
+                    help='curv (D51): fork of the 57-dim contract with 3 curvature-ahead '
+                         'channels; f1tenth only. Pass it to --eval too')
     ap.add_argument('--algo', default='ppo', choices=['ppo', 'sac'],
                     help='D32 #11: SAC at matched simulator steps; pass it to --eval too')
     ap.add_argument('--collision-penalty', type=float, default=5.0,
@@ -476,10 +519,12 @@ def main(argv):
               device=o.device, action_repeat=o.action_repeat,
               random_start=not o.fixed_start, batch_size=o.batch_size,
               step_cost=o.step_cost, base=base, resid_scale=o.resid_scale,
-              reward=o.reward, collision_penalty=o.collision_penalty, algo=o.algo)
+              reward=o.reward, collision_penalty=o.collision_penalty, algo=o.algo,
+              curv=o.obs == 'curv')
     elif o.eval:
         evaluate(o.eval, test=o.test, timeout=o.timeout, action_repeat=o.action_repeat,
-                 base=base, resid_scale=o.resid_scale, fresh=o.fresh, rev=o.rev, algo=o.algo)
+                 base=base, resid_scale=o.resid_scale, fresh=o.fresh, rev=o.rev, algo=o.algo,
+                 curv=o.obs == 'curv')
     else:
         ap.error('one of --selftest, --train, --eval')
 
