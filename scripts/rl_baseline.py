@@ -205,9 +205,11 @@ def worker_tracks(tracks=None, envs=0):
 def train(steps, out, tracks=None, envs=0, seed=0, n_steps=512, warm_from=None,
           gamma=GAMMA, batch_size=512, device='cpu', action_repeat=ACTION_REPEAT,
           random_start=True, step_cost=STEP_COST, base=None,
-          resid_scale=RESID_SCALE, reward='progress', collision_penalty=5.0):
+          resid_scale=RESID_SCALE, reward='progress', collision_penalty=5.0, algo='ppo'):
     import functools
-    from stable_baselines3 import PPO
+    from stable_baselines3 import PPO, SAC
+    if algo != 'ppo' and warm_from:
+        raise ValueError('warm starts are PPO-only')
     from stable_baselines3.common.vec_env import SubprocVecEnv
     tracks = worker_tracks(tracks, envs)
     # partial, not a closure: SubprocVecEnv pickles the factory to each worker.
@@ -239,12 +241,15 @@ def train(steps, out, tracks=None, envs=0, seed=0, n_steps=512, warm_from=None,
         # device stays CPU by measurement, not assumption -- R33 puts the Amdahl ceiling
         # for any accelerator at 2.04x and a CUDA launch above the CPU cost at batch 14.
         model = PPO('MlpPolicy', venv, n_steps=n_steps, seed=seed, verbose=1,
-                    gamma=gamma, batch_size=batch_size, device=device)
+                    gamma=gamma, batch_size=batch_size, device=device) if algo == 'ppo' \
+            else SAC('MlpPolicy', venv, seed=seed, verbose=1, gamma=gamma, device=device,
+                     buffer_size=1_000_000, learning_starts=10_000)
     gamma = float(model.gamma)      # read back from the model: the argument is a request
     print(f'gamma {gamma} -> horizon {1/(1-gamma):.0f} decisions = '
           f'{1/(1-gamma)*F1.DT*action_repeat:.1f}s   action_repeat {action_repeat}   '
           f'random_start {random_start}   device {device}   '
-          f'batch {model.batch_size}   n_steps {model.n_steps}   '
+          f'algo {algo}   batch {model.batch_size}   '
+          f'{f"n_steps {model.n_steps}   " if algo == "ppo" else ""}'
           f'reward {reward}   '
           f'{"" if reward == "aligned" else f"step_cost {step_cost}   "}'
           f'{"" if reward == "aligned" else f"collision_penalty {collision_penalty}   "}'
@@ -258,15 +263,15 @@ def train(steps, out, tracks=None, envs=0, seed=0, n_steps=512, warm_from=None,
 
 
 def evaluate(path, test=False, timeout=250.0, action_repeat=ACTION_REPEAT,
-             base=None, resid_scale=RESID_SCALE, fresh=False, rev=False):
+             base=None, resid_scale=RESID_SCALE, fresh=False, rev=False, algo='ppo'):
     """Score a trained policy circuit by circuit, through rollout() and nothing else.
 
     The midpoint control rides along on every circuit: those gains ARE the frozen
     baseline point, so they must read exactly 1.0000. It costs one rollout per circuit
     and it is what caught B1 and B7.
     """
-    from stable_baselines3 import PPO
-    model = PPO.load(path, device='cpu')
+    from stable_baselines3 import PPO, SAC
+    model = (PPO if algo == 'ppo' else SAC).load(path, device='cpu')
     label = 'REVERSED' if rev else 'FRESH' if fresh else 'TEST' if test else 'TRAIN'
     pool = getattr(circuits, label)
     print(f'{os.path.basename(path)} on {len(pool)} {label} circuits')
@@ -451,6 +456,8 @@ def main(argv):
     ap.add_argument('--step-cost', type=float, default=STEP_COST,
                     help='living cost per DECISION. Break-even speed is '
                          'length*cost/100, so 0.05 reaches racing pace itself (B22)')
+    ap.add_argument('--algo', default='ppo', choices=['ppo', 'sac'],
+                    help='D32 #11: SAC at matched simulator steps; pass it to --eval too')
     ap.add_argument('--collision-penalty', type=float, default=5.0,
                     help='progress reward only; 0 leaves a crash priced by the progress it '
                          'forfeits, which is what the measured cost charges (D50)')
@@ -469,10 +476,10 @@ def main(argv):
               device=o.device, action_repeat=o.action_repeat,
               random_start=not o.fixed_start, batch_size=o.batch_size,
               step_cost=o.step_cost, base=base, resid_scale=o.resid_scale,
-              reward=o.reward, collision_penalty=o.collision_penalty)
+              reward=o.reward, collision_penalty=o.collision_penalty, algo=o.algo)
     elif o.eval:
         evaluate(o.eval, test=o.test, timeout=o.timeout, action_repeat=o.action_repeat,
-                 base=base, resid_scale=o.resid_scale, fresh=o.fresh, rev=o.rev)
+                 base=base, resid_scale=o.resid_scale, fresh=o.fresh, rev=o.rev, algo=o.algo)
     else:
         ap.error('one of --selftest, --train, --eval')
 
