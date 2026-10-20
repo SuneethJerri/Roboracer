@@ -48,15 +48,13 @@ CLR_EXP = 1.0       # exponent on the clearance factor
 # measured itself doing: +0.2 on every command, including above the ceiling.
 THR_OFFSET = 0.0
 
-# The competition deliverable (D42, measured in R62). These are o19-c3_p7 seed 2's final
-# gains -- R55's best cell, C3 at p = 7 -- with GAP_THRESH scaled to 0.80 of its tuned
-# 2.378473, which is the SELECTION step D42 chose instead of capping the search box. It is
-# the only controller in the project feasible both in and out of sample: 17/17 on TRAIN at
-# 0.6641, and a finished lap on Montreal, the one circuit outside the 22 (R62).
-DELIVERABLE = {'FOV': 1.149634, 'BUBBLE_R': 0.489816, 'GAP_THRESH': 1.902778,
-               'MAX_THROTTLE': 0.515671, 'MAX_STEER': 0.609426, 'CLEARANCE': 5.282678,
-               'THR_OFFSET': 0.200000}
-DELIVERABLE_TUNED_GAP = 2.378473      # what GAP_THRESH was before the 0.80 selection
+# The competition deliverable (D46, measured in R66). o29-c3w_p7 seed 0's final gains, as
+# tuned: C3 at p = 7 with THR_OFFSET's box widened to (-0.40, 0.40). 35/35 on TRAIN,
+# Montreal and the reversed circuits, faster than D42's deliverable on all three.
+DELIVERABLE = {'FOV': 0.943708, 'BUBBLE_R': 0.311586, 'GAP_THRESH': 2.156371,
+               'MAX_THROTTLE': 0.480048, 'MAX_STEER': 0.651753, 'CLEARANCE': 5.956598,
+               'THR_OFFSET': 0.260109}
+DELIVERABLE_THR_BOX = (-0.40, 0.40)   # the box it was tuned in (D45)
 
 SCAN_TOPIC = '/autodrive/roboracer_1/lidar'
 LAPCOUNT_TOPIC = '/autodrive/roboracer_1/lap_count'
@@ -170,13 +168,12 @@ def selftest():
     s, t = plan(bad, amin, inc)
     assert np.isfinite(s) and np.isfinite(t)
 
-    # D42: the deliverable is a named point, so its provenance is asserted rather than
-    # remembered -- every key must be a real tunable, and GAP_THRESH must be exactly the
-    # 0.80 selection of the tuned value R55 ended at. A later edit cannot silently change
-    # what "the deliverable" means.
+    # D42/D46: the deliverable is a named point, so its provenance is asserted rather than
+    # remembered -- every key must be a real tunable, and the offset must be one only the
+    # widened box could reach. A later edit cannot silently change what it means.
     assert set(DELIVERABLE) <= set(globals()), 'a deliverable key is not a tunable'
-    assert abs(DELIVERABLE['GAP_THRESH'] - 0.80 * DELIVERABLE_TUNED_GAP) < 1e-6
-    assert DELIVERABLE['THR_OFFSET'] == 0.20, 'the tuned offset sat on its box ceiling'
+    lo, hi = DELIVERABLE_THR_BOX
+    assert 0.20 < DELIVERABLE['THR_OFFSET'] < hi and lo == -hi, 'D46: tuned past the old 0.20'
     _saved = {k: globals()[k] for k in DELIVERABLE}
     try:
         base = plan(np.full(n, 8.0), amin, inc)
@@ -261,7 +258,7 @@ def apply_overrides(argv):
     p.add_argument('--max-steer', type=float, default=MAX_STEER)
     p.add_argument('--clearance', type=float, default=CLEARANCE)
     p.add_argument('--deliverable', action='store_true',
-                   help='drive the D42 deliverable gains, overriding the individual gain '
+                   help='drive the D46 deliverable gains, overriding the individual gain '
                         'flags above')
     p.add_argument('--flip', action='store_true', help='invert steering sign')
     p.add_argument('--log', default=None,
@@ -277,7 +274,7 @@ def apply_overrides(argv):
         g['STEER_SIGN'] = -STEER_SIGN
     if a.deliverable:
         g.update(DELIVERABLE)           # last word, by design: see --deliverable's help
-        print('deliverable gains (D42/R62): ' +
+        print('deliverable gains (D46/R66): ' +
               ' '.join(f'{k}={v}' for k, v in DELIVERABLE.items()))
     print(f'fov={FOV} bubble={BUBBLE_R} gap={GAP_THRESH} '
           f'throttle={MAX_THROTTLE} offset={THR_OFFSET} sign={STEER_SIGN:+.0f}')
