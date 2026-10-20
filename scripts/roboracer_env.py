@@ -203,7 +203,8 @@ class RoboRacerInterface:
         self.sim_lap_counts = 0
         self.laps = 0
         self.collisions = 0
-        self._col_raw = None
+        self._col_raw = self._last_tick = None
+        self.contacts = 0                       # counter episodes (D60)
         self._contact = ContactCounter()
         self._new_scan = threading.Event()
 
@@ -367,18 +368,26 @@ class RoboRacerInterface:
                 # argmin anyway is what let a wrong-way car walk round the loop (B26).
                 self._prog_idx = max(self._prog_idx, lo + k)
 
-    def _on_collision(self, v):
+    CONTACT_GAP_S = 1.5     # ticks closer than this are one contact (D58, R80)
+
+    def _on_collision(self, v, t=None):
         """B37: a running total of the counter's increases. The reset zeroes the simulator's
         counter, and that drop can land after rollout() has read its start, so a raw read
-        differenced against a stale start came out negative and was clamped to 0."""
+        differenced against a stale start came out negative and was clamped to 0.
+
+        D60: `contacts` groups the ticks into episodes, because a held contact ticks every
+        ~1.75 s (R80) and the constraint is about hitting walls, not dwelling on them."""
         if self._col_raw is not None and v > self._col_raw:
             self.collisions += v - self._col_raw
+            t = time.time() if t is None else t
+            if self._last_tick is None or t - self._last_tick >= self.CONTACT_GAP_S:
+                self.contacts += 1
+            self._last_tick = t
         self._col_raw = v
 
     @property
-    def contacts(self):
-        """Scan-derived contact events since the interface started (D57). Monotone, like
-        `collisions`; rollout() takes the difference."""
+    def scan_contacts(self):
+        """Scan-derived contact events (D57). Failed as a collision measure (R81): not cited."""
         return self._contact.events
 
     def now(self):
@@ -806,10 +815,18 @@ def selftest():
     assert cc.events == 0
 
     # B37: the counter's total survives the reset's drop to zero, whenever it lands.
-    fake = types.SimpleNamespace(collisions=0, _col_raw=None)
+    fake = types.SimpleNamespace(collisions=0, contacts=0, _col_raw=None, _last_tick=None,
+                                 CONTACT_GAP_S=RoboRacerInterface.CONTACT_GAP_S)
     for v in (0, 3, 13, 13, 0, 4, 10):                # rep 1 ends at 13, the reset zeroes it
-        RoboRacerInterface._on_collision(fake, v)
+        RoboRacerInterface._on_collision(fake, v, t=0.0)
     assert fake.collisions == 23, fake.collisions
+    # D60: ticks 1.0 s apart are one contact, a 2.0 s gap starts another, and a repeated
+    # value is not a tick.
+    fake = types.SimpleNamespace(collisions=0, contacts=0, _col_raw=None, _last_tick=None,
+                                 CONTACT_GAP_S=RoboRacerInterface.CONTACT_GAP_S)
+    for v, t in ((0, 0.0), (1, 1.0), (2, 2.0), (2, 3.0), (3, 3.1), (4, 5.1), (5, 5.2)):
+        RoboRacerInterface._on_collision(fake, v, t=t)
+    assert (fake.collisions, fake.contacts) == (5, 2), (fake.collisions, fake.contacts)
 
     print('selftest OK')
 

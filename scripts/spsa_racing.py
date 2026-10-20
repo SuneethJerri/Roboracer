@@ -245,7 +245,7 @@ class Rollout(NamedTuple):
     circuit: str
     cost: float = float('nan')          # implied normalised lap time (C3's objective)
     shortfall: float = float('nan')     # 1 - progress (C3's constraint channel)
-    contacts: int = 0                   # scan-derived wall contacts, AutoDRIVE only (D57)
+    contacts: int = 0                   # collision-counter episodes, AutoDRIVE only (D60)
 
 
 def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None, normalize=False,
@@ -266,8 +266,10 @@ def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None, normalize=False
     circuit = getattr(iface, 'map_name', '')
     base = None
     if normalize:
-        import circuits          # lazy: this module still runs with no map infrastructure
-        base = circuits.baseline(circuit)
+        base = getattr(iface, 'ref_lap_s', None)    # D60: AutoDRIVE has no D5 baseline
+        if base is None:
+            import circuits      # lazy: this module still runs with no map infrastructure
+            base = circuits.baseline(circuit)
         if timeout <= base:
             # B2 in code rather than in a notebook entry. Below the circuit's own
             # baseline lap, every rollout fails on the clock and the objective measures
@@ -556,12 +558,17 @@ def violation(rollouts, delta=DELTA, graded=False):
     return float(np.mean([min(1.0, r.shortfall / delta) for r in rollouts]))
 
 
+def contact_rate(rollouts, laps, beta):
+    """D60's constraint channel: mean contact episodes per lap wanted, over beta. <= 1 holds."""
+    return float(np.mean([r.contacts for r in rollouts])) / laps / beta
+
+
 def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=None,
                      seed=0, out=None, max_step=0.10, timeout=250.0, alpha=0.02,
                      lam0=1.0, tracks_per_iter=2, start=None, lam_every=LAM_EVERY,
                      delta=DELTA, family='bernoulli', accumulate_g=False,
                      graded_g=False, c_adapt=0.0, restart=False, sf_m=0, sf_sigma=0.16,
-                     one_meas=False):
+                     one_meas=False, tracks=None, beta=None, mu0=0.0):
     """Primal-dual SPSA on a constrained racing problem (notebook C3).
 
         minimise   J(theta)  = E_M[ implied_lap(theta, M) / baseline(M) ]
@@ -622,10 +629,13 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
     BhatnagarFuMarcusWang2003. With `family='hadamard'` the `L(theta)` term cancels exactly
     over each period; with Bernoulli only in expectation.
 
-    ponytail: one constraint. Collisions are the obvious second (and `Rollout.collisions`
-    is already carried for it), but D7's warning about interacting schedules is real --
-    every extra multiplier is another timescale to separate. Add it when the completion
-    constraint is shown to hold.
+    `beta` adds the second constraint (D60): contacts per lap <= beta, as
+    `H = mean(contacts per lap) / beta <= 1`, with its own multiplier `mu` stepped on the
+    same slow tick as `lambda` and from the same block. Given theta the two duals do not
+    interact, so this adds no timescale (D57). Normalised by beta so `H - 1` has the
+    completion channel's scale and `B_GAIN` applies to both. Two-probe estimator only.
+
+    `tracks` fixes the draw for every iteration, for a single-track backend (AutoDRIVE).
     """
     import circuits
     if out is None:
@@ -642,11 +652,12 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
     srng = np.random.default_rng([seed, 8])         # SF probes (D36)
     assert not (sf_m and (c_adapt or restart)), 'sf_m is its own estimator (D36)'
     assert not (one_meas and (sf_m or c_adapt or restart)), 'one_meas is its own (D37)'
+    assert beta is None or (beta > 0 and not (sf_m or one_meas)), 'beta: two-probe only (D60)'
     u = np.array([0.5] * P) if start is None else np.asarray(start, dtype=float)
     print('start (unit):', np.round(u, 4),
           '= box midpoint' if start is None else '= --start', flush=True)   # B10
-    lam = float(lam0)
-    gacc = []                       # constraint samples since the last dual update (D25)
+    lam, mu = float(lam0), float(mu0)
+    gacc, hacc = [], []             # constraint samples since the last dual update (D25)
     cmul = 1.0                      # C4's radius multiplier; stays 1.0 unless c_adapt
     # Iterations each coordinate spent pinned to a box face (audit F5 / D42). The projection
     # is silent otherwise: R30's infeasible arm spent 62% of 200 iterations on BUBBLE_R's
@@ -656,7 +667,8 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
 
     fields = (['iter', 'a_n', 'b_n', 'c_n', 'lam'] + [n for n, _, _ in GAINS]
               + ['L_plus', 'L_minus', 'J_plus', 'J_minus', 'G_plus', 'G_minus',
-                 'G_hat', 'G_dual', 'feas_plus', 'feas_minus', 'circuits', 'family'])
+                 'G_hat', 'G_dual', 'feas_plus', 'feas_minus', 'circuits', 'family']
+              + (['mu', 'H_plus', 'H_minus'] if beta else []))
     with open(out, 'w', newline='') as fh:
         w = csv.DictWriter(fh, fieldnames=fields)
         w.writeheader()
@@ -664,14 +676,15 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
             an = a / (n + 1 + A_stab) ** ALPHA
             cn = cmul * c / (n + 1) ** GAMMA
             d = pert(n, rng)
-            tracks = circuits.sample(tracks_per_iter, trng)      # CRN, both arms (D4)
+            draw = (tuple(tracks) if tracks else
+                    circuits.sample(tracks_per_iter, trng))      # CRN, both arms (D4)
             if sf_m:                                             # D36: J_sigma
                 cn = sf_sigma
-                mm = measure(pool, u, tracks, laps, timeout)
+                mm = measure(pool, u, draw, laps, timeout)
                 Gm = violation(mm.rollouts, delta, graded_g)
                 Lm = mm.cost + lam * (Gm - alpha)
                 ds = srng.standard_normal((sf_m, P))
-                ms = [measure(pool, u + cn * di, tracks, laps, timeout) for di in ds]
+                ms = [measure(pool, u + cn * di, draw, laps, timeout) for di in ds]
                 Gs = [violation(x.rollouts, delta, graded_g) for x in ms]
                 Ls = [x.cost + lam * (g - alpha) for x, g in zip(ms, Gs)]
                 g = sum(di * (Li - Lm) for di, Li in zip(ds, Ls)) / (cn * sf_m)
@@ -681,17 +694,22 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
                                     feasible=all(x.feasible for x in ms))
                 Gp, Lp = float(np.mean(Gs)), float(np.mean(Ls))
             elif one_meas:                                       # D37
-                mp = mm = measure(pool, u + cn * d, tracks, laps, timeout)
+                mp = mm = measure(pool, u + cn * d, draw, laps, timeout)
                 Gp = Gm = violation(mp.rollouts, delta, graded_g)
                 Lp, Lm = mp.cost + lam * (Gp - alpha), float('nan')
                 u = np.clip(u - np.clip(an * Lp / (cn * d), -max_step, max_step), 0.0, 1.0)
             else:
-                mp = measure(pool, u + cn * d, tracks, laps, timeout)
-                mm = measure(pool, u - cn * d, tracks, laps, timeout)
+                mp = measure(pool, u + cn * d, draw, laps, timeout)
+                mm = measure(pool, u - cn * d, draw, laps, timeout)
                 Gp, Gm = (violation(mp.rollouts, delta, graded_g),
                           violation(mm.rollouts, delta, graded_g))
                 Lp = mp.cost + lam * (Gp - alpha)
                 Lm = mm.cost + lam * (Gm - alpha)
+                if beta:                                         # D60
+                    Hp = contact_rate(mp.rollouts, laps, beta)
+                    Hm = contact_rate(mm.rollouts, laps, beta)
+                    Lp += mu * (Hp - 1.0)
+                    Lm += mu * (Hm - 1.0)
             # No both-failed special case, and that reasoning was WRONG -- kept here with
             # its refutation because it is load-bearing. The claim was that implied_lap
             # keeps varying with how far each arm got, so the gradient stays informative
@@ -720,6 +738,8 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
             face += (u <= 1e-12) | (u >= 1.0 - 1e-12)
             Ghat = 0.5 * (Gp + Gm)
             gacc.append(Ghat)
+            if beta:
+                hacc.append(0.5 * (Hp + Hm))
             g_in = ''                   # what the dual was handed, blank on a non-tick
             if n % lam_every == lam_every - 1:                   # the slow timescale
                 j = n // lam_every + 1
@@ -730,7 +750,11 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
                 # averaging recursion D19 names. Default off so recorded runs reproduce.
                 g_in = float(np.mean(gacc)) if accumulate_g else Ghat
                 lam = max(0.0, lam + bn * (g_in - alpha))        # projection onto [0, inf)
+                if beta:
+                    h_in = float(np.mean(hacc)) if accumulate_g else hacc[-1]
+                    mu = max(0.0, mu + bn * (h_in - 1.0))
                 gacc.clear()
+                hacc.clear()
             else:
                 bn = 0.0
 
@@ -739,7 +763,9 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
                    'G_plus': Gp, 'G_minus': Gm, 'G_hat': Ghat, 'G_dual': g_in,
                    'family': family,
                    'feas_plus': int(mp.feasible), 'feas_minus': int(mm.feasible),
-                   'circuits': ';'.join(tracks)}
+                   'circuits': ';'.join(draw)}
+            if beta:
+                row.update({'mu': mu, 'H_plus': Hp, 'H_minus': Hm})
             row.update({nm: v for (nm, _, _), v in zip(GAINS, to_real(u))})
             w.writerow(row)
             fh.flush()
@@ -747,7 +773,7 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
                   f'G={Ghat:6.4f}  lam={lam:7.4f}  feas={int(mp.feasible)}{int(mm.feasible)}',
                   flush=True)
 
-    print(f'\nfinal lambda {lam:.4f};  gains: ' +
+    print(f'\nfinal lambda {lam:.4f}' + (f', mu {mu:.4f}' if beta else '') + ';  gains: ' +
           '  '.join(f'--{nm.lower().replace("_", "-")} {v:.3f}'
                     for (nm, _, _), v in zip(GAINS, to_real(u))))
     # D42 (A): say which bounds the search leaned on, and flag the one coordinate whose
@@ -1120,6 +1146,46 @@ def selftest():
             assert all(float(r['lam']) >= 0.0 for r in rows), 'dual projected onto [0, inf)'
             assert float(rows[-1]['lam']) == 0.0, \
                 'an always-feasible run with alpha > 0 must drive lambda to 0'
+            assert 'mu' not in rows[-1], 'without beta the CSV keeps its recorded columns'
+
+            # D60: contacts per lap grow with gain 1 (4 per lap at unit 1), the bowl wants
+            # 0.3 there (1.2 per lap). beta = 0.6 binds, so mu must rise and pull gain 1
+            # below where the unconstrained run leaves it. Fixed draw, own reference lap.
+            class _Rub(_Bowl):
+                ref_lap_s = 25.0                # about half IMS's D5 baseline
+
+                def __init__(self, track):
+                    super().__init__(track)
+                    self.contacts = 0.0
+
+                def wait_for_scan(self, timeout=None):
+                    self.contacts += 4.0 * to_unit([getattr(ftg, nm) for nm, _, _ in GAINS])[1]
+                    return super().wait_for_scan(timeout)
+
+            fins = {}
+            for tag, bt in (('free', None), ('mu', 0.6)):
+                fp = os.path.join(td, f'rub_{tag}.csv')
+                spsa_constrained(CircuitPool(lambda t: _Rub(t)), iters=40, a=0.05, c=0.05,
+                                 seed=0, timeout=1e9, lam0=0.05, tracks=('IMS',), beta=bt,
+                                 lam_every=2, out=fp)
+                rr = list(csv.DictReader(open(fp)))
+                fins[tag] = to_unit([float(rr[-1][nm]) for nm, _, _ in GAINS])[1]
+                assert all(r['circuits'] == 'IMS' for r in rr), 'tracks= must fix the draw'
+            assert 'mu' in rr[-1] and max(float(r['mu']) for r in rr) > 0, 'mu must rise'
+            assert all(float(r['mu']) >= 0 for r in rr), 'mu projected onto [0, inf)'
+            assert fins['mu'] < fins['free'] - 0.05, \
+                f'the contact constraint must pull gain 1 down: {fins}'
+            assert float(rr[0]['J_plus']) > 1.8, 'ref_lap_s, not the D5 baseline, sets the scale'
+            h0 = to_unit([float(rr[0][nm]) for nm, _, _ in GAINS])[1]   # ~0.5 at the start
+            assert 0.8 * 4 * h0 / 0.6 < float(rr[0]['H_plus']) < 1.2 * 4 * h0 / 0.6, \
+                'H is contacts per lap over beta'
+            # A slack constraint (beta far above the rate) must hold mu at its floor, 0.
+            fp = os.path.join(td, 'rub_slack.csv')
+            spsa_constrained(CircuitPool(lambda t: _Rub(t)), iters=8, a=0.05, c=0.05, seed=0,
+                             timeout=1e9, lam0=0.05, tracks=('IMS',), beta=10.0, lam_every=2,
+                             out=fp)
+            assert all(float(r['mu']) == 0.0 for r in csv.DictReader(open(fp))), \
+                'mu projected onto [0, inf) when the constraint is slack'
 
             # C6: the same loop must run and descend at p = 24, where 18 of the 24
             # coordinates are the neutral extra structure. Catches a length mismatch
