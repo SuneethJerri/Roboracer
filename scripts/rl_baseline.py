@@ -205,13 +205,14 @@ def worker_tracks(tracks=None, envs=0):
 def train(steps, out, tracks=None, envs=0, seed=0, n_steps=512, warm_from=None,
           gamma=GAMMA, batch_size=512, device='cpu', action_repeat=ACTION_REPEAT,
           random_start=True, step_cost=STEP_COST, base=None,
-          resid_scale=RESID_SCALE, reward='progress'):
+          resid_scale=RESID_SCALE, reward='progress', collision_penalty=5.0):
     import functools
     from stable_baselines3 import PPO
     from stable_baselines3.common.vec_env import SubprocVecEnv
     tracks = worker_tracks(tracks, envs)
     # partial, not a closure: SubprocVecEnv pickles the factory to each worker.
-    reward_fn = functools.partial(RE.reward_progress, step_cost=step_cost)
+    reward_fn = functools.partial(RE.reward_progress, step_cost=step_cost,
+                                  collision_penalty=collision_penalty)
     # Each worker gets its own start-pose stream, keyed off the run's seed, or every
     # worker draws the identical sequence of poses and --seed never reaches them (B23).
     venv = SubprocVecEnv([(lambda t=t, i=i: make_track_env(t, action_repeat=action_repeat,
@@ -246,6 +247,7 @@ def train(steps, out, tracks=None, envs=0, seed=0, n_steps=512, warm_from=None,
           f'batch {model.batch_size}   n_steps {model.n_steps}   '
           f'reward {reward}   '
           f'{"" if reward == "aligned" else f"step_cost {step_cost}   "}'
+          f'{"" if reward == "aligned" else f"collision_penalty {collision_penalty}   "}'
           f'base {"FTG " + str(np.round(base.gains, 4)) if base else "none"}'
           f'{f" resid_scale {resid_scale}" if base else ""}', flush=True)
     model.learn(total_timesteps=steps)
@@ -449,6 +451,9 @@ def main(argv):
     ap.add_argument('--step-cost', type=float, default=STEP_COST,
                     help='living cost per DECISION. Break-even speed is '
                          'length*cost/100, so 0.05 reaches racing pace itself (B22)')
+    ap.add_argument('--collision-penalty', type=float, default=5.0,
+                    help='progress reward only; 0 leaves a crash priced by the progress it '
+                         'forfeits, which is what the measured cost charges (D50)')
     ap.add_argument('--reward', default='progress', choices=['progress', 'aligned'],
                     help='aligned (D49): progress as a potential plus the measured cost '
                          'at the end, so the return\'s optimum is the objective\'s')
@@ -464,7 +469,7 @@ def main(argv):
               device=o.device, action_repeat=o.action_repeat,
               random_start=not o.fixed_start, batch_size=o.batch_size,
               step_cost=o.step_cost, base=base, resid_scale=o.resid_scale,
-              reward=o.reward)
+              reward=o.reward, collision_penalty=o.collision_penalty)
     elif o.eval:
         evaluate(o.eval, test=o.test, timeout=o.timeout, action_repeat=o.action_repeat,
                  base=base, resid_scale=o.resid_scale, fresh=o.fresh, rev=o.rev)
