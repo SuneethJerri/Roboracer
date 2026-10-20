@@ -251,6 +251,19 @@ class RoboRacerInterface:
         return self.MIN_PLAUSIBLE_LAP
 
     @classmethod
+    def use_track(cls, slug):
+        """D54: progress along another track's centreline (`data/autodrive_centerline_<slug>.csv`,
+        built from that track's checkpoints, R76). `porto` is the recorded default. Call before
+        the first `progress()`; the cache is per process."""
+        name = ('autodrive_centerline.csv' if slug in (None, '', 'porto')
+                else f'autodrive_centerline_{slug}.csv')
+        path = os.path.join(os.path.dirname(cls.CENTERLINE), name)
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+        cls.CENTERLINE, cls._cl_cache = path, None
+        return path
+
+    @classmethod
     def _centerline(cls):
         """Loaded once per process. Absent file means no progress measure, and
         `progress()` then reports 0.0 -- which `rollout()` tolerates and D11's fourth
@@ -703,6 +716,20 @@ def selftest():
         pass
     else:
         raise AssertionError('a missing progress reading must raise, not default to 0')
+
+    # D54: a track's centreline is selected explicitly, and a missing one must raise rather
+    # than leave progress at the silent 0.0 an absent file otherwise gives.
+    keep = RoboRacerInterface.CENTERLINE
+    try:
+        try:
+            RoboRacerInterface.use_track('no_such_track')
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError('an unknown track must raise')
+        assert RoboRacerInterface.CENTERLINE == keep, 'a failed switch must not move it'
+    finally:
+        RoboRacerInterface.CENTERLINE, RoboRacerInterface._cl_cache = keep, None
 
     print('selftest OK')
 
