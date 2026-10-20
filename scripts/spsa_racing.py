@@ -63,7 +63,9 @@ GAINS_ALL = [('FOV',          0.60, 2.00),
              # O16: the additive offset R50's residual actually used. Centred on 0.0, so
              # the midpoint is still the frozen baseline, and reaching the top of the box
              # is exactly the residual's measured +0.2.
-             ('THR_OFFSET', -0.20, 0.20)]
+             ('THR_OFFSET', -0.20, 0.20),
+             # D48: the clearance let-off on that offset, centred on its no-op 0.
+             ('LETOFF', -1.0, 1.0)]
 GAINS = GAINS_ALL[:6]       # the six gains every run before C6 used, in that order
 P = len(GAINS)
 DIMS = (6, 12, 24)          # p = 6 FTG's own gains; +6 sector thresholds; +12 more
@@ -771,7 +773,7 @@ def selftest():
     # C6 (D28). The six original gains must stay first and unchanged, or no recorded run
     # reproduces; and every ADDED gain's box must be centred on the value at which it is
     # a no-op, which is what makes the p=24 midpoint the same controller as the p=6 one.
-    assert GAINS == GAINS_ALL[:6] and len(GAINS_ALL) == 26
+    assert GAINS == GAINS_ALL[:6] and len(GAINS_ALL) == 27   # 26 + D48's LETOFF
     for nm, lo, hi in GAINS_ALL[6:]:
         assert 0.5 * (lo + hi) == getattr(ftg, nm), \
             f'{nm}: box centre {0.5*(lo+hi)} is not the neutral value {getattr(ftg, nm)}'

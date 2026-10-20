@@ -47,6 +47,9 @@ CLR_EXP = 1.0       # exponent on the clearance factor
 # multiplicative or clearance-scaled, so none of them can express what R50's residual
 # measured itself doing: +0.2 on every command, including above the ceiling.
 THR_OFFSET = 0.0
+# D48/R67: scale the offset by forward clearance, 1 - LETOFF * (1 - clearance). 0 is the
+# unconditional offset; 1 lets it off fully when the way ahead is short.
+LETOFF = 0.0
 
 # The competition deliverable (D46, measured in R66). o29-c3w_p7 seed 0's final gains, as
 # tuned: C3 at p = 7 with THR_OFFSET's box widened to (-0.40, 0.40). 35/35 on TRAIN,
@@ -128,7 +131,9 @@ def plan(ranges, angle_min, angle_increment):
     t = float(np.clip(throttle, MIN_THROTTLE * clearance * thr_b, MAX_THROTTLE))
     # Adding exactly 0.0 and clipping a value already inside [0, 1] is the identity, so
     # this is bit-for-bit the old return when the offset is neutral.
-    return steer_cmd, float(np.clip(t + THR_OFFSET, 0.0, 1.0))
+    # 1 - 0.0 * x is exactly 1.0, so LETOFF = 0 keeps this bit-for-bit as well.
+    off = THR_OFFSET * (1.0 - LETOFF * (1.0 - clearance))
+    return steer_cmd, float(np.clip(t + off, 0.0, 1.0))
 
 
 def selftest():
@@ -235,13 +240,21 @@ def selftest():
         assert got2 != want, 'THR_OFFSET is inert'
         assert max(t for _, t in got2) > MAX_THROTTLE, \
             'the offset must be able to exceed the MAX_THROTTLE ceiling'
+        # D48: LETOFF only scales the offset -- inert without one, never more throttle
+        # than the plain offset at 1, never less than t at full let-off with no clearance.
+        g['LETOFF'] = 1.0
+        got3 = [plan(s, amin, inc) for s in cases]
+        assert got3 != got2, 'LETOFF is inert'
+        assert all(a[1] <= b[1] for a, b in zip(got3, got2)), 'a let-off cannot add throttle'
         g['THR_OFFSET'] = 0.0
+        assert [plan(s, amin, inc) for s in cases] == want, 'LETOFF must be inert at no offset'
+        g['LETOFF'] = 0.0
     finally:
         for i in range(1, SECTORS + 1):
             g[f'GAP_S{i}'], g[f'RNG_S{i}'] = 1.0, 1.0
         for i in range(1, 5):
             g[f'THR_B{i}'] = 1.0
-        g['STEER_EXP'], g['CLR_EXP'], g['THR_OFFSET'] = 2.0, 1.0, 0.0
+        g['STEER_EXP'], g['CLR_EXP'], g['THR_OFFSET'], g['LETOFF'] = 2.0, 1.0, 0.0, 0.0
     print('selftest OK')
 
 
