@@ -25,6 +25,7 @@ import os
 import sys
 import threading
 import time
+import types
 
 import numpy as np
 
@@ -202,6 +203,7 @@ class RoboRacerInterface:
         self.sim_lap_counts = 0
         self.laps = 0
         self.collisions = 0
+        self._col_raw = None
         self._contact = ContactCounter()
         self._new_scan = threading.Event()
 
@@ -226,7 +228,7 @@ class RoboRacerInterface:
             lambda m: setattr(self, 'last_lap_time', float(m.data)), qos)
         self.node.create_subscription(Int32, LAPCOUNT_TOPIC, self._on_lapcount, qos)
         self.node.create_subscription(
-            Int32, COLLISION_TOPIC, lambda m: setattr(self, 'collisions', int(m.data)), qos)
+            Int32, COLLISION_TOPIC, lambda m: self._on_collision(int(m.data)), qos)
 
         self._pub_t = self.node.create_publisher(Float32, THROTTLE_TOPIC, cmd_qos)
         self._pub_s = self.node.create_publisher(Float32, STEERING_TOPIC, cmd_qos)
@@ -364,6 +366,14 @@ class RoboRacerInterface:
                 # Off the corridor there is no evidence of progress, and crediting the
                 # argmin anyway is what let a wrong-way car walk round the loop (B26).
                 self._prog_idx = max(self._prog_idx, lo + k)
+
+    def _on_collision(self, v):
+        """B37: a running total of the counter's increases. The reset zeroes the simulator's
+        counter, and that drop can land after rollout() has read its start, so a raw read
+        differenced against a stale start came out negative and was clamped to 0."""
+        if self._col_raw is not None and v > self._col_raw:
+            self.collisions += v - self._col_raw
+        self._col_raw = v
 
     @property
     def contacts(self):
@@ -794,6 +804,12 @@ def selftest():
     cc = ContactCounter()
     cc.update(np.r_[np.full(9, np.inf), 0.0], 0.0)    # no-return beams are not contact
     assert cc.events == 0
+
+    # B37: the counter's total survives the reset's drop to zero, whenever it lands.
+    fake = types.SimpleNamespace(collisions=0, _col_raw=None)
+    for v in (0, 3, 13, 13, 0, 4, 10):                # rep 1 ends at 13, the reset zeroes it
+        RoboRacerInterface._on_collision(fake, v)
+    assert fake.collisions == 23, fake.collisions
 
     print('selftest OK')
 
