@@ -143,7 +143,7 @@ class ContactCounter:
     only after the minimum stays above `off_m` for `hold_s`, so a held contact is one event.
     """
 
-    def __init__(self, on_m=0.20, off_m=0.25, hold_s=0.5):
+    def __init__(self, on_m=0.38, off_m=0.43, hold_s=0.5):     # fitted on R80 by D59's rule
         self.on_m, self.off_m, self.hold_s = on_m, off_m, hold_s
         self.events, self.times = 0, []
         self._in, self._clear_since = False, None
@@ -782,26 +782,26 @@ def selftest():
     # D57: a held contact is one event, two separated contacts are two, and a dip that
     # clears for less than hold_s does not re-arm.
     far, near = np.full(10, 3.0), np.r_[np.full(9, 3.0), 0.15]
-    cc = ContactCounter()
+    cc = ContactCounter(on_m=0.20, off_m=0.25)
     for i in range(30):                       # 0.0-2.9 s, pinned to the wall the whole time
         cc.update(near, i * 0.1)
     assert cc.events == 1, f'a held contact must count once, got {cc.events}'
-    cc = ContactCounter()
+    cc = ContactCounter(on_m=0.20, off_m=0.25)
     seq = [near] * 3 + [far] * 10 + [near] * 3        # clear for 1.0 s between the two
     for i, sc in enumerate(seq):
         cc.update(sc, i * 0.1)
     assert cc.events == 2 and cc.times == [0.0, 1.3], (cc.events, cc.times)
-    cc = ContactCounter()
+    cc = ContactCounter(on_m=0.20, off_m=0.25)
     seq = [near] * 3 + [far] * 3 + [near] * 3         # clear for only 0.3 s
     for i, sc in enumerate(seq):
         cc.update(sc, i * 0.1)
     assert cc.events == 1, 'a brief clearance must not count a second contact'
-    cc = ContactCounter()
+    cc = ContactCounter(on_m=0.20, off_m=0.25)
     band = np.r_[np.full(9, 3.0), 0.22]               # inside the hysteresis band, 1.0 s
     for i, sc in enumerate([near] * 3 + [band] * 10 + [near] * 3):
         cc.update(sc, i * 0.1)
     assert cc.events == 1, 'scraping along between on_m and off_m is one contact'
-    cc = ContactCounter()
+    cc = ContactCounter(on_m=0.20, off_m=0.25)
     cc.update(np.r_[np.full(9, np.inf), 0.0], 0.0)    # no-return beams are not contact
     assert cc.events == 0
 
