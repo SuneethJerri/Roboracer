@@ -558,9 +558,10 @@ def violation(rollouts, delta=DELTA, graded=False):
     return float(np.mean([min(1.0, r.shortfall / delta) for r in rollouts]))
 
 
-def contact_rate(rollouts, laps, beta):
-    """D60's constraint channel: mean contact episodes per lap wanted, over beta. <= 1 holds."""
-    return float(np.mean([r.contacts for r in rollouts])) / laps / beta
+def contact_rate(rollouts, laps, beta, key='contacts'):
+    """D60's constraint channel: mean `key` per lap wanted, over beta. <= 1 holds. D61 uses
+    'collisions' (counter ticks, i.e. contact time) after R82 found episodes gameable."""
+    return float(np.mean([getattr(r, key) for r in rollouts])) / laps / beta
 
 
 def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=None,
@@ -568,7 +569,7 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
                      lam0=1.0, tracks_per_iter=2, start=None, lam_every=LAM_EVERY,
                      delta=DELTA, family='bernoulli', accumulate_g=False,
                      graded_g=False, c_adapt=0.0, restart=False, sf_m=0, sf_sigma=0.16,
-                     one_meas=False, tracks=None, beta=None, mu0=0.0):
+                     one_meas=False, tracks=None, beta=None, mu0=0.0, h_key='contacts'):
     """Primal-dual SPSA on a constrained racing problem (notebook C3).
 
         minimise   J(theta)  = E_M[ implied_lap(theta, M) / baseline(M) ]
@@ -634,6 +635,9 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
     same slow tick as `lambda` and from the same block. Given theta the two duals do not
     interact, so this adds no timescale (D57). Normalised by beta so `H - 1` has the
     completion channel's scale and `B_GAIN` applies to both. Two-probe estimator only.
+
+    `h_key` names the Rollout field H counts: 'contacts' (episodes, D60) or 'collisions'
+    (ticks, D61).
 
     `tracks` fixes the draw for every iteration, for a single-track backend (AutoDRIVE).
     """
@@ -706,8 +710,8 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
                 Lp = mp.cost + lam * (Gp - alpha)
                 Lm = mm.cost + lam * (Gm - alpha)
                 if beta:                                         # D60
-                    Hp = contact_rate(mp.rollouts, laps, beta)
-                    Hm = contact_rate(mm.rollouts, laps, beta)
+                    Hp = contact_rate(mp.rollouts, laps, beta, h_key)
+                    Hm = contact_rate(mm.rollouts, laps, beta, h_key)
                     Lp += mu * (Hp - 1.0)
                     Lm += mu * (Hm - 1.0)
             # No both-failed special case, and that reasoning was WRONG -- kept here with
@@ -1173,6 +1177,14 @@ def selftest():
                 assert all(r['circuits'] == 'IMS' for r in rr), 'tracks= must fix the draw'
             assert 'mu' in rr[-1] and max(float(r['mu']) for r in rr) > 0, 'mu must rise'
             assert all(float(r['mu']) >= 0 for r in rr), 'mu projected onto [0, inf)'
+            assert contact_rate([Rollout(1, True, 2, 6, 1.0, 'X', contacts=2)], 2, 1.5,
+                                'collisions') == 2.0, 'h_key selects the field H counts'
+            fp = os.path.join(td, 'rub_ticks.csv')                     # the stub never ticks
+            spsa_constrained(CircuitPool(lambda t: _Rub(t)), iters=2, a=0.05, c=0.05, seed=0,
+                             timeout=1e9, tracks=('IMS',), beta=0.6, h_key='collisions',
+                             out=fp)
+            assert all(float(r['H_plus']) == 0.0 for r in csv.DictReader(open(fp))), \
+                'h_key must reach the Lagrangian'
             assert fins['mu'] < fins['free'] - 0.05, \
                 f'the contact constraint must pull gain 1 down: {fins}'
             assert float(rr[0]['J_plus']) > 1.8, 'ref_lap_s, not the D5 baseline, sets the scale'
