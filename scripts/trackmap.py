@@ -226,22 +226,47 @@ class PlanFollower:
         return steer, (-go if back else go)
 
 
-def clean_path(P, max_turn=np.radians(60), ds=0.05, smooth_m=0.3, closed=True):
-    """R101: a recorded mapping path can double back where plan segments join (a zigzag at
-    CDC-TF's hairpin made pure pursuit's nearest point jump backwards). Drop points that turn the
-    path by more than max_turn until none do, resample every ds m, and smooth over smooth_m."""
+def clean_path(P, redrive_m=0.15, gap_m=0.4, ds=0.05, smooth_m=0.3, closed=True,
+               max_spikes=10):
+    """R101: a recorded mapping path can double back where plan segments join (a 0.3 m step
+    back at CDC-TF's hairpin made pure pursuit's nearest point jump backwards). (1) Drop the
+    EARLIER pass of anything driven twice: a point the path comes back to within redrive_m after
+    at least gap_m more path, and at most half the lap later (so the end does not erase the
+    start). Later by path length, not by index: neighbours 3 points on are ~0.13 m away.
+    (2) Drop isolated
+    spikes (sharp turns on both sides of one point), at most max_spikes. (3) Resample every ds m
+    and smooth over smooth_m. A first version deleted the sharpest turn repeatedly; that
+    cascaded and moved the line up to 2.07 m from where the car drove."""
     P = np.asarray(P, float)[:, :2]
-    changed = True
-    while changed and len(P) > 5:
+    arc = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))]
+    keep = np.ones(len(P), bool)
+    for k in range(len(P)):
+        j = (arc - arc[k] >= gap_m) & (arc - arc[k] <= arc[-1] / 2)
+        if j.any() and (np.linalg.norm(P[j] - P[k], axis=1) < redrive_m).any():
+            keep[k] = False
+    P = P[keep]
+    # (1b) points recorded while the car rolled backwards: a step against the local direction of
+    # travel (the chord over +-5 points) goes, repeated until none does
+    for _ in range(50):
+        m = len(P)
+        if m < 12:
+            break
+        tang = P[np.minimum(np.arange(m) + 5, m - 1)] - P[np.maximum(np.arange(m) - 5, 0)]
+        step = np.r_[P[1:] - P[:-1], [[0.0, 0.0]]]
+        bad = np.where(np.sum(step * tang, axis=1) < 0)[0]
+        if not bad.size:
+            break
+        P = np.delete(P, bad[0] + 1, axis=0)
+    for _ in range(max_spikes):
         d = np.diff(P, axis=0)
         a = np.arctan2(d[:, 1], d[:, 0])
-        turn = np.abs(_wrap(np.diff(a)))
-        bad = np.where(turn > max_turn)[0]
-        changed = bad.size > 0
-        if changed:
-            P = np.delete(P, bad[0] + 1, axis=0)
+        turn = np.abs(_wrap(np.diff(a)))                  # turn at points 1..n-2
+        spike = np.where((turn[:-1] > np.radians(90)) & (turn[1:] > np.radians(90)))[0]
+        if not spike.size:
+            break
+        P = np.delete(P, spike[0] + 2, axis=0)
     if closed:
-        P = np.r_[P, P[:1]]                       # close the seam before resampling
+        P = np.r_[P, P[:1]]                               # close the seam before resampling
     seg = np.linalg.norm(np.diff(P, axis=0), axis=1)
     keep = np.r_[True, seg > 1e-9]
     P, s_ = P[keep], np.r_[0.0, np.cumsum(seg[seg > 1e-9])]
@@ -352,15 +377,24 @@ def selftest():
     assert pf2.done and not pf2.failed, (pf2.r, len(pf2.runs), pf2.failed)
     assert np.linalg.norm(xy2 - gl2) < 0.45 and mind2 > 0.15, (xy2, mind2)
     assert abs(_wrap(hd2 - np.pi)) < np.pi / 4, f'and arrives facing -x: {np.degrees(hd2):.0f}'
-    # clean_path: a zigzag (forward, back, forward) is removed; a smooth circle keeps its radius
+    # clean_path: forward, a 0.3 m step back, forward again (CDC-TF's hairpin, R101) comes out
+    # smooth, never more than 0.2 m from the driven line, and a smooth circle keeps its radius
     th_ = np.linspace(0, 2 * np.pi, 300, endpoint=False)
     circ = np.c_[2 * np.cos(th_), 2 * np.sin(th_)]
-    zz = np.r_[circ[:100], circ[[100, 99, 98]], circ[101:]]
+    zz = np.r_[circ[:100], circ[[99, 97, 95, 93]], circ[95:]]
     cz = clean_path(zz)
-    dz = np.diff(cz, axis=0)
+    dz = np.diff(np.r_[cz, cz[:1]], axis=0)
     turn = np.abs(_wrap(np.diff(np.arctan2(dz[:, 1], dz[:, 0]))))
     assert turn.max() < np.radians(20), np.degrees(turn.max())
+    assert max(np.min(np.linalg.norm(zz - q, axis=1)) for q in cz) < 0.2
+    assert max(np.min(np.linalg.norm(cz - q, axis=1)) for q in circ) < 0.05, 'no track cut'
     assert abs(np.median(np.linalg.norm(clean_path(circ), axis=1)) - 2.0) < 0.02
+    # a reverse leg recorded as path (overshoot 0.4 m, back 0.4 m, on): removed, line kept
+    rv = np.r_[circ[:100], circ[[108, 106, 104, 102]], circ[103:]]
+    cv = clean_path(rv)
+    dv_ = np.diff(np.r_[cv, cv[:1]], axis=0)
+    assert np.abs(_wrap(np.diff(np.arctan2(dv_[:, 1], dv_[:, 0])))).max() < np.radians(20)
+    assert max(np.min(np.linalg.norm(cv - q, axis=1)) for q in circ) < 0.05
     # follower unit: a car that does not move along the run is declared stuck (R99)
     straight = [(0.0, 0.0, 0.0, 0, 0.0)] + [(0.2 * k, 0.0, 0.0, 1, 0.0) for k in range(1, 6)]
     fs = PlanFollower(straight)

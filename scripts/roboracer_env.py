@@ -229,6 +229,7 @@ class Explorer:
         self.rays = []                     # (origin, endpoints, is_hit): R99's known-free map
         self.events = []                   # (t, x, y, head, kind) for diagnosis (R98)
         self.braking, self.t_plan_end = False, -1e9
+        self.rolling_back = False          # R101: never record path while moving backwards
         self.side, self.leg_back, self.leg_from = 1.0, True, None
         self.head, self.anchor, self.turning, self.t_turn = None, None, False, None
         self.target, self.rsteer, self.since, self.turns = None, 0.0, None, 0
@@ -363,13 +364,14 @@ class Explorer:
             # means reversing" was wrong for the braking part of every turn.
             back = self.head is not None and np.cos(mh - self.head) < 0
             self.head, self.anchor = self._wrap(mh + np.pi) if back else mh, xy
+            self.rolling_back = bool(back)
         if self.follower is not None:
             cmd = self.follower(xy, self.head if self.head is not None else 0.0, iface.speed)
             if self.follower.done or self.follower.failed:
                 self._log(now, xy, 'plan_done' if self.follower.done else 'plan_lost')
                 self.follower, self.t_plan_end = None, now
                 self.base.reset()
-            elif cmd[1] >= 0 and self.head is not None and (
+            elif cmd[1] >= 0 and self.head is not None and not self.rolling_back and (
                     not self.pts or np.linalg.norm(xy - self.pts[-1]) >= self.ds):
                 if self.pts:
                     self.length += float(np.linalg.norm(xy - self.pts[-1]))
@@ -410,7 +412,8 @@ class Explorer:
         if Recovery._sector(iface, -0.35, 0.35, np.min) < self.stop_m:
             th = 0.0                                      # R99: stop before the wall, not at it
             self.since = now if self.since is None else self.since
-        if self.head is not None and (not self.pts or np.linalg.norm(xy - self.pts[-1]) >= self.ds):
+        if self.head is not None and not self.rolling_back and (
+                not self.pts or np.linalg.norm(xy - self.pts[-1]) >= self.ds):
             if self.pts:
                 self.length += float(np.linalg.norm(xy - self.pts[-1]))
             self.pts.append(xy)
