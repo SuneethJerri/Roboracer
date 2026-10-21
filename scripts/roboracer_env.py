@@ -261,8 +261,9 @@ class Recovery:
     """
 
     def __init__(self, wait=1.0, thr=0.3, dur=0.5, max_n=3, window=10.0, v_stop=0.1,
-                 steer=0.4):
+                 steer=0.4, base=None):
         self.wait, self.thr, self.dur, self.steer = wait, thr, dur, steer
+        self.base = base                   # D69: any act(iface); None means FTG's plan()
         self.max_n, self.window, self.v_stop = max_n, window, v_stop
         self.reset()
 
@@ -274,7 +275,8 @@ class Recovery:
         now = iface.now()
         if self.until is not None and now < self.until:
             return self.rsteer, -self.thr
-        steer, thr = ftg.plan(iface.scan, iface.angle_min, iface.angle_increment)
+        steer, thr = (self.base(iface) if self.base is not None else
+                      ftg.plan(iface.scan, iface.angle_min, iface.angle_increment))
         boxed = steer == 0.0 and thr == 0.0
         if boxed or (thr > 0.0 and iface.speed < self.v_stop):
             self.since = now if self.since is None else self.since
@@ -289,6 +291,9 @@ class Recovery:
         if not boxed:
             self.last = steer
         return steer, thr
+
+    def reversing(self, now):
+        return self.until is not None and now < self.until
 
 
 class ContactCounter:
@@ -1030,6 +1035,17 @@ def selftest():
         assert all(rc(it)[1] >= 0 for it.t in np.arange(0, 3, 0.1)), 'never reverse a mover'
     finally:
         ftg.plan = plan0
+    # D69: wrapping another controller. Commanding throttle but stalled against a wall means a
+    # reverse after ~1 s, away from the side it was steering to, flagged by `reversing`.
+    it = types.SimpleNamespace(speed=0.0, t=0.0)
+    it.now = lambda: it.t
+    rc = Recovery(base=lambda i: (0.8, 0.5))
+    outs, flags = [], []
+    for k in range(15):
+        it.t = 0.1 * (k + 1)
+        outs.append(rc(it))
+        flags.append(rc.reversing(it.t))
+    assert outs[0] == (0.8, 0.5) and (-0.4, -0.3) in outs and any(flags), (outs, flags)
 
     # D68: pure pursuit on a kinematic car (R89's model) laps a stadium track, stays within
     # 0.15 m of the line, and is slower in the tight ends than on the straights.
