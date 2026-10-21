@@ -210,6 +210,7 @@ class Explorer:
     def reset(self):
         self.pts, self.dirs, self.length = [], [], 0.0
         self.hits, self.follower, self.plans, self.plan_fail = [], None, 0, 0
+        self.events = []                   # (t, x, y, head, kind) for diagnosis (R98)
         self.side, self.leg_back, self.leg_from = 1.0, True, None
         self.head, self.anchor, self.turning, self.t_turn = None, None, False, None
         self.target, self.rsteer, self.since, self.turns = None, 0.0, None, 0
@@ -268,13 +269,23 @@ class Explorer:
     def reversing(self, now):
         return self.turning
 
-    def _plan_escape(self, iface, xy):
+    def _log(self, now, xy, kind):
+        self.events.append((now, float(xy[0]), float(xy[1]),
+                            float(self.head) if self.head is not None else np.nan, kind))
+
+    def _grid(self):
+        import trackmap as TM
+        return TM.Grid(np.vstack(self.hits)) if self.hits else None
+
+    def _plan_escape(self, iface, xy, now=0.0):
         """D70: at a stall, plan through the map built so far toward the frontier heading."""
         if not (self.planner and self.hits and self.head is not None):
+            self._log(now, xy, 'plan_skip_no_map')
             return False
         import trackmap as TM
         th = self.frontier(iface, xy)
         if th is None:
+            self._log(now, xy, 'plan_skip_no_frontier')
             return False
         grid = TM.Grid(np.vstack(self.hits))
         for d in self.plan_d:
@@ -285,8 +296,10 @@ class Explorer:
                            th_tol=np.pi / 4, max_exp=30000)
             if path is not None:
                 self.follower, self.plans, self.since = TM.PlanFollower(path), self.plans + 1, None
+                self._log(now, xy, f'plan_ok_{d}m_{len(path)}')
                 return True
         self.plan_fail += 1
+        self._log(now, xy, 'plan_fail')
         return False
 
     def __call__(self, iface):
@@ -330,7 +343,17 @@ class Explorer:
         dist, odir = self._visited(xy)
         backwards = (self.head is not None and dist < self.near
                      and np.cos(self.head - odir) < -0.3)
+        if backwards and self.hits:
+            # R98: across a hairpin's divider the other leg is close and anti-parallel; a wall
+            # in between means it is not ground being retraced.
+            old = np.asarray(self.pts[:-self.skip])
+            j = int(np.argmin(np.sum((old - xy) ** 2, axis=1)))
+            g = self._grid()
+            if g is not None and g.wall_between(xy, old[j]):
+                backwards = False
+                self._log(now, xy, 'backtrack_vetoed_wall')
         if backwards:
+            self._log(now, xy, 'backtrack_turn')
             return self._turn(iface, now, odir)
         steer, th = self.base(iface)
         if self.head is not None and (not self.pts or np.linalg.norm(xy - self.pts[-1]) >= self.ds):
@@ -343,8 +366,9 @@ class Explorer:
         else:
             self.since = None
         if self.since is not None and now - self.since >= self.wait:
-            if dist >= self.near and self._plan_escape(iface, xy):
+            if dist >= self.near and self._plan_escape(iface, xy, now):
                 return 0.0, 0.0
+            self._log(now, xy, 'stall_turn_near_visited' if dist < self.near else 'stall_turn')
             return self._turn(iface, now, odir if dist < self.near else self.frontier(iface, xy))
         return steer, th
 
@@ -1447,6 +1471,28 @@ def selftest():
     exh = Explorer()
     assert hairpin(exh, exh.hits), 'with the map and planner it gets round'
     assert exh.plans >= 1 and exh.turns == 0, (exh.plans, exh.turns, exh.plan_fail)
+    # R98: on the exit leg, anti-parallel and 0.3 m from entry-leg memory across the mapped
+    # divider, the car is NOT backtracking; with no wall between, it is.
+    ev = Explorer()
+    ev.hits = [wall]
+    ev.pts = [np.array([x, 0.9]) for x in np.arange(0.5, 4.0, 0.05)] \
+        + [np.array([4.6, 1.0])] * 20
+    ev.dirs = [0.0] * (len(ev.pts) - 20) + [np.pi / 2] * 20
+    ev.head, ev.anchor = np.pi, np.array([2.0, 1.25])
+    cx = types.SimpleNamespace(position=np.array([2.0, 1.25, 0.0]), speed=1.0, t=0.0,
+                               scan=TM.ray_cast(segs, np.array([2.0, 1.25]), np.pi, angs),
+                               angle_min=-2.35619, angle_increment=0.0261799)
+    cx.now = lambda: 0.0
+    ev(cx)
+    assert not ev.turning and ev.events[-1][4] == 'backtrack_vetoed_wall', ev.events
+    ev2 = Explorer()
+    ev2.hits = [wall]
+    ev2.pts, ev2.dirs, ev2.head = list(ev.pts), list(ev.dirs), np.pi
+    ev2.anchor = np.array([2.0, 0.75])
+    cx.position, cx.scan = np.array([2.0, 0.75, 0.0]), TM.ray_cast(segs, np.array([2.0, 0.75]),
+                                                                   np.pi, angs)
+    ev2(cx)
+    assert ev2.turning and ev2.events[-1][4] == 'backtrack_turn', ev2.events
 
     print('selftest OK')
 

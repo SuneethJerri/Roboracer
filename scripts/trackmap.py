@@ -53,6 +53,17 @@ class Grid:
         self.occ = cnt >= min_hits
         self.blocked = dilate(self.occ, int(np.ceil(inflate / res)))
 
+    def wall_between(self, a, b):
+        """True if an occupied (uninflated) cell lies on the segment a-b (R98: a hairpin's other
+        leg, seen across its divider, is not ground being retraced)."""
+        a, b = np.asarray(a, float), np.asarray(b, float)
+        n = max(2, int(np.ceil(np.linalg.norm(b - a) / (self.res / 2))))
+        pts = a + np.linspace(0, 1, n)[:, None] * (b - a)
+        ij = np.floor((pts - self.lo) / self.res).astype(int)
+        ok = (ij[:, 0] >= 0) & (ij[:, 1] >= 0) & (ij[:, 0] < self.shape[0]) & \
+             (ij[:, 1] < self.shape[1])
+        return bool(self.occ[ij[ok, 0], ij[ok, 1]].any())
+
     def free(self, pts):
         """True where a point is not blocked. Outside the grid is unknown, hence free."""
         pts = np.asarray(pts, float).reshape(-1, 2)
@@ -233,6 +244,8 @@ def selftest():
     assert g.free(P).all(), 'every pose clears the inflated walls'
     assert max(abs(p[4]) for p in path) <= 1 / R_MIN + 1e-9, 'no arc tighter than r_min'
     assert P[:, 0].max() > 4.0, 'it went round the divider, not through it'
+    # line of sight: across the divider there is a wall, along a leg there is not
+    assert g.wall_between((2.0, 0.6), (2.0, 1.9)) and not g.wall_between((1.0, 0.6), (3.0, 0.6))
     # a car stalled against the wall (inside the inflated band) can still plan away from it
     assert not g.free([[1.0, 0.12]])[0]
     assert plan(g, (1.0, 0.12, 0.0), goal) is not None, 'start inside the band must still plan'
