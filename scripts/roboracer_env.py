@@ -197,7 +197,8 @@ class Explorer:
 
     def __init__(self, base=None, ds=0.05, near=0.4, skip_m=0.6, thr=0.3, steer=0.8, clear=0.5,
                  min_dur=0.3, max_dur=8.0, align=np.pi / 4, wait=1.0, v_stop=0.1, leg_m=0.5,
-                 v_turn=0.8, front_min=0.3):
+                 v_turn=0.8, front_min=0.3, planner=True, plan_d=(2.5, 2.0, 1.5, 1.0)):
+        self.planner, self.plan_d = planner, plan_d
         self.base = base if base is not None else WallFollower()
         self.ds, self.near, self.skip = ds, near, int(round(skip_m / ds))
         self.thr, self.steer, self.clear = thr, steer, clear
@@ -208,6 +209,7 @@ class Explorer:
 
     def reset(self):
         self.pts, self.dirs, self.length = [], [], 0.0
+        self.hits, self.follower, self.plans, self.plan_fail = [], None, 0, 0
         self.side, self.leg_back, self.leg_from = 1.0, True, None
         self.head, self.anchor, self.turning, self.t_turn = None, None, False, None
         self.target, self.rsteer, self.since, self.turns = None, 0.0, None, 0
@@ -266,6 +268,27 @@ class Explorer:
     def reversing(self, now):
         return self.turning
 
+    def _plan_escape(self, iface, xy):
+        """D70: at a stall, plan through the map built so far toward the frontier heading."""
+        if not (self.planner and self.hits and self.head is not None):
+            return False
+        import trackmap as TM
+        th = self.frontier(iface, xy)
+        if th is None:
+            return False
+        grid = TM.Grid(np.vstack(self.hits))
+        for d in self.plan_d:
+            goal = xy + d * np.array([np.cos(th), np.sin(th)])
+            if not grid.free(goal)[0]:
+                continue
+            path = TM.plan(grid, (xy[0], xy[1], self.head), goal, goal_th=th,
+                           th_tol=np.pi / 4, max_exp=30000)
+            if path is not None:
+                self.follower, self.plans, self.since = TM.PlanFollower(path), self.plans + 1, None
+                return True
+        self.plan_fail += 1
+        return False
+
     def __call__(self, iface):
         now, xy = iface.now(), np.array(iface.position[:2], float)
         if self.anchor is None:
@@ -277,6 +300,20 @@ class Explorer:
             # means reversing" was wrong for the braking part of every turn.
             back = self.head is not None and np.cos(mh - self.head) < 0
             self.head, self.anchor = self._wrap(mh + np.pi) if back else mh, xy
+        if self.follower is not None:
+            cmd = self.follower(xy, self.head if self.head is not None else 0.0, iface.speed)
+            if self.follower.done or self.follower.failed:
+                self.follower = None
+                self.base.reset()
+            elif cmd[1] >= 0 and self.head is not None and (
+                    not self.pts or np.linalg.norm(xy - self.pts[-1]) >= self.ds):
+                if self.pts:
+                    self.length += float(np.linalg.norm(xy - self.pts[-1]))
+                self.pts.append(xy)
+                self.dirs.append(self.head)
+                return cmd
+            else:
+                return cmd
         if self.turning:
             el = now - self.t_turn
             aligned = (self.target is None or self.head is None
@@ -306,6 +343,8 @@ class Explorer:
         else:
             self.since = None
         if self.since is not None and now - self.since >= self.wait:
+            if dist >= self.near and self._plan_escape(iface, xy):
+                return 0.0, 0.0
             return self._turn(iface, now, odir if dist < self.near else self.frontier(iface, xy))
         return steer, th
 
@@ -1365,6 +1404,49 @@ def selftest():
         f'a stall must K-turn toward unexplored ground: target {ef.target}'
     assert th2[-1] - th2[np.argmin(th2)] > np.pi / 2, \
         f'and then travel the remembered (ccw) way: {th2[-1] - th2[np.argmin(th2)]:.2f} rad'
+
+    # D70: on a hairpin too tight for corridor-centring (1.0 m legs, centre radius ~0.58 m, at the
+    # car's limit), the WallFollower alone deadlocks at the bend; the Explorer, mapping from its
+    # own simulated LIDAR, plans out of the stall and reaches the other leg without a K-turn.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import trackmap as TM
+    segs, wall = TM.hairpin_walls(w=1.0, div=0.15)
+    angs = -2.35619 + 0.0261799 * np.arange(181)
+
+    def hairpin(ctrl, hits=None, steps=600):
+        car = types.SimpleNamespace(position=np.array([0.8, 0.5, 0.0]), speed=0.0, t=0.0,
+                                    angle_min=-2.35619, angle_increment=0.0261799)
+        car.now = lambda: car.t
+        hd, v, q = 0.0, 0.0, [(0.0, 0.0)] * 2
+        for k in range(steps):
+            car.scan = TM.ray_cast(segs, car.position[:2], hd, angs)
+            if hits is not None and k % 4 == 0:
+                r_, a_ = car.scan[::2], angs[::2]
+                ok_ = r_ < 9.0
+                hits.append(car.position[:2] + r_[ok_, None]
+                            * np.c_[np.cos(hd + a_[ok_]), np.sin(hd + a_[ok_])])
+            q.append(ctrl(car))
+            st, th_ = q.pop(0)
+            if th_ >= 0.3:
+                v += (4.5 if v >= 0 else 6.0) * 0.055
+            elif th_ <= -0.3:
+                v -= (4.5 if v <= 0 else 6.0) * 0.055
+            else:
+                v -= np.sign(v) * min(abs(v), 6.0 * 0.055)
+            nh = hd + v * np.tan(st * PurePursuit.DELTA_MAX) / PurePursuit.L * 0.055
+            nxt = car.position[:2] + v * 0.055 * np.array([np.cos(nh), np.sin(nh)])
+            if np.min(np.linalg.norm(wall - nxt, axis=1)) < 0.15:
+                v = 0.0                                       # the body meets a wall: stop
+            else:
+                car.position[:2], hd = nxt, nh
+            car.speed, car.t = abs(v), car.t + 0.055
+            if car.position[1] > 1.25 and car.position[0] < 3.0:
+                return True
+        return False
+    assert not hairpin(WallFollower()), 'premise: centring alone deadlocks in this hairpin'
+    exh = Explorer()
+    assert hairpin(exh, exh.hits), 'with the map and planner it gets round'
+    assert exh.plans >= 1 and exh.turns == 0, (exh.plans, exh.turns, exh.plan_fail)
 
     print('selftest OK')
 
