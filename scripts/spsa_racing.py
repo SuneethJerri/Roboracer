@@ -558,10 +558,19 @@ def violation(rollouts, delta=DELTA, graded=False):
     return float(np.mean([min(1.0, r.shortfall / delta) for r in rollouts]))
 
 
-def contact_rate(rollouts, laps, beta, key='contacts'):
-    """D60's constraint channel: mean `key` per lap wanted, over beta. <= 1 holds. D61 uses
-    'collisions' (counter ticks, i.e. contact time) after R82 found episodes gameable."""
-    return float(np.mean([getattr(r, key) for r in rollouts])) / laps / beta
+H_CAP = 3.0         # a rollout that drove under PROG_FLOOR of a lap: a full violation (B38)
+
+
+def contact_rate(rollouts, beta, key='contacts'):
+    """D60's constraint channel: mean over rollouts of `key` per lap DRIVEN, over beta.
+    <= 1 holds. D61 counts 'collisions' (ticks, contact time) after R82 found episodes
+    gameable. Per lap driven, not wanted, and a car that barely moved is charged H_CAP:
+    per lap wanted, a stopped car scored 0, the best value (B38, R83)."""
+    h = []
+    for r in rollouts:
+        driven = r.laps + (0.0 if r.feasible else min(max(r.progress, 0.0), 1.0))
+        h.append(H_CAP if driven < PROG_FLOOR else getattr(r, key) / driven / beta)
+    return float(np.mean(h))
 
 
 def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=None,
@@ -710,8 +719,8 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
                 Lp = mp.cost + lam * (Gp - alpha)
                 Lm = mm.cost + lam * (Gm - alpha)
                 if beta:                                         # D60
-                    Hp = contact_rate(mp.rollouts, laps, beta, h_key)
-                    Hm = contact_rate(mm.rollouts, laps, beta, h_key)
+                    Hp = contact_rate(mp.rollouts, beta, h_key)
+                    Hm = contact_rate(mm.rollouts, beta, h_key)
                     Lp += mu * (Hp - 1.0)
                     Lm += mu * (Hm - 1.0)
             # No both-failed special case, and that reasoning was WRONG -- kept here with
@@ -1177,7 +1186,7 @@ def selftest():
                 assert all(r['circuits'] == 'IMS' for r in rr), 'tracks= must fix the draw'
             assert 'mu' in rr[-1] and max(float(r['mu']) for r in rr) > 0, 'mu must rise'
             assert all(float(r['mu']) >= 0 for r in rr), 'mu projected onto [0, inf)'
-            assert contact_rate([Rollout(1, True, 2, 6, 1.0, 'X', contacts=2)], 2, 1.5,
+            assert contact_rate([Rollout(1, True, 2, 6, 1.0, 'X', contacts=2)], 1.5,
                                 'collisions') == 2.0, 'h_key selects the field H counts'
             fp = os.path.join(td, 'rub_ticks.csv')                     # the stub never ticks
             spsa_constrained(CircuitPool(lambda t: _Rub(t)), iters=2, a=0.05, c=0.05, seed=0,
@@ -1185,6 +1194,13 @@ def selftest():
                              out=fp)
             assert all(float(r['H_plus']) == 0.0 for r in csv.DictReader(open(fp))), \
                 'h_key must reach the Lagrangian'
+            # B38: per lap DRIVEN. A stopped car is the worst score, not the best, and a car
+            # that drove 1.5 laps is charged per 1.5 laps, not per the 2 it was asked for.
+            stopped = Rollout(90, False, 0, 0, 0.1, 'X', contacts=0)
+            assert contact_rate([stopped], 2.0) == H_CAP, 'not moving must violate fully'
+            part = Rollout(90, False, 1, 0, 0.5, 'X', contacts=3)
+            assert contact_rate([part], 2.0) == 1.0, '3 contacts over 1.5 laps driven, beta 2'
+            assert contact_rate([Rollout(9, True, 2, 0, 0.0, 'X', contacts=4)], 2.0) == 1.0
             assert fins['mu'] < fins['free'] - 0.05, \
                 f'the contact constraint must pull gain 1 down: {fins}'
             assert float(rr[0]['J_plus']) > 1.8, 'ref_lap_s, not the D5 baseline, sets the scale'
