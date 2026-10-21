@@ -141,12 +141,15 @@ class Recovery:
     """D64: Follow-the-Gap plus a reverse recovery. FTG never reverses and stops when boxed in,
     so a stall on AutoDRIVE is absorbing (R77, R88). When `plan()` is boxed in, or the car has been
     below `v_stop` for `wait` s while commanding throttle, reverse at -`thr` for `dur` s with
-    full lock opposite to the last forward steering, then resume. At most `max_n` per `window` s,
+    `steer` of lock opposite to the last forward steering, then resume. The car turns
+    kinematically (R89), so rotation ~ distance x tan(delta) / L: full lock for 0.8 s turned it
+    ~120 deg and sent it the wrong way (R90). 0.4 of lock for 0.5 s backs ~0.5 m at ~15 deg. At most `max_n` per `window` s,
     so a car that cannot get out still stalls and is scored as stalled. Pass as `rollout(act=)`.
     """
 
-    def __init__(self, wait=1.0, thr=0.3, dur=0.8, max_n=3, window=10.0, v_stop=0.1):
-        self.wait, self.thr, self.dur = wait, thr, dur
+    def __init__(self, wait=1.0, thr=0.3, dur=0.5, max_n=3, window=10.0, v_stop=0.1,
+                 steer=0.4):
+        self.wait, self.thr, self.dur, self.steer = wait, thr, dur, steer
         self.max_n, self.window, self.v_stop = max_n, window, v_stop
         self.reset()
 
@@ -166,7 +169,7 @@ class Recovery:
             self.since = None
         recent = [t for t in self.done if now - t < self.window]
         if self.since is not None and now - self.since >= self.wait and len(recent) < self.max_n:
-            self.rsteer = -float(np.sign(self.last))
+            self.rsteer = -self.steer * float(np.sign(self.last))
             self.until, self.since = now + self.dur, None
             self.done = recent + [now]
             return self.rsteer, -self.thr
@@ -903,9 +906,9 @@ def selftest():
             it.t = 0.1 * (k + 1)
             out.append(rc(it))
         rev = [i for i, o in enumerate(out) if o[1] < 0]
-        assert rev and out[rev[0]] == (-1.0, -0.3), out[rev[0]] if rev else out
+        assert rev and out[rev[0]] == (-0.4, -0.3), out[rev[0]] if rev else out
         assert 9 <= rev[0] <= 11, f'reverse after ~1 s boxed, at sample {rev[0]}'
-        assert 7 <= sum(1 for i in rev if i < rev[0] + 10) <= 9, 'and holds it for ~0.8 s'
+        assert 4 <= sum(1 for i in rev if i < rev[0] + 10) <= 6, 'and holds it for ~0.5 s'
         assert len(rc.done) == 3, f'capped at max_n per window: {rc.done}'
         rc.reset()
         assert (rc.until, rc.since, rc.done) == (None, None, []), 'reset clears state'
