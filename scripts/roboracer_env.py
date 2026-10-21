@@ -225,6 +225,26 @@ class Explorer:
         j = int(np.argmin(np.sum((old - xy) ** 2, axis=1)))
         return float(np.linalg.norm(old[j] - xy)), self.dirs[j]
 
+    def frontier(self, iface, xy, free_m=1.0, probe_m=1.0, recent=6):
+        """D69 (user: "how to give it a notion of where forward is"): forward on an unknown track
+        is away from where the car has been. Of the headings within +-135 deg (the LIDAR's view)
+        whose scan is >= free_m open, pick the one whose point probe_m out is farthest from the
+        remembered path (ignoring the last `recent` points); ties go to the smaller turn. None
+        if nothing is open or there is no memory yet."""
+        if self.head is None or len(self.pts) <= recent:
+            return None
+        old = np.asarray(self.pts[:-recent])
+        best, best_key = None, None
+        for rel in np.radians(np.arange(-135, 136, 15)):
+            if Recovery._sector(iface, rel - 0.1, rel + 0.1, np.median) < free_m:
+                continue
+            h = self.head + rel
+            pt = xy + probe_m * np.array([np.cos(h), np.sin(h)])
+            key = (round(float(np.min(np.linalg.norm(old - pt, axis=1))), 1), -abs(rel))
+            if best_key is None or key > best_key:
+                best, best_key = self._wrap(h), key
+        return best
+
     def _turn(self, iface, now, target):
         if target is not None and self.head is not None:
             side = 1.0 if self._wrap(target - self.head) >= 0 else -1.0
@@ -286,7 +306,7 @@ class Explorer:
         else:
             self.since = None
         if self.since is not None and now - self.since >= self.wait:
-            return self._turn(iface, now, odir if dist < self.near else None)
+            return self._turn(iface, now, odir if dist < self.near else self.frontier(iface, xy))
         return steer, th
 
 
@@ -1309,6 +1329,40 @@ def selftest():
                                 angle_min=-2.35619, angle_increment=0.0261799)
     assert ek._turn(it_, 0.0, 1.0)[0] < 0 and ek.side == 1.0, 'target 57 deg left: turn left'
     assert ek._turn(it_, 0.0, -1.0)[0] > 0 and ek.side == -1.0, 'and right for right'
+    # frontier: driven along +x to the origin, facing +x into a wall. Open to the left (+90) and
+    # back-right (-135, toward where it came from). Forward is the unexplored left.
+    ef = Explorer()
+    ef.head = 0.0
+    ef.pts = [np.array([x, 0.0]) for x in np.arange(-4.0, 0.0, 0.05)]
+    sang = -2.35619 + 0.0261799 * np.arange(181)
+    open_ = (np.abs(sang - np.pi / 2) < 0.3) | (np.abs(sang + 3 * np.pi / 4) < 0.3)
+    it_.scan = np.where(open_, 3.0, 0.3)
+    tf = ef.frontier(it_, np.zeros(2))
+    assert tf is not None and abs(tf - np.pi / 2) < 0.35, f'forward is the unexplored side: {tf}'
+    ef.pts = []
+    assert ef.frontier(it_, np.zeros(2)) is None, 'no memory: no opinion'
+    # The smaller turn (-45 deg) leads onto visited ground; the unexplored opening (+120) is the
+    # larger turn. Through a real stall (throttle commanded, not moving for > wait), the K-turn
+    # must target the unexplored one.
+    class _Push:                                         # commands throttle, goes nowhere
+        def __call__(self, i):
+            return 0.0, 0.5
+
+        def reset(self):
+            pass
+    ef = Explorer(base=_Push())
+    ef.head, ef.anchor = 0.0, np.zeros(2)
+    ef.pts = [np.array([0.7, y]) for y in np.arange(-3.0, -0.65, 0.05)]
+    ef.dirs = [np.pi / 2] * len(ef.pts)
+    open_ = (np.abs(sang + np.pi / 4) < 0.15) | (np.abs(sang - 2 * np.pi / 3) < 0.15)
+    st = types.SimpleNamespace(position=np.zeros(3), speed=0.0, scan=np.where(open_, 3.0, 0.3),
+                               angle_min=-2.35619, angle_increment=0.0261799, t=0.0)
+    st.now = lambda: st.t
+    for k in range(25):
+        st.t = 0.1 * k
+        ef(st)
+    assert ef.turning and ef.target is not None and abs(ef.target - 2 * np.pi / 3) < 0.35, \
+        f'a stall must K-turn toward unexplored ground: target {ef.target}'
     assert th2[-1] - th2[np.argmin(th2)] > np.pi / 2, \
         f'and then travel the remembered (ccw) way: {th2[-1] - th2[np.argmin(th2)]:.2f} rad'
 
