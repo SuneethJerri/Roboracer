@@ -297,6 +297,16 @@ class Explorer:
             return TM.Grid.from_rays(self.rays)
         return TM.Grid(np.vstack(self.hits)) if self.hits else None
 
+    def _home(self, xy, lap_m=20.0, near_m=3.0, ahead_m=1.0):
+        """(goal, heading) on the recorded path ahead_m past the start, once the car has driven
+        lap_m and is within near_m of the start; else None."""
+        if self.length < lap_m or len(self.pts) < 2:
+            return None
+        if np.linalg.norm(xy - self.pts[0]) > near_m:
+            return None
+        k = min(len(self.pts) - 1, int(round(ahead_m / self.ds)))
+        return np.asarray(self.pts[k], float), float(self.dirs[k])
+
     def _plan_escape(self, iface, xy, now=0.0):
         """D70: at a stall, plan through the map built so far toward the frontier heading."""
         if not (self.planner and self.hits and self.head is not None):
@@ -308,6 +318,18 @@ class Explorer:
             self._log(now, xy, 'plan_skip_no_frontier')
             return False
         grid = self._grid()
+        # R100: closing the loop. Near the start after a lap's worth of path, "forward" is the
+        # visited start, which the frontier avoids by design. Aim for a point ~1 m along the
+        # recorded path from the start instead, facing the way the lap began.
+        home = self._home(xy)
+        if home is not None:
+            gxy, gth = home
+            path = TM.plan(grid, (xy[0], xy[1], self.head), gxy, goal_th=gth, th_tol=np.pi / 3,
+                           max_exp=20000)
+            if path is not None:
+                self.follower, self.plans, self.since = TM.PlanFollower(path), self.plans + 1, None
+                self._log(now, xy, f'plan_home_{len(path)}')
+                return True
         # R99: goals must lie in KNOWN free space. March out along the frontier heading and a few
         # either side, and take the farthest point reached (>= 0.8 m), farthest first.
         cands = []
@@ -1544,6 +1566,18 @@ def selftest():
                                                                    np.pi, angs)
     ev2(cx)
     assert ev2.turning and ev2.events[-1][4] == 'backtrack_turn', ev2.events
+    # R100: after a lap's worth of path, near the start, the goal is the recorded path ~1 m past
+    # the start, facing the way the lap began; before that, or far from the start, no home goal
+    eh = Explorer()
+    eh.pts = [np.array([2.5 * np.cos(t), 2.5 * np.sin(t)]) for t in a_]
+    eh.dirs = [float(Explorer._wrap(t + np.pi / 2)) for t in a_]
+    eh.length = 25.0                                     # past lap_m (20 m)
+    hg = eh._home(np.array([2.4, -0.8]))
+    assert hg is not None and np.linalg.norm(hg[0] - eh.pts[20]) < 1e-9 and \
+        abs(hg[1] - eh.dirs[20]) < 1e-9, hg
+    assert eh._home(np.array([-2.5, 0.0])) is None, 'far from the start: no home goal'
+    eh.length = 5.0
+    assert eh._home(np.array([2.4, -0.8])) is None, 'too early in the lap: no home goal'
 
     print('selftest OK')
 
