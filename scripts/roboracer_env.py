@@ -149,9 +149,13 @@ class WallFollower:
     positive scan angles are to the left, so the right wall is at -90 deg.
     """
 
-    def __init__(self, theta=0.87, look=0.6, kp=1.2, kd=0.15, v=1.0, thr=0.5):
+    def __init__(self, theta=0.87, look=0.6, kp=1.2, kd=0.15, v=1.0, thr=0.5, front_m=1.0,
+                 k_front=1.0, v_slow=0.4):
         self.theta, self.look = theta, look
         self.kp, self.kd, self.v, self.thr = kp, kd, v, thr
+        # R99 (user: "why is the car going into walls"): it only looked sideways. Within
+        # front_m of a wall ahead (+-20 deg), slow to v_slow and steer toward the open side.
+        self.front_m, self.k_front, self.v_slow = front_m, k_front, v_slow
         self.reset()
 
     def reset(self):
@@ -175,8 +179,15 @@ class WallFollower:
         err = 0.5 * (self._ahead(iface, +1) - self._ahead(iface, -1))   # > 0: nearer the right
         de = 0.0 if self.prev is None else err - self.prev
         self.prev = err
-        steer = float(np.clip(self.kp * err + self.kd * de / 0.055, -1.0, 1.0))
-        return steer, (self.thr if iface.speed < self.v else 0.0)
+        steer = self.kp * err + self.kd * de / 0.055
+        front = Recovery._sector(iface, -0.35, 0.35, np.min)
+        v = self.v
+        if front < self.front_m:
+            left = Recovery._sector(iface, 0.35, 1.6, np.median)
+            right = Recovery._sector(iface, -1.6, -0.35, np.median)
+            steer += self.k_front * (1.0 - front / self.front_m) * (1.0 if left > right else -1.0)
+            v = self.v_slow
+        return float(np.clip(steer, -1.0, 1.0)), (self.thr if iface.speed < v else 0.0)
 
 
 class Explorer:
@@ -197,8 +208,13 @@ class Explorer:
 
     def __init__(self, base=None, ds=0.05, near=0.4, skip_m=0.6, thr=0.3, steer=0.8, clear=0.5,
                  min_dur=0.3, max_dur=8.0, align=np.pi / 4, wait=1.0, v_stop=0.1, leg_m=0.5,
-                 v_turn=0.8, front_min=0.3, planner=True, plan_d=(2.5, 2.0, 1.5, 1.0)):
+                 v_turn=0.8, front_min=0.3, planner=True, plan_d=(2.5, 2.0, 1.5, 1.0),
+                 plan_front=1.2, plan_cool=2.0):
         self.planner, self.plan_d = planner, plan_d
+        # R99: plan BEFORE the corner. Below plan_front m clear ahead, brake to a stop, then plan
+        # (the bridge repeats the last command while planning blocks), then follow the plan.
+        self.plan_front, self.plan_cool = plan_front, plan_cool
+        self.stop_m = 0.3
         self.base = base if base is not None else WallFollower()
         self.ds, self.near, self.skip = ds, near, int(round(skip_m / ds))
         self.thr, self.steer, self.clear = thr, steer, clear
@@ -210,7 +226,9 @@ class Explorer:
     def reset(self):
         self.pts, self.dirs, self.length = [], [], 0.0
         self.hits, self.follower, self.plans, self.plan_fail = [], None, 0, 0
+        self.rays = []                     # (origin, endpoints, is_hit): R99's known-free map
         self.events = []                   # (t, x, y, head, kind) for diagnosis (R98)
+        self.braking, self.t_plan_end = False, -1e9
         self.side, self.leg_back, self.leg_from = 1.0, True, None
         self.head, self.anchor, self.turning, self.t_turn = None, None, False, None
         self.target, self.rsteer, self.since, self.turns = None, 0.0, None, 0
@@ -228,7 +246,7 @@ class Explorer:
         j = int(np.argmin(np.sum((old - xy) ** 2, axis=1)))
         return float(np.linalg.norm(old[j] - xy)), self.dirs[j]
 
-    def frontier(self, iface, xy, free_m=1.0, probe_m=1.0, recent=6):
+    def frontier(self, iface, xy, free_m=0.6, probe_m=1.0, recent=6):
         """D69 (user: "how to give it a notion of where forward is"): forward on an unknown track
         is away from where the car has been. Of the headings within +-135 deg (the LIDAR's view)
         whose scan is >= free_m open, pick the one whose point probe_m out is farthest from the
@@ -275,6 +293,8 @@ class Explorer:
 
     def _grid(self):
         import trackmap as TM
+        if self.rays:
+            return TM.Grid.from_rays(self.rays)
         return TM.Grid(np.vstack(self.hits)) if self.hits else None
 
     def _plan_escape(self, iface, xy, now=0.0):
@@ -287,16 +307,24 @@ class Explorer:
         if th is None:
             self._log(now, xy, 'plan_skip_no_frontier')
             return False
-        grid = TM.Grid(np.vstack(self.hits))
-        for d in self.plan_d:
-            goal = xy + d * np.array([np.cos(th), np.sin(th)])
-            if not grid.free(goal)[0]:
-                continue
-            path = TM.plan(grid, (xy[0], xy[1], self.head), goal, goal_th=th,
-                           th_tol=np.pi / 4, max_exp=30000)
+        grid = self._grid()
+        # R99: goals must lie in KNOWN free space. March out along the frontier heading and a few
+        # either side, and take the farthest point reached (>= 0.8 m), farthest first.
+        cands = []
+        for off in np.radians([0, 15, -15, 30, -30, 45, -45]):
+            dv = np.array([np.cos(th + off), np.sin(th + off)])
+            r = 0.3
+            while r + 0.1 <= max(self.plan_d) and grid.free(xy + (r + 0.1) * dv)[0]:
+                r += 0.1
+            if r >= 0.8:
+                cands.append((r, -abs(off), th + off))
+        for r, _, gth in sorted(cands, reverse=True)[:3]:
+            goal = xy + r * np.array([np.cos(gth), np.sin(gth)])
+            path = TM.plan(grid, (xy[0], xy[1], self.head), goal, goal_th=gth,
+                           th_tol=np.pi / 3, max_exp=20000)
             if path is not None:
                 self.follower, self.plans, self.since = TM.PlanFollower(path), self.plans + 1, None
-                self._log(now, xy, f'plan_ok_{d}m_{len(path)}')
+                self._log(now, xy, f'plan_ok_{r:.1f}m_{len(path)}')
                 return True
         self.plan_fail += 1
         self._log(now, xy, 'plan_fail')
@@ -316,7 +344,8 @@ class Explorer:
         if self.follower is not None:
             cmd = self.follower(xy, self.head if self.head is not None else 0.0, iface.speed)
             if self.follower.done or self.follower.failed:
-                self.follower = None
+                self._log(now, xy, 'plan_done' if self.follower.done else 'plan_lost')
+                self.follower, self.t_plan_end = None, now
                 self.base.reset()
             elif cmd[1] >= 0 and self.head is not None and (
                     not self.pts or np.linalg.norm(xy - self.pts[-1]) >= self.ds):
@@ -356,6 +385,9 @@ class Explorer:
             self._log(now, xy, 'backtrack_turn')
             return self._turn(iface, now, odir)
         steer, th = self.base(iface)
+        if Recovery._sector(iface, -0.35, 0.35, np.min) < self.stop_m:
+            th = 0.0                                      # R99: stop before the wall, not at it
+            self.since = now if self.since is None else self.since
         if self.head is not None and (not self.pts or np.linalg.norm(xy - self.pts[-1]) >= self.ds):
             if self.pts:
                 self.length += float(np.linalg.norm(xy - self.pts[-1]))
@@ -363,13 +395,27 @@ class Explorer:
             self.dirs.append(self.head)
         if th > 0 and iface.speed < self.v_stop:
             self.since = now if self.since is None else self.since
-        else:
+        elif not (th == 0.0 and Recovery._sector(iface, -0.35, 0.35, np.min) < self.stop_m):
             self.since = None
         if self.since is not None and now - self.since >= self.wait:
-            if dist >= self.near and self._plan_escape(iface, xy, now):
+            # R99: "toward the remembered direction" at a stall pointed back into the wall it had
+            # just hit, 22 times in 60 s. A stall always looks for unexplored, open ground.
+            if self._plan_escape(iface, xy, now):
                 return 0.0, 0.0
-            self._log(now, xy, 'stall_turn_near_visited' if dist < self.near else 'stall_turn')
-            return self._turn(iface, now, odir if dist < self.near else self.frontier(iface, xy))
+            self._log(now, xy, 'stall_turn')
+            return self._turn(iface, now, self.frontier(iface, xy))
+        # R99: approaching a wall on mapped ground, stop and plan before reaching it
+        front = Recovery._sector(iface, -0.35, 0.35, np.min)
+        if (self.planner and self.hits and self.head is not None and front < self.plan_front
+                and now - self.t_plan_end > self.plan_cool):
+            if iface.speed > 0.05:
+                self.braking = True
+                return 0.0, 0.0
+            self.braking = False
+            self._log(now, xy, 'corner_plan')
+            if self._plan_escape(iface, xy, now):
+                return 0.0, 0.0
+            self.t_plan_end = now
         return steer, th
 
 
@@ -1445,10 +1491,11 @@ def selftest():
         for k in range(steps):
             car.scan = TM.ray_cast(segs, car.position[:2], hd, angs)
             if hits is not None and k % 4 == 0:
-                r_, a_ = car.scan[::2], angs[::2]
-                ok_ = r_ < 9.0
-                hits.append(car.position[:2] + r_[ok_, None]
-                            * np.c_[np.cos(hd + a_[ok_]), np.sin(hd + a_[ok_])])
+                r_, a_ = np.minimum(car.scan[::2], 6.0), angs[::2]
+                ends = car.position[:2] + r_[:, None] * np.c_[np.cos(hd + a_), np.sin(hd + a_)]
+                hits.append(ends[car.scan[::2] < 9.0])
+                if hasattr(ctrl, 'rays'):
+                    ctrl.rays.append((car.position[:2].copy(), ends, car.scan[::2] < 9.0))
             q.append(ctrl(car))
             st, th_ = q.pop(0)
             if th_ >= 0.3:
@@ -1460,17 +1507,21 @@ def selftest():
             nh = hd + v * np.tan(st * PurePursuit.DELTA_MAX) / PurePursuit.L * 0.055
             nxt = car.position[:2] + v * 0.055 * np.array([np.cos(nh), np.sin(nh)])
             if np.min(np.linalg.norm(wall - nxt, axis=1)) < 0.15:
-                v = 0.0                                       # the body meets a wall: stop
+                v, contacts[0] = 0.0, contacts[0] + 1          # the body meets a wall: stop
             else:
                 car.position[:2], hd = nxt, nh
             car.speed, car.t = abs(v), car.t + 0.055
             if car.position[1] > 1.25 and car.position[0] < 3.0:
                 return True
         return False
-    assert not hairpin(WallFollower()), 'premise: centring alone deadlocks in this hairpin'
+    contacts = [0]
+    old_wf = WallFollower(front_m=0.0)                         # R98's side-only follower
+    assert not hairpin(old_wf), 'premise: side-only centring deadlocks in this hairpin'
+    contacts[0] = 0
     exh = Explorer()
-    assert hairpin(exh, exh.hits), 'with the map and planner it gets round'
-    assert exh.plans >= 1 and exh.turns == 0, (exh.plans, exh.turns, exh.plan_fail)
+    assert hairpin(exh, exh.hits), ('with look-ahead, map and planner it gets round', exh.events)
+    assert contacts[0] == 0, f'R99: and never touches a wall: {contacts[0]} contact steps'
+    assert exh.turns == 0, (exh.turns, exh.events)
     # R98: on the exit leg, anti-parallel and 0.3 m from entry-leg memory across the mapped
     # divider, the car is NOT backtracking; with no wall between, it is.
     ev = Explorer()

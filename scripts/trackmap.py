@@ -43,7 +43,10 @@ def dilate(occ, r):
 
 
 class Grid:
-    def __init__(self, hits, res=RES, pad=1.5, inflate=INFLATE, min_hits=2):
+    def __init__(self, hits, res=RES, pad=1.5, inflate=INFLATE, min_hits=2, rays=None):
+        """`hits` alone: unknown space is free. With `rays` [(origin, endpoints, is_hit), ...]
+        every cell a ray crossed is known free, and **unknown is blocked**: R99's plan ran through
+        walls the LIDAR had not yet seen, out to x = 6.1 past a wall at 5.1."""
         hits = np.asarray(hits, float).reshape(-1, 2)
         self.res, self.lo = res, hits.min(axis=0) - pad
         self.shape = tuple(int(v) for v in np.ceil((hits.max(axis=0) + pad - self.lo) / res) + 1)
@@ -52,6 +55,31 @@ class Grid:
         np.add.at(cnt, (ij[:, 0], ij[:, 1]), 1)
         self.occ = cnt >= min_hits
         self.blocked = dilate(self.occ, int(np.ceil(inflate / res)))
+        self.known = None
+        if rays is not None:
+            known = np.zeros(self.shape, bool)
+            for o, ends, _ in rays:
+                o, ends = np.asarray(o, float), np.asarray(ends, float).reshape(-1, 2)
+                seg = ends - o
+                n = int(np.ceil(np.linalg.norm(seg, axis=1).max() / res)) if len(ends) else 0
+                if n < 1:
+                    continue
+                f = np.linspace(0, 1, n + 1)[:-1]                 # stop short of the endpoint
+                pts = (o + f[:, None, None] * seg[None]).reshape(-1, 2)
+                ij = np.floor((pts - self.lo) / res).astype(int)
+                ok = (ij[:, 0] >= 0) & (ij[:, 1] >= 0) & (ij[:, 0] < self.shape[0]) & \
+                     (ij[:, 1] < self.shape[1])
+                known[ij[ok, 0], ij[ok, 1]] = True
+            self.known = known & ~self.occ
+            # R99: pad unknown like a wall. A wall seen by too few rays to count as occupied had
+            # unknown behind it, and an unpadded unknown let a plan pass 0.11 m from it.
+            self.blocked = dilate(self.occ | ~self.known, int(np.ceil(inflate / res)))
+
+    @classmethod
+    def from_rays(cls, rays, **kw):
+        ends = [np.asarray(e, float)[np.asarray(h, bool)] for _, e, h in rays]
+        hits = np.vstack([e for e in ends if len(e)] + [np.asarray([o for o, _, _ in rays])])
+        return cls(hits, rays=rays, **kw)
 
     def wall_between(self, a, b):
         """True if an occupied (uninflated) cell lies on the segment a-b (R98: a hairpin's other
@@ -70,7 +98,7 @@ class Grid:
         ij = np.floor((pts - self.lo) / self.res).astype(int)
         inside = (ij[:, 0] >= 0) & (ij[:, 1] >= 0) & (ij[:, 0] < self.shape[0]) & \
                  (ij[:, 1] < self.shape[1])
-        ok = np.ones(len(pts), bool)
+        ok = np.ones(len(pts), bool) if self.known is None else np.zeros(len(pts), bool)
         ok[inside] = ~self.blocked[ij[inside, 0], ij[inside, 1]]
         return ok
 
@@ -146,7 +174,8 @@ class PlanFollower:
     than `max_dev` m off the run."""
     DELTA_MAX = 0.5236
 
-    def __init__(self, path, v=0.5, thr=0.3, ld=0.4, end_tol=0.15, max_dev=0.45):
+    def __init__(self, path, v=0.5, thr=0.3, ld=0.4, end_tol=0.15, max_dev=0.45, stuck_s=2.5,
+                 dt=0.055):
         self.runs, cur = [], []
         for p in path[1:]:
             if cur and p[3] != cur[-1][3]:
@@ -157,6 +186,10 @@ class PlanFollower:
             self.runs.append(cur)
         self.v, self.thr, self.ld, self.end_tol, self.max_dev = v, thr, ld, end_tol, max_dev
         self.r, self.done, self.failed = 0, not self.runs, False
+        # R99: pinned against a wall, it commanded throttle for 500 steps. No progress ALONG the
+        # run (its nearest index not advancing) for stuck_s (calls x dt) means failed. Distance to
+        # the run's end is not monotone on a U-shaped run, so it is not the measure.
+        self.stuck_n, self.best, self.idle = int(round(stuck_s / dt)), -1, 0
 
     def __call__(self, xy, head, speed):
         if self.done or self.failed:
@@ -170,8 +203,16 @@ class PlanFollower:
         if np.linalg.norm(pts[-1] - xy) < self.end_tol:
             self.r += 1
             self.done = self.r >= len(self.runs)
+            self.best, self.idle = -1, 0
             return 0.0, 0.0                               # stop between runs
         i = int(np.argmin(d))
+        if i > self.best:
+            self.best, self.idle = i, 0
+        else:
+            self.idle += 1
+            if self.idle > self.stuck_n:
+                self.failed = True
+                return 0.0, 0.0
         seg = np.linalg.norm(np.diff(pts[i:], axis=0), axis=1).cumsum() if i < len(pts) - 1 \
             else np.zeros(0)
         j = i + 1 + int(np.searchsorted(seg, self.ld)) if seg.size else len(pts) - 1
@@ -244,6 +285,14 @@ def selftest():
     assert g.free(P).all(), 'every pose clears the inflated walls'
     assert max(abs(p[4]) for p in path) <= 1 / R_MIN + 1e-9, 'no arc tighter than r_min'
     assert P[:, 0].max() > 4.0, 'it went round the divider, not through it'
+    # rays: what a scan crossed is known free; beyond its walls is unknown, hence blocked
+    o_ = np.array([1.0, 0.6])
+    an_ = np.linspace(-np.pi, np.pi, 360, endpoint=False)
+    r_ = ray_cast(segs, o_, 0.0, an_)
+    gr = Grid.from_rays([(o_, o_ + r_[:, None] * np.c_[np.cos(an_), np.sin(an_)], r_ < 9.0)])
+    assert gr.free([[2.0, 0.6]])[0], 'seen open corridor is free'
+    assert not gr.free([[2.0, 1.9]])[0], 'leg B behind the divider is unseen: blocked'
+    assert not gr.free([[6.0, 0.6]])[0], 'outside the outer wall is blocked'
     # line of sight: across the divider there is a wall, along a leg there is not
     assert g.wall_between((2.0, 0.6), (2.0, 1.9)) and not g.wall_between((1.0, 0.6), (3.0, 0.6))
     # a car stalled against the wall (inside the inflated band) can still plan away from it
@@ -274,6 +323,12 @@ def selftest():
     assert pf2.done and not pf2.failed, (pf2.r, len(pf2.runs), pf2.failed)
     assert np.linalg.norm(xy2 - gl2) < 0.45 and mind2 > 0.15, (xy2, mind2)
     assert abs(_wrap(hd2 - np.pi)) < np.pi / 4, f'and arrives facing -x: {np.degrees(hd2):.0f}'
+    # follower unit: a car that does not move along the run is declared stuck (R99)
+    straight = [(0.0, 0.0, 0.0, 0, 0.0)] + [(0.2 * k, 0.0, 0.0, 1, 0.0) for k in range(1, 6)]
+    fs = PlanFollower(straight)
+    for _ in range(60):
+        fs(np.array([0.3, 0.0]), 0.0, 0.0)
+    assert fs.failed, 'no progress along the run for > stuck_s means failed'
     print('selftest OK', f'hairpin plan {len(path)} poses, clearance {mind:.2f}; dead end '
           f'{len(pf2.runs)} runs, clearance {mind2:.2f}')
 
