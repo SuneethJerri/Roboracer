@@ -137,6 +137,44 @@ def reward_progress(prev, cur, collision_penalty=5.0, progress_scale=100.0,
 
 
 # ----------------------------------------------------------------- ROS 2 interface
+class Recovery:
+    """D64: Follow-the-Gap plus a reverse recovery. FTG never reverses and stops when boxed in,
+    so a stall on AutoDRIVE is absorbing (R77, R88). When `plan()` is boxed in, or the car has been
+    below `v_stop` for `wait` s while commanding throttle, reverse at -`thr` for `dur` s with
+    full lock opposite to the last forward steering, then resume. At most `max_n` per `window` s,
+    so a car that cannot get out still stalls and is scored as stalled. Pass as `rollout(act=)`.
+    """
+
+    def __init__(self, wait=1.0, thr=0.3, dur=0.8, max_n=3, window=10.0, v_stop=0.1):
+        self.wait, self.thr, self.dur = wait, thr, dur
+        self.max_n, self.window, self.v_stop = max_n, window, v_stop
+        self.reset()
+
+    def reset(self):
+        self.since, self.until, self.rsteer, self.last, self.done = None, None, 0.0, 0.0, []
+
+    def __call__(self, iface):
+        import follow_the_gap as ftg
+        now = iface.now()
+        if self.until is not None and now < self.until:
+            return self.rsteer, -self.thr
+        steer, thr = ftg.plan(iface.scan, iface.angle_min, iface.angle_increment)
+        boxed = steer == 0.0 and thr == 0.0
+        if boxed or (thr > 0.0 and iface.speed < self.v_stop):
+            self.since = now if self.since is None else self.since
+        else:
+            self.since = None
+        recent = [t for t in self.done if now - t < self.window]
+        if self.since is not None and now - self.since >= self.wait and len(recent) < self.max_n:
+            self.rsteer = -float(np.sign(self.last))
+            self.until, self.since = now + self.dur, None
+            self.done = recent + [now]
+            return self.rsteer, -self.thr
+        if not boxed:
+            self.last = steer
+        return steer, thr
+
+
 class ContactCounter:
     """D57: wall contacts derived from the scan, because the simulator's counter is dead on
     the v4 track copies (R78). One event per rising edge of `min(scan) < on_m`, released
@@ -846,6 +884,36 @@ def selftest():
     for v, t in ((0, 0.0), (1, 1.0), (2, 2.0), (2, 3.0), (3, 3.1), (4, 5.1), (5, 5.2)):
         RoboRacerInterface._on_collision(fake, v, t=t)
     assert (fake.collisions, fake.contacts) == (5, 2), (fake.collisions, fake.contacts)
+
+    # D64: boxed in for `wait` reverses, opposite full lock to the last forward steer, for `dur`;
+    # capped at max_n per window; a moving car is never reversed; reset() clears it all.
+    import follow_the_gap as ftg
+    plan0, seq = ftg.plan, []
+    ftg.plan = lambda *a: seq[0]
+    try:
+        it = types.SimpleNamespace(scan=None, angle_min=0.0, angle_increment=0.0, speed=2.0,
+                                   t=0.0)
+        it.now = lambda: it.t
+        rc = Recovery()
+        seq[:] = [(0.4, 0.5)]
+        assert rc(it) == (0.4, 0.5) and rc.last == 0.4, 'driving: FTG passes through'
+        seq[:] = [(0.0, 0.0)]                                # boxed in from here
+        out = []
+        for k in range(90):                                  # 9 s at 10 Hz
+            it.t = 0.1 * (k + 1)
+            out.append(rc(it))
+        rev = [i for i, o in enumerate(out) if o[1] < 0]
+        assert rev and out[rev[0]] == (-1.0, -0.3), out[rev[0]] if rev else out
+        assert 9 <= rev[0] <= 11, f'reverse after ~1 s boxed, at sample {rev[0]}'
+        assert 7 <= sum(1 for i in rev if i < rev[0] + 10) <= 9, 'and holds it for ~0.8 s'
+        assert len(rc.done) == 3, f'capped at max_n per window: {rc.done}'
+        rc.reset()
+        assert (rc.until, rc.since, rc.done) == (None, None, []), 'reset clears state'
+        it.speed = 2.0
+        seq[:] = [(0.1, 0.5)]                                # driving, and moving
+        assert all(rc(it)[1] >= 0 for it.t in np.arange(0, 3, 0.1)), 'never reverse a mover'
+    finally:
+        ftg.plan = plan0
 
     print('selftest OK')
 

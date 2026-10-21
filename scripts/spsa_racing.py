@@ -283,10 +283,12 @@ def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None, normalize=False
                              f'{base:.1f}s; nothing can finish (notebook B2)')
         if ref_lap is None:
             ref_lap = base
-    if (u is None) == (act is None):
-        raise ValueError('pass gains `u` or a policy `act`, not both and not neither')
+    if u is None and act is None:
+        raise ValueError('pass gains `u`, a policy `act`, or both (D64: gains + a wrapper)')
     if u is not None:
         apply_gains(to_real(u))
+    if hasattr(act, 'reset'):
+        act.reset()                    # a stateful wrapper starts each rollout clean (D64)
     iface.reset()
     start_laps, start_col = iface.laps, iface.collisions
     start_ct = getattr(iface, 'contacts', 0)
@@ -394,7 +396,7 @@ class Meas(NamedTuple):
     rollouts: tuple
 
 
-def measure(pool, u, tracks, laps=1, timeout=250.0, ref_lap=None, stall_s=None):
+def measure(pool, u, tracks, laps=1, timeout=250.0, ref_lap=None, stall_s=None, act=None):
     """Measure `u` over `tracks`.
 
     `feasible` is all-of: a gain set that finishes 2 of 3 circuits has not solved the
@@ -404,7 +406,8 @@ def measure(pool, u, tracks, laps=1, timeout=250.0, ref_lap=None, stall_s=None):
     All three channels come from the same two rollouts, so carrying them costs nothing.
     `score` is kept so that every number recorded before C3 stays comparable.
     """
-    rs = [rollout(pool.get(t), u, laps, timeout, ref_lap, normalize=True, stall_s=stall_s)
+    rs = [rollout(pool.get(t), u, laps, timeout, ref_lap, normalize=True, stall_s=stall_s,
+                  act=act)
           for t in tracks]
     return Meas(score=float(np.mean([r.score for r in rs])),
                 cost=float(np.mean([r.cost for r in rs])),
@@ -593,7 +596,7 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
                      delta=DELTA, family='bernoulli', accumulate_g=False,
                      graded_g=False, c_adapt=0.0, restart=False, sf_m=0, sf_sigma=0.16,
                      one_meas=False, tracks=None, beta=None, mu0=0.0, h_key='contacts',
-                     stall_s=None):
+                     stall_s=None, restart_on='tie', act=None):
     """Primal-dual SPSA on a constrained racing problem (notebook C3).
 
         minimise   J(theta)  = E_M[ implied_lap(theta, M) / baseline(M) ]
@@ -665,6 +668,10 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
 
     `stall_s` ends a probe that has stopped (D63, see rollout()).
 
+    `restart_on='infeasible'` fires the restart when both probes fail, `spsa()`'s own rule
+    (D34), instead of on `L+ == L-`. Under graded G two failed probes never tie exactly, so the
+    tie trigger stops firing (R88). 'tie' stays the default so R53 reproduces.
+
     `tracks` fixes the draw for every iteration, for a single-track backend (AutoDRIVE).
     """
     import circuits
@@ -674,6 +681,7 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
         os.makedirs(os.path.dirname(out), exist_ok=True)
     A_stab = 0.1 * iters if A_stab is None else A_stab
     assert lam_every >= 2, 'the dual must be slower than the primal'
+    assert restart_on in ('tie', 'infeasible'), restart_on
     pert, is_sf = perturbation(family), sf_form(family)      # C2 knob; see spsa()
 
     rng = np.random.default_rng([seed, 0])          # perturbations
@@ -682,7 +690,8 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
     srng = np.random.default_rng([seed, 8])         # SF probes (D36)
     assert not (sf_m and (c_adapt or restart)), 'sf_m is its own estimator (D36)'
     assert not (one_meas and (sf_m or c_adapt or restart)), 'one_meas is its own (D37)'
-    assert beta is None or (beta > 0 and not (sf_m or one_meas)), 'beta: two-probe only (D60)'
+    assert beta is None or (beta > 0 and not (sf_m or one_meas)), \
+        'beta: two-probe only (D60)'
     u = np.array([0.5] * P) if start is None else np.asarray(start, dtype=float)
     print('start (unit):', np.round(u, 4),
           '= box midpoint' if start is None else '= --start', flush=True)   # B10
@@ -710,11 +719,12 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
                     circuits.sample(tracks_per_iter, trng))      # CRN, both arms (D4)
             if sf_m:                                             # D36: J_sigma
                 cn = sf_sigma
-                mm = measure(pool, u, draw, laps, timeout, stall_s=stall_s)
+                mm = measure(pool, u, draw, laps, timeout, stall_s=stall_s, act=act)
                 Gm = violation(mm.rollouts, delta, graded_g)
                 Lm = mm.cost + lam * (Gm - alpha)
                 ds = srng.standard_normal((sf_m, P))
-                ms = [measure(pool, u + cn * di, draw, laps, timeout, stall_s=stall_s) for di in ds]
+                ms = [measure(pool, u + cn * di, draw, laps, timeout, stall_s=stall_s, act=act)
+                      for di in ds]
                 Gs = [violation(x.rollouts, delta, graded_g) for x in ms]
                 Ls = [x.cost + lam * (g - alpha) for x, g in zip(ms, Gs)]
                 g = sum(di * (Li - Lm) for di, Li in zip(ds, Ls)) / (cn * sf_m)
@@ -724,13 +734,13 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
                                     feasible=all(x.feasible for x in ms))
                 Gp, Lp = float(np.mean(Gs)), float(np.mean(Ls))
             elif one_meas:                                       # D37
-                mp = mm = measure(pool, u + cn * d, draw, laps, timeout, stall_s=stall_s)
+                mp = mm = measure(pool, u + cn * d, draw, laps, timeout, stall_s=stall_s, act=act)
                 Gp = Gm = violation(mp.rollouts, delta, graded_g)
                 Lp, Lm = mp.cost + lam * (Gp - alpha), float('nan')
                 u = np.clip(u - np.clip(an * Lp / (cn * d), -max_step, max_step), 0.0, 1.0)
             else:
-                mp = measure(pool, u + cn * d, draw, laps, timeout, stall_s=stall_s)
-                mm = measure(pool, u - cn * d, draw, laps, timeout, stall_s=stall_s)
+                mp = measure(pool, u + cn * d, draw, laps, timeout, stall_s=stall_s, act=act)
+                mm = measure(pool, u - cn * d, draw, laps, timeout, stall_s=stall_s, act=act)
                 Gp, Gm = (violation(mp.rollouts, delta, graded_g),
                           violation(mm.rollouts, delta, graded_g))
                 Lp = mp.cost + lam * (Gp - alpha)
@@ -748,7 +758,8 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
             # C4's radius is one response (R49); `restart` is cheaper and did as well (R53).
             if sf_m or one_meas:
                 pass                                             # stepped above
-            elif restart and Lp == Lm:
+            elif restart and (Lp == Lm if restart_on == 'tie'
+                              else not (mp.feasible or mm.feasible)):
                 u = np.clip(u + jrng.normal(0, 2 * cn, size=P), 0.0, 1.0)
             else:
                 u = np.clip(u - np.clip(an * grad(Lp - Lm, cn, d, is_sf),
@@ -1402,6 +1413,38 @@ def selftest():
             assert all(t == th['plain'][0] for t in th['plain']), 'plateau: plain is frozen'
             assert th['restart'][-1] != th['restart'][0], 'the restart must move theta'
             assert c_mults(os.path.join(td, 'rs_restart.csv')) == [1.0] * 4
+            # R88: under graded G, failed probes at different progress never tie, so the tie
+            # trigger is silent and theta barely moves. 'infeasible' must fire there anyway.
+            class _Graded(_Bowl):
+                def __init__(self, t):
+                    super().__init__(t, wall=-1.0)
+                    self.progress = lambda: 0.1 + 0.2 * float(
+                        to_unit([getattr(ftg, nm) for nm, _, _ in GAINS])[0])
+            disp = {}
+            for trig in ('tie', 'infeasible'):
+                fp = os.path.join(td, f'rs_graded_{trig}.csv')
+                spsa_constrained(CircuitPool(lambda t: _Graded(t)), iters=4, seed=0,
+                                 timeout=250.0, restart=True, graded_g=True,
+                                 restart_on=trig, out=fp)
+                rr = list(csv.DictReader(open(fp)))
+                assert all(r['L_plus'] != r['L_minus'] for r in rr), 'graded: no exact ties'
+                th0 = np.array([float(rr[0][k]) for k in gk])
+                disp[trig] = float(np.abs(np.array([float(rr[-1][k]) for k in gk]) - th0).max())
+            assert disp['infeasible'] > 5 * disp['tie'], f'infeasible trigger must jump: {disp}'
+            # D64: an `act` wrapper reaches both probes, with the gains applied, and is reset
+            # at the start of each rollout.
+            calls = {'act': 0, 'reset': 0}
+
+            class _Wrap:
+                def reset(self):
+                    calls['reset'] += 1
+
+                def __call__(self, it):
+                    calls['act'] += 1
+                    return ftg.plan(it.scan, it.angle_min, it.angle_increment)
+            spsa_constrained(CircuitPool(lambda t: _Bowl(t)), iters=1, seed=0, timeout=1e9,
+                             act=_Wrap(), out=os.path.join(td, 'wrap.csv'))
+            assert calls['reset'] == 4 and calls['act'] >= 4, calls    # 2 probes x 2 tracks
 
             # D36: the SF step must descend a bowl, and with sigma reaching past the
             # plateau's edge it must move where SPSA at a small radius is frozen.
