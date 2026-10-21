@@ -144,13 +144,16 @@ class PurePursuit:
     full acceleration and 0 is a hard brake (R89). `path` is (N, 2), closed, in IPS coordinates.
     Commands are in AutoDRIVE's own units (delta / 0.5236), so the runner must not rescale them.
     Heading is the direction of the car's own last `head_m` of IPS travel, and the path tangent
-    before it has moved: odometry's quaternion, read as a planar yaw, was wrong (R93).
+    before it has moved: odometry's quaternion, read as a planar yaw, was wrong (R93). The
+    lookahead grows with speed, max(ld, t_la v): a fixed 0.8 m is 2-3 control cycles at 6 m/s,
+    and with the loop's delay it oscillated into the wall (R95).
     """
     L, DELTA_MAX = 0.33, 0.5236                       # bridge TF; R73
 
-    def __init__(self, path, ld=0.8, a_lat=4.0, v_max=6.0, horizon=2.0, thr=0.6, head_m=0.15):
+    def __init__(self, path, ld=0.6, a_lat=4.0, v_max=6.0, horizon=2.0, thr=0.6, head_m=0.15,
+                 t_la=0.5):
         self.p = np.asarray(path, float)[:, :2]
-        self.head_m = head_m
+        self.head_m, self.t_la = head_m, t_la
         self.trace = None                  # set to [] to record every decision (R94)
         self.ld, self.a_lat, self.v_max, self.horizon, self.thr = ld, a_lat, v_max, horizon, thr
         seg = np.linalg.norm(np.diff(self.p, axis=0, append=self.p[:1]), axis=1)
@@ -190,9 +193,10 @@ class PurePursuit:
         elif np.linalg.norm(xy - self.anchor) >= self.head_m:
             d = xy - self.anchor
             self.head, self.anchor = float(np.arctan2(d[1], d[0])), xy
-        tgt = self.p[(i + max(1, int(round(self.ld / self.ds)))) % n]
+        ld = max(self.ld, self.t_la * iface.speed)
+        tgt = self.p[(i + max(1, int(round(ld / self.ds)))) % n]
         alpha = np.arctan2(tgt[1] - xy[1], tgt[0] - xy[0]) - self.head
-        delta = np.arctan(2 * self.L * np.sin(alpha) / self.ld)
+        delta = np.arctan(2 * self.L * np.sin(alpha) / ld)
         ahead = self.kappa[(i + np.arange(int(round(self.horizon / self.ds)))) % n]
         v_t = min(self.v_max, np.sqrt(self.a_lat / max(float(ahead.max()), 1e-6)))
         throttle = self.thr if iface.speed < v_t else 0.0
@@ -987,17 +991,20 @@ def selftest():
 
     # D68: pure pursuit on a kinematic car (R89's model) laps a stadium track, stays within
     # 0.15 m of the line, and is slower in the tight ends than on the straights.
+    # R95: at the real loop's ~18 Hz with ~0.1 s of command delay, on straights long enough to
+    # reach 6 m/s. A delay-free test passed a fixed 0.8 m lookahead that oscillated into a wall.
     th = np.linspace(0, np.pi, 60, endpoint=False)
-    oval = np.r_[np.c_[np.linspace(0, 6, 80, endpoint=False), np.zeros(80)],
-                 np.c_[6 + 1.2 * np.sin(th), 1.2 - 1.2 * np.cos(th)],
-                 np.c_[np.linspace(6, 0, 80, endpoint=False), np.full(80, 2.4)],
+    oval = np.r_[np.c_[np.linspace(0, 16, 200, endpoint=False), np.zeros(200)],
+                 np.c_[16 + 1.2 * np.sin(th), 1.2 - 1.2 * np.cos(th)],
+                 np.c_[np.linspace(16, 0, 200, endpoint=False), np.full(200, 2.4)],
                  np.c_[-1.2 * np.sin(th), 1.2 + 1.2 * np.cos(th)]]
     pp = PurePursuit(oval)
     car = types.SimpleNamespace(position=np.zeros(3), speed=0.0)    # no yaw: R93
     yaw = 0.0
-    dt, prog, dev, v_end, v_str = 0.05, 0.0, [], [], []
-    for _ in range(600):                                 # 30 s
-        st, th_ = pp(car)
+    dt, prog, dev, v_end, v_str, q, dev_str = 0.055, 0.0, [], [], [], [(0.0, 0.0)] * 2, []
+    for _ in range(700):                                 # ~38 s
+        q.append(pp(car))
+        st, th_ = q.pop(0)                               # applied two cycles late
         delta = st * PurePursuit.DELTA_MAX
         acc = 4.5 if th_ >= 0.3 else -6.0                # R89: saturated / hard brake
         car.speed = max(0.0, car.speed + acc * dt)
@@ -1005,9 +1012,13 @@ def selftest():
         car.position[:2] += car.speed * dt * np.array([np.cos(yaw), np.sin(yaw)])
         d = np.min(np.linalg.norm(oval - car.position[:2], axis=1))
         dev.append(d)
-        (v_end if car.position[0] > 6.3 or car.position[0] < -0.3 else v_str).append(car.speed)
+        (v_end if car.position[0] > 16.3 or car.position[0] < -0.3 else v_str).append(car.speed)
+        if 5.0 < car.position[0] < 11.0:                 # mid-straight, clear of corner exits
+            dev_str.append(d)
         prog = max(prog, pp.i) if pp.i < len(oval) - 5 else prog
-    assert max(dev[40:]) < 0.15, f'pure pursuit must hold the line: max dev {max(dev[40:]):.3f}'
+    assert max(dev_str[20:]) < 0.10, f'no slalom on the straights: {max(dev_str[20:]):.3f}'
+    assert max(dev[40:]) < 0.30, f'corner cutting stays bounded: max dev {max(dev[40:]):.3f}'
+    assert max(v_str) > 5.0, 'and the straights must be fast enough to test the lookahead'
     assert prog > len(oval) * 0.9, 'and get round the lap'
     assert np.mean(v_end) < 0.8 * np.mean(v_str), (np.mean(v_end), np.mean(v_str))
 
