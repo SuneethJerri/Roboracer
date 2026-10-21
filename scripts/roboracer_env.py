@@ -261,20 +261,37 @@ class Recovery:
     """
 
     def __init__(self, wait=1.0, thr=0.3, dur=0.5, max_n=3, window=10.0, v_stop=0.1,
-                 steer=0.4, base=None):
+                 steer=0.4, base=None, aware=False, clear=0.6, min_dur=0.3, max_dur=1.2,
+                 aware_steer=0.8):
         self.wait, self.thr, self.dur, self.steer = wait, thr, dur, steer
         self.base = base                   # D69: any act(iface); None means FTG's plan()
+        # D69 (user: "0.4 lock ... in a loop at a wall"): with `aware`, turn the nose toward the
+        # more open side read from the scan (reversing flips the turn, so steer AWAY from it),
+        # and reverse until the way ahead is `clear` m open, between min_dur and max_dur s.
+        self.aware, self.clear, self.min_dur, self.max_dur = aware, clear, min_dur, max_dur
+        self.aware_steer = aware_steer
         self.max_n, self.window, self.v_stop = max_n, window, v_stop
         self.reset()
 
     def reset(self):
         self.since, self.until, self.rsteer, self.last, self.done = None, None, 0.0, 0.0, []
+        self.t_rev = None
+
+    @staticmethod
+    def _sector(iface, lo, hi, fn):
+        r = np.asarray(iface.scan, float)
+        a = iface.angle_min + iface.angle_increment * np.arange(r.size)
+        w = r[(a >= lo) & (a <= hi) & np.isfinite(r) & (r > 0)]
+        return float(fn(w)) if w.size else 10.0
 
     def __call__(self, iface):
         import follow_the_gap as ftg
         now = iface.now()
         if self.until is not None and now < self.until:
-            return self.rsteer, -self.thr
+            if not (self.aware and now - self.t_rev >= self.min_dur
+                    and self._sector(iface, -0.26, 0.26, np.min) >= self.clear):
+                return self.rsteer, -self.thr
+            self.until = now                                  # room ahead: drive on
         steer, thr = (self.base(iface) if self.base is not None else
                       ftg.plan(iface.scan, iface.angle_min, iface.angle_increment))
         boxed = steer == 0.0 and thr == 0.0
@@ -284,8 +301,15 @@ class Recovery:
             self.since = None
         recent = [t for t in self.done if now - t < self.window]
         if self.since is not None and now - self.since >= self.wait and len(recent) < self.max_n:
-            self.rsteer = -self.steer * float(np.sign(self.last))
-            self.until, self.since = now + self.dur, None
+            if self.aware:
+                left = self._sector(iface, 0.5, 1.6, np.median)
+                right = self._sector(iface, -1.6, -0.5, np.median)
+                self.rsteer = -self.aware_steer * (1.0 if left > right else -1.0)
+                self.until = now + self.max_dur
+            else:
+                self.rsteer = -self.steer * float(np.sign(self.last))
+                self.until = now + self.dur
+            self.since, self.t_rev = None, now
             self.done = recent + [now]
             return self.rsteer, -self.thr
         if not boxed:
@@ -1046,6 +1070,23 @@ def selftest():
         outs.append(rc(it))
         flags.append(rc.reversing(it.t))
     assert outs[0] == (0.8, 0.5) and (-0.4, -0.3) in outs and any(flags), (outs, flags)
+    # `aware`: wall ahead, open on the left: reverse steering RIGHT (nose swings left), held
+    # until the front clears (after min_dur), not for a fixed time.
+    ang = -2.35619 + 0.004363323 * np.arange(1081)
+    walled = np.where(np.abs(ang) < 0.3, 0.15, np.where(ang > 0, 3.0, 0.3))
+    it = types.SimpleNamespace(speed=0.0, t=0.0, scan=walled, angle_min=-2.35619,
+                               angle_increment=0.004363323)
+    it.now = lambda: it.t
+    rc = Recovery(base=lambda i: (0.0, 0.5), aware=True)
+    outs = []
+    for k in range(25):
+        it.t = 0.1 * (k + 1)
+        if k == 16:
+            it.scan = np.where(np.abs(ang) < 0.3, 1.0, walled)    # backed out: room ahead
+        outs.append(rc(it))
+    rev = [k for k, o in enumerate(outs) if o[1] < 0]
+    assert rev and outs[rev[0]] == (-0.8, -0.3), outs
+    assert rev[-1] == 16 - 1 and not rc.reversing(it.t), (rev, 'held until the front cleared')
 
     # D68: pure pursuit on a kinematic car (R89's model) laps a stadium track, stays within
     # 0.15 m of the line, and is slower in the tight ends than on the straights.
