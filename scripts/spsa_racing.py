@@ -248,8 +248,11 @@ class Rollout(NamedTuple):
     contacts: int = 0                   # collision-counter episodes, AutoDRIVE only (D60)
 
 
+STALL_SPEED = 0.2   # m/s: below this, with no progress for stall_s, the car has stopped (D63)
+
+
 def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None, normalize=False,
-            act=None):
+            act=None, stall_s=None):
     """Reset, drive, and report what happened for gains `u`.
 
     `normalize` divides the score by the circuit's frozen baseline (D5) and, unless
@@ -295,6 +298,11 @@ def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None, normalize=False
     t0 = t_start = iface.now()  # SIM time: wall clock is wrong at 45x real time. t0 is
     deadline = t0 + timeout     # reset at each crossing; t_start is the rollout's own
     seen = start_laps
+    # D63: end a probe that has stopped. Cost-neutral, because implied_lap charges the
+    # budget, not elapsed time. Needs speed too: off the progress corridor a moving car
+    # reads no progress (R76) and must not be cut off.
+    stall = stall_s if hasattr(iface, 'progress') else None
+    best, t_best = -1.0, t_start
 
     while iface.now() < deadline and len(lap_times) < laps_wanted:
         if not iface.wait_for_scan(timeout=2.0):
@@ -302,6 +310,12 @@ def rollout(iface, u, laps_wanted=1, timeout=60.0, ref_lap=None, normalize=False
         steer, throttle = (act(iface) if act else
                            ftg.plan(iface.scan, iface.angle_min, iface.angle_increment))
         iface.send(steer, throttle)
+        if stall:
+            key = iface.laps + iface.progress()
+            if key > best + 1e-9 or getattr(iface, 'speed', 0.0) >= STALL_SPEED:
+                best, t_best = max(best, key), iface.now()
+            elif iface.now() - t_best > stall:
+                break
         if iface.laps > seen:
             now = iface.now()
             floor = getattr(iface, 'min_plausible_lap', lambda: 0.0)()
@@ -380,7 +394,7 @@ class Meas(NamedTuple):
     rollouts: tuple
 
 
-def measure(pool, u, tracks, laps=1, timeout=250.0, ref_lap=None):
+def measure(pool, u, tracks, laps=1, timeout=250.0, ref_lap=None, stall_s=None):
     """Measure `u` over `tracks`.
 
     `feasible` is all-of: a gain set that finishes 2 of 3 circuits has not solved the
@@ -390,7 +404,7 @@ def measure(pool, u, tracks, laps=1, timeout=250.0, ref_lap=None):
     All three channels come from the same two rollouts, so carrying them costs nothing.
     `score` is kept so that every number recorded before C3 stays comparable.
     """
-    rs = [rollout(pool.get(t), u, laps, timeout, ref_lap, normalize=True)
+    rs = [rollout(pool.get(t), u, laps, timeout, ref_lap, normalize=True, stall_s=stall_s)
           for t in tracks]
     return Meas(score=float(np.mean([r.score for r in rs])),
                 cost=float(np.mean([r.cost for r in rs])),
@@ -578,7 +592,8 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
                      lam0=1.0, tracks_per_iter=2, start=None, lam_every=LAM_EVERY,
                      delta=DELTA, family='bernoulli', accumulate_g=False,
                      graded_g=False, c_adapt=0.0, restart=False, sf_m=0, sf_sigma=0.16,
-                     one_meas=False, tracks=None, beta=None, mu0=0.0, h_key='contacts'):
+                     one_meas=False, tracks=None, beta=None, mu0=0.0, h_key='contacts',
+                     stall_s=None):
     """Primal-dual SPSA on a constrained racing problem (notebook C3).
 
         minimise   J(theta)  = E_M[ implied_lap(theta, M) / baseline(M) ]
@@ -648,6 +663,8 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
     `h_key` names the Rollout field H counts: 'contacts' (episodes, D60) or 'collisions'
     (ticks, D61).
 
+    `stall_s` ends a probe that has stopped (D63, see rollout()).
+
     `tracks` fixes the draw for every iteration, for a single-track backend (AutoDRIVE).
     """
     import circuits
@@ -693,11 +710,11 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
                     circuits.sample(tracks_per_iter, trng))      # CRN, both arms (D4)
             if sf_m:                                             # D36: J_sigma
                 cn = sf_sigma
-                mm = measure(pool, u, draw, laps, timeout)
+                mm = measure(pool, u, draw, laps, timeout, stall_s=stall_s)
                 Gm = violation(mm.rollouts, delta, graded_g)
                 Lm = mm.cost + lam * (Gm - alpha)
                 ds = srng.standard_normal((sf_m, P))
-                ms = [measure(pool, u + cn * di, draw, laps, timeout) for di in ds]
+                ms = [measure(pool, u + cn * di, draw, laps, timeout, stall_s=stall_s) for di in ds]
                 Gs = [violation(x.rollouts, delta, graded_g) for x in ms]
                 Ls = [x.cost + lam * (g - alpha) for x, g in zip(ms, Gs)]
                 g = sum(di * (Li - Lm) for di, Li in zip(ds, Ls)) / (cn * sf_m)
@@ -707,13 +724,13 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
                                     feasible=all(x.feasible for x in ms))
                 Gp, Lp = float(np.mean(Gs)), float(np.mean(Ls))
             elif one_meas:                                       # D37
-                mp = mm = measure(pool, u + cn * d, draw, laps, timeout)
+                mp = mm = measure(pool, u + cn * d, draw, laps, timeout, stall_s=stall_s)
                 Gp = Gm = violation(mp.rollouts, delta, graded_g)
                 Lp, Lm = mp.cost + lam * (Gp - alpha), float('nan')
                 u = np.clip(u - np.clip(an * Lp / (cn * d), -max_step, max_step), 0.0, 1.0)
             else:
-                mp = measure(pool, u + cn * d, draw, laps, timeout)
-                mm = measure(pool, u - cn * d, draw, laps, timeout)
+                mp = measure(pool, u + cn * d, draw, laps, timeout, stall_s=stall_s)
+                mm = measure(pool, u - cn * d, draw, laps, timeout, stall_s=stall_s)
                 Gp, Gm = (violation(mp.rollouts, delta, graded_g),
                           violation(mm.rollouts, delta, graded_g))
                 Lp = mp.cost + lam * (Gp - alpha)
@@ -1201,6 +1218,53 @@ def selftest():
             part = Rollout(90, False, 1, 0, 0.5, 'X', contacts=3)
             assert contact_rate([part], 2.0) == 1.0, '3 contacts over 1.5 laps driven, beta 2'
             assert contact_rate([Rollout(9, True, 2, 0, 0.0, 'X', contacts=4)], 2.0) == 1.0
+            # D63: a car that stops is ended early at the SAME cost (implied_lap charges the
+            # budget), and one still moving without progress (off the corridor) is not cut.
+            class _Halt:
+                laps = collisions = 0
+                angle_min, angle_increment = -2.35, 0.00435
+                scan = np.full(1080, 5.0)
+
+                def __init__(self, moving):
+                    self._t, self._p, self.moving = 0.0, 0.0, moving
+
+                def reset(self):
+                    self._t, self._p = 0.0, 0.0
+
+                def now(self):
+                    return self._t
+
+                def wait_for_scan(self, timeout=None):
+                    self._t += 0.5
+                    self._p = min(0.3, self._p + 0.05)
+                    return True
+
+                def progress(self):
+                    return self._p
+
+                @property
+                def speed(self):
+                    return 1.0 if self.moving or self._p < 0.3 else 0.0
+
+                def send(self, *a):
+                    pass
+
+            h0, h1 = _Halt(False), _Halt(False)
+            full = rollout(h0, [0.5] * P, timeout=60.0)
+            cut = rollout(h1, [0.5] * P, timeout=60.0, stall_s=5.0)
+            assert h1._t < 15.0 <= 60.0 <= h0._t, (h0._t, h1._t)
+            assert (cut.cost, cut.shortfall, cut.feasible) == \
+                (full.cost, full.shortfall, full.feasible), 'early stop must not change cost'
+            hm = _Halt(True)
+            rollout(hm, [0.5] * P, timeout=60.0, stall_s=5.0)
+            assert hm._t >= 60.0, 'a moving car without progress must not be cut'
+            hs, ends = _Halt(False), []
+            hs.ref_lap_s = 10.0
+            hs.reset = lambda: (ends.append(hs._t), setattr(hs, '_t', 0.0),
+                                setattr(hs, '_p', 0.0))
+            spsa_constrained(CircuitPool(lambda t: hs), iters=1, seed=0, timeout=60.0,
+                             tracks=('X',), stall_s=5.0, out=os.path.join(td, 'halt.csv'))
+            assert max(ends + [hs._t]) < 15.0, 'stall_s must reach BOTH probes in spsa_constrained'
             assert fins['mu'] < fins['free'] - 0.05, \
                 f'the contact constraint must pull gain 1 down: {fins}'
             assert float(rr[0]['J_plus']) > 1.8, 'ref_lap_s, not the D5 baseline, sets the scale'
