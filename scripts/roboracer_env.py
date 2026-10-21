@@ -151,6 +151,7 @@ class PurePursuit:
     def __init__(self, path, ld=0.8, a_lat=4.0, v_max=6.0, horizon=2.0, thr=0.6, head_m=0.15):
         self.p = np.asarray(path, float)[:, :2]
         self.head_m = head_m
+        self.trace = None                  # set to [] to record every decision (R94)
         self.ld, self.a_lat, self.v_max, self.horizon, self.thr = ld, a_lat, v_max, horizon, thr
         seg = np.linalg.norm(np.diff(self.p, axis=0, append=self.p[:1]), axis=1)
         self.ds = float(np.median(seg))
@@ -195,7 +196,11 @@ class PurePursuit:
         ahead = self.kappa[(i + np.arange(int(round(self.horizon / self.ds)))) % n]
         v_t = min(self.v_max, np.sqrt(self.a_lat / max(float(ahead.max()), 1e-6)))
         throttle = self.thr if iface.speed < v_t else 0.0
-        return float(np.clip(delta / self.DELTA_MAX, -1.0, 1.0)), throttle
+        steer = float(np.clip(delta / self.DELTA_MAX, -1.0, 1.0))
+        if self.trace is not None:
+            self.trace.append((iface.now(), xy[0], xy[1], i, self.head, alpha, steer, throttle,
+                               iface.speed, v_t))
+        return steer, throttle
 
 
 class Recovery:
