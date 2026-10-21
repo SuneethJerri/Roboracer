@@ -137,6 +137,48 @@ def reward_progress(prev, cur, collision_penalty=5.0, progress_scale=100.0,
 
 
 # ----------------------------------------------------------------- ROS 2 interface
+class WallFollower:
+    """D69: a slow corridor-centring follower for the mapping lap. On each side, two beams (at
+    90 deg and 90 - theta) give that wall's angle a and its distance `look` m ahead,
+    b cos(a) + look sin(a). Steering is PD on half the difference, so it centres. A fixed 0.4 m
+    from the right wall read a curving wall as nearer and ran at 0.25 m from it, and right-only
+    centring was biased outward on curves; the track's width varies 0.7-1.5 m.
+    It never chooses between gaps, so it
+    cannot box itself in or turn round the way FTG does (R88, B39). Speed is held near `v` with
+    the same bang-bang throttle as PurePursuit (R89). Positive steering turns left (R94), and
+    positive scan angles are to the left, so the right wall is at -90 deg.
+    """
+
+    def __init__(self, theta=0.87, look=0.6, kp=1.2, kd=0.15, v=1.0, thr=0.5):
+        self.theta, self.look = theta, look
+        self.kp, self.kd, self.v, self.thr = kp, kd, v, thr
+        self.reset()
+
+    def reset(self):
+        self.prev = None
+
+    def _range(self, iface, ang):
+        r = np.asarray(iface.scan, float)
+        k = int(round((ang - iface.angle_min) / iface.angle_increment))
+        w = r[max(0, k - 3):k + 4]
+        w = w[np.isfinite(w) & (w > 0)]
+        return float(np.median(w)) if w.size else 10.0
+
+    def _ahead(self, iface, side):
+        """Distance to the wall on `side` (+1 left, -1 right), `look` m ahead (two-beam)."""
+        b = self._range(iface, side * np.pi / 2)
+        a = self._range(iface, side * (np.pi / 2 - self.theta))
+        alpha = np.arctan2(a * np.cos(self.theta) - b, a * np.sin(self.theta))
+        return b * np.cos(alpha) + self.look * np.sin(alpha)
+
+    def __call__(self, iface):
+        err = 0.5 * (self._ahead(iface, +1) - self._ahead(iface, -1))   # > 0: nearer the right
+        de = 0.0 if self.prev is None else err - self.prev
+        self.prev = err
+        steer = float(np.clip(self.kp * err + self.kd * de / 0.055, -1.0, 1.0))
+        return steer, (self.thr if iface.speed < self.v else 0.0)
+
+
 class PurePursuit:
     """D68: follow a known path instead of the scan's gaps. Steering is pure pursuit,
     delta = atan(2 L sin(alpha) / ld), which is exact for the kinematic car R89 measured. Speed
@@ -1021,6 +1063,38 @@ def selftest():
     assert max(v_str) > 5.0, 'and the straights must be fast enough to test the lookahead'
     assert prog > len(oval) * 0.9, 'and get round the lap'
     assert np.mean(v_end) < 0.8 * np.mean(v_str), (np.mean(v_end), np.mean(v_str))
+
+    # D69: the wall follower laps a ring track (inner radius 2.0, outer 3.0) counter-clockwise,
+    # so the outer wall is on its right, at the loop's 18 Hz with a 2-cycle command delay,
+    # without touching either wall. Ranges are ray-cast against the two circles.
+    def ring_scan(xy, hd, angs, r_in=2.0, r_out=3.0):
+        out = np.full(angs.size, 10.0)
+        for j, an in enumerate(angs):
+            dv = np.array([np.cos(hd + an), np.sin(hd + an)])
+            pb, c0 = float(xy @ dv), float(xy @ xy)
+            for rr in (r_in, r_out):
+                disc = pb * pb - (c0 - rr * rr)
+                if disc >= 0:
+                    for tt in (-pb - np.sqrt(disc), -pb + np.sqrt(disc)):
+                        if 1e-6 < tt < out[j]:
+                            out[j] = tt
+        return out
+    angs = -2.35619 + 0.0261799 * np.arange(181)          # coarse 1.5 deg beams, same span
+    car = types.SimpleNamespace(position=np.array([2.5, 0.0, 0.0]), speed=0.0,
+                                angle_min=-2.35619, angle_increment=0.0261799)
+    wf, hd, q, rad, turned = WallFollower(), np.pi / 2, [(0.0, 0.0)] * 2, [], 0.0
+    for _ in range(900):                                  # ~50 s
+        car.scan = ring_scan(car.position[:2], hd, angs)
+        q.append(wf(car))
+        st, th_ = q.pop(0)
+        car.speed = max(0.0, car.speed + (4.5 if th_ >= 0.3 else -6.0) * 0.055)
+        dh = car.speed * np.tan(st * PurePursuit.DELTA_MAX) / PurePursuit.L * 0.055
+        hd, turned = hd + dh, turned + dh
+        car.position[:2] += car.speed * 0.055 * np.array([np.cos(hd), np.sin(hd)])
+        rad.append(np.linalg.norm(car.position[:2]))
+    assert 2.25 < min(rad[20:]) and max(rad[20:]) < 2.75, (min(rad[20:]), max(rad[20:]))
+    assert turned > 2 * np.pi, f'and get round the ring: {np.degrees(turned):.0f} deg'
+    assert abs(np.mean(rad[200:]) - 2.5) < 0.1, f'centred in the corridor: {np.mean(rad[200:]):.3f}'
 
     print('selftest OK')
 
