@@ -179,6 +179,117 @@ class WallFollower:
         return steer, (self.thr if iface.speed < self.v else 0.0)
 
 
+class Explorer:
+    """D69 (user: "can it not know where it was before and explore new positions"): the mapping
+    lap's controller. `base` (a WallFollower) drives; the explorer remembers where it has been.
+    Every `ds` m of forward travel it stores (position, direction), which is also the recorded
+    path. If the car comes within `near` m of a point stored more than `skip_m` m of path ago while
+    moving against that point's direction, it is going backwards, and it turns round toward the
+    remembered direction. A stall turns toward the remembered direction if it is near visited
+    ground, else toward the more open side of the scan. A turn is a K-turn: reverse with `steer`
+    of lock away from the target side (a reverse flips the turn), then forward toward it, each leg
+    at most `leg_m` m and `v_turn` m/s, switching early when the front is under `front_min` m,
+    until the heading is within `align` of the target with the way ahead `clear` m open, or
+    `max_dur`. A plain reverse was too fast (throttle -0.3 is full acceleration, R89) and could
+    not turn a car round in a corridor.
+    Heading is from IPS motion (R93), flipped when a step goes against the current heading.
+    """
+
+    def __init__(self, base=None, ds=0.05, near=0.4, skip_m=0.6, thr=0.3, steer=0.8, clear=0.5,
+                 min_dur=0.3, max_dur=8.0, align=np.pi / 4, wait=1.0, v_stop=0.1, leg_m=0.5,
+                 v_turn=0.8, front_min=0.3):
+        self.base = base if base is not None else WallFollower()
+        self.ds, self.near, self.skip = ds, near, int(round(skip_m / ds))
+        self.thr, self.steer, self.clear = thr, steer, clear
+        self.min_dur, self.max_dur, self.align = min_dur, max_dur, align
+        self.wait, self.v_stop = wait, v_stop
+        self.leg_m, self.v_turn, self.front_min = leg_m, v_turn, front_min
+        self.reset()
+
+    def reset(self):
+        self.pts, self.dirs, self.length = [], [], 0.0
+        self.side, self.leg_back, self.leg_from = 1.0, True, None
+        self.head, self.anchor, self.turning, self.t_turn = None, None, False, None
+        self.target, self.rsteer, self.since, self.turns = None, 0.0, None, 0
+        self.base.reset()
+
+    @staticmethod
+    def _wrap(a):
+        return (a + np.pi) % (2 * np.pi) - np.pi
+
+    def _visited(self, xy):
+        """(distance, direction) of the nearest point stored more than skip_m m ago."""
+        if len(self.pts) <= self.skip + 5:
+            return np.inf, None
+        old = np.asarray(self.pts[:-self.skip])
+        j = int(np.argmin(np.sum((old - xy) ** 2, axis=1)))
+        return float(np.linalg.norm(old[j] - xy)), self.dirs[j]
+
+    def _turn(self, iface, now, target):
+        if target is not None and self.head is not None:
+            side = 1.0 if self._wrap(target - self.head) >= 0 else -1.0
+        else:
+            left = Recovery._sector(iface, 0.5, 1.6, np.median)
+            side = 1.0 if left > Recovery._sector(iface, -1.6, -0.5, np.median) else -1.0
+        self.side, self.target, self.turning = side, target, True
+        self.t_turn, self.since, self.turns = now, None, self.turns + 1
+        self.leg_back, self.leg_from = True, np.array(iface.position[:2], float)
+        return self._leg(iface)
+
+    def _leg(self, iface):
+        """One K-turn leg: back away from the target side, or forward toward it, speed-limited."""
+        go = self.thr if iface.speed < self.v_turn else 0.0
+        if self.leg_back:
+            return -self.steer * self.side, -go
+        return self.steer * self.side, go
+
+    def reversing(self, now):
+        return self.turning
+
+    def __call__(self, iface):
+        now, xy = iface.now(), np.array(iface.position[:2], float)
+        if self.anchor is None:
+            self.anchor = xy
+        d = xy - self.anchor
+        if np.linalg.norm(d) >= 0.1:
+            mh = float(np.arctan2(d[1], d[0]))
+            # forwards or backwards by continuity: the car cannot turn 90 deg in 0.1 m. "Turning
+            # means reversing" was wrong for the braking part of every turn.
+            back = self.head is not None and np.cos(mh - self.head) < 0
+            self.head, self.anchor = self._wrap(mh + np.pi) if back else mh, xy
+        if self.turning:
+            el = now - self.t_turn
+            aligned = (self.target is None or self.head is None
+                       or abs(self._wrap(self.target - self.head)) < self.align)
+            front = Recovery._sector(iface, -0.26, 0.26, np.min)
+            if not ((el >= self.min_dur and aligned and front >= self.clear)
+                    or el >= self.max_dur):
+                moved = float(np.linalg.norm(xy - self.leg_from))
+                if moved >= self.leg_m or (not self.leg_back and front < self.front_min):
+                    self.leg_back, self.leg_from = not self.leg_back, xy
+                return self._leg(iface)
+            self.turning = False
+            self.base.reset()
+        dist, odir = self._visited(xy)
+        backwards = (self.head is not None and dist < self.near
+                     and np.cos(self.head - odir) < -0.3)
+        if backwards:
+            return self._turn(iface, now, odir)
+        steer, th = self.base(iface)
+        if self.head is not None and (not self.pts or np.linalg.norm(xy - self.pts[-1]) >= self.ds):
+            if self.pts:
+                self.length += float(np.linalg.norm(xy - self.pts[-1]))
+            self.pts.append(xy)
+            self.dirs.append(self.head)
+        if th > 0 and iface.speed < self.v_stop:
+            self.since = now if self.since is None else self.since
+        else:
+            self.since = None
+        if self.since is not None and now - self.since >= self.wait:
+            return self._turn(iface, now, odir if dist < self.near else None)
+        return steer, th
+
+
 class PurePursuit:
     """D68: follow a known path instead of the scan's gaps. Steering is pure pursuit,
     delta = atan(2 L sin(alpha) / ld), which is exact for the kinematic car R89 measured. Speed
@@ -1152,6 +1263,54 @@ def selftest():
     assert 2.25 < min(rad[20:]) and max(rad[20:]) < 2.75, (min(rad[20:]), max(rad[20:]))
     assert turned > 2 * np.pi, f'and get round the ring: {np.degrees(turned):.0f} deg'
     assert abs(np.mean(rad[200:]) - 2.5) < 0.1, f'centred in the corridor: {np.mean(rad[200:]):.3f}'
+
+    # D69 Explorer, on the same ring with signed velocity (a reverse flips the turn):
+    # (1) driving forward it laps with no turn-rounds; (2) with memory of a counter-clockwise lap
+    # and placed facing clockwise, it detects that it is going backwards, turns round, and
+    # carries on counter-clockwise.
+    def drive(ex, pos, hd, steps, v0=0.0):
+        car = types.SimpleNamespace(position=np.array([pos[0], pos[1], 0.0]), speed=abs(v0),
+                                    angle_min=-2.35619, angle_increment=0.0261799, t=0.0)
+        car.now = lambda: car.t
+        v, q, th_pos = v0, [(0.0, 0.0)] * 2, []
+        for _ in range(steps):
+            car.scan = ring_scan(car.position[:2], hd, angs)
+            q.append(ex(car))
+            st, th_ = q.pop(0)
+            if th_ >= 0.3:
+                v += (4.5 if v >= 0 else 6.0) * 0.055
+            elif th_ <= -0.3:
+                v -= (4.5 if v <= 0 else 6.0) * 0.055
+            else:
+                v -= np.sign(v) * min(abs(v), 6.0 * 0.055)
+            hd += v * np.tan(st * PurePursuit.DELTA_MAX) / PurePursuit.L * 0.055
+            nxt = car.position[:2] + v * 0.055 * np.array([np.cos(hd), np.sin(hd)])
+            if not 2.15 < np.linalg.norm(nxt) < 2.85:          # the body meets a wall: stop
+                v = 0.0
+            else:
+                car.position[:2] = nxt
+            car.speed = abs(v)
+            car.t += 0.055
+            th_pos.append(np.arctan2(car.position[1], car.position[0]))
+        return np.unwrap(th_pos), car
+    ex = Explorer()
+    th1, car1 = drive(ex, (2.5, 0.0), np.pi / 2, 500)
+    assert ex.turns == 0 and th1[-1] - th1[0] > np.pi, (ex.turns, th1[-1] - th1[0])
+    assert 2.25 < np.linalg.norm(car1.position[:2]) < 2.75
+    ex = Explorer()
+    a_ = np.arange(0, 2 * np.pi, 0.05 / 2.5)
+    ex.pts = [np.array([2.5 * np.cos(t), 2.5 * np.sin(t)]) for t in a_]
+    ex.dirs = [float(Explorer._wrap(t + np.pi / 2)) for t in a_]
+    th2, car2 = drive(ex, (2.5, 0.0), -np.pi / 2, 600, v0=0.8)
+    assert ex.turns >= 1, 'going backwards over visited ground must trigger a turn-round'
+    ek = Explorer()
+    ek.head = 0.0
+    it_ = types.SimpleNamespace(position=np.zeros(3), speed=0.0, scan=np.full(181, 5.0),
+                                angle_min=-2.35619, angle_increment=0.0261799)
+    assert ek._turn(it_, 0.0, 1.0)[0] < 0 and ek.side == 1.0, 'target 57 deg left: turn left'
+    assert ek._turn(it_, 0.0, -1.0)[0] > 0 and ek.side == -1.0, 'and right for right'
+    assert th2[-1] - th2[np.argmin(th2)] > np.pi / 2, \
+        f'and then travel the remembered (ccw) way: {th2[-1] - th2[np.argmin(th2)]:.2f} rad'
 
     print('selftest OK')
 
