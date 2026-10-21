@@ -546,6 +546,8 @@ class Recovery:
     def reset(self):
         self.since, self.until, self.rsteer, self.last, self.done = None, None, 0.0, 0.0, []
         self.t_rev = None
+        if hasattr(self.base, 'reset'):
+            self.base.reset()                 # a wrapped controller starts each rollout clean
 
     @staticmethod
     def _sector(iface, lo, hi, fn):
@@ -1357,6 +1359,9 @@ def selftest():
     rev = [k for k, o in enumerate(outs) if o[1] < 0]
     assert rev and outs[rev[0]] == (-0.8, -0.3), outs
     assert rev[-1] == 16 - 1 and not rc.reversing(it.t), (rev, 'held until the front cleared')
+    seen = []
+    Recovery(base=types.SimpleNamespace(reset=lambda: seen.append(1))).reset()
+    assert len(seen) == 2, 'reset reaches the wrapped controller (once at init, once here)'
 
     # D68: pure pursuit on a kinematic car (R89's model) laps a stadium track, stays within
     # 0.15 m of the line, and is slower in the tight ends than on the straights.
