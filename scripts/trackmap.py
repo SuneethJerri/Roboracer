@@ -226,6 +226,35 @@ class PlanFollower:
         return steer, (-go if back else go)
 
 
+def clean_path(P, max_turn=np.radians(60), ds=0.05, smooth_m=0.3, closed=True):
+    """R101: a recorded mapping path can double back where plan segments join (a zigzag at
+    CDC-TF's hairpin made pure pursuit's nearest point jump backwards). Drop points that turn the
+    path by more than max_turn until none do, resample every ds m, and smooth over smooth_m."""
+    P = np.asarray(P, float)[:, :2]
+    changed = True
+    while changed and len(P) > 5:
+        d = np.diff(P, axis=0)
+        a = np.arctan2(d[:, 1], d[:, 0])
+        turn = np.abs(_wrap(np.diff(a)))
+        bad = np.where(turn > max_turn)[0]
+        changed = bad.size > 0
+        if changed:
+            P = np.delete(P, bad[0] + 1, axis=0)
+    if closed:
+        P = np.r_[P, P[:1]]                       # close the seam before resampling
+    seg = np.linalg.norm(np.diff(P, axis=0), axis=1)
+    keep = np.r_[True, seg > 1e-9]
+    P, s_ = P[keep], np.r_[0.0, np.cumsum(seg[seg > 1e-9])]
+    t = np.arange(0.0, s_[-1], ds)
+    Q = np.c_[np.interp(t, s_, P[:, 0]), np.interp(t, s_, P[:, 1])]
+    w = max(1, int(round(smooth_m / ds / 2)))
+    if closed:
+        ext = np.r_[Q[-w:], Q, Q[:w]]
+        Q = np.c_[[np.convolve(ext[:, j], np.ones(2 * w + 1) / (2 * w + 1), 'valid')
+                   for j in range(2)]].T
+    return Q
+
+
 # ---------------------------------------------------------------------------- test geometry
 def hairpin_walls(w=1.2, div=0.2, length=4.0, ds=0.02):
     """Two parallel legs (y in [0, w] and [w + div, 2w + div]) joined by a U-bend around the end
@@ -323,6 +352,15 @@ def selftest():
     assert pf2.done and not pf2.failed, (pf2.r, len(pf2.runs), pf2.failed)
     assert np.linalg.norm(xy2 - gl2) < 0.45 and mind2 > 0.15, (xy2, mind2)
     assert abs(_wrap(hd2 - np.pi)) < np.pi / 4, f'and arrives facing -x: {np.degrees(hd2):.0f}'
+    # clean_path: a zigzag (forward, back, forward) is removed; a smooth circle keeps its radius
+    th_ = np.linspace(0, 2 * np.pi, 300, endpoint=False)
+    circ = np.c_[2 * np.cos(th_), 2 * np.sin(th_)]
+    zz = np.r_[circ[:100], circ[[100, 99, 98]], circ[101:]]
+    cz = clean_path(zz)
+    dz = np.diff(cz, axis=0)
+    turn = np.abs(_wrap(np.diff(np.arctan2(dz[:, 1], dz[:, 0]))))
+    assert turn.max() < np.radians(20), np.degrees(turn.max())
+    assert abs(np.median(np.linalg.norm(clean_path(circ), axis=1)) - 2.0) < 0.02
     # follower unit: a car that does not move along the run is declared stuck (R99)
     straight = [(0.0, 0.0, 0.0, 0, 0.0)] + [(0.2 * k, 0.0, 0.0, 1, 0.0) for k in range(1, 6)]
     fs = PlanFollower(straight)

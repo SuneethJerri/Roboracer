@@ -455,9 +455,12 @@ class PurePursuit:
     L, DELTA_MAX = 0.33, 0.5236                       # bridge TF; R73
 
     def __init__(self, path, ld=0.6, a_lat=4.0, v_max=6.0, horizon=2.0, thr=0.6, head_m=0.15,
-                 t_la=0.5):
+                 t_la=0.5, align=np.radians(30), v_align=1.0):
         self.p = np.asarray(path, float)[:, :2]
         self.head_m, self.t_la = head_m, t_la
+        # R101: off the path's direction by more than `align`, do not accelerate past v_align;
+        # it sped to 3.2 m/s at ~40 deg off a straight and hit the wall
+        self.align, self.v_align = align, v_align
         self.trace = None                  # set to [] to record every decision (R94)
         self.ld, self.a_lat, self.v_max, self.horizon, self.thr = ld, a_lat, v_max, horizon, thr
         seg = np.linalg.norm(np.diff(self.p, axis=0, append=self.p[:1]), axis=1)
@@ -503,6 +506,8 @@ class PurePursuit:
         delta = np.arctan(2 * self.L * np.sin(alpha) / ld)
         ahead = self.kappa[(i + np.arange(int(round(self.horizon / self.ds)))) % n]
         v_t = min(self.v_max, np.sqrt(self.a_lat / max(float(ahead.max()), 1e-6)))
+        if abs(alpha) > self.align:
+            v_t = min(v_t, self.v_align)
         throttle = self.thr if iface.speed < v_t else 0.0
         steer = float(np.clip(delta / self.DELTA_MAX, -1.0, 1.0))
         if self.trace is not None:
@@ -1382,6 +1387,12 @@ def selftest():
     assert max(v_str) > 5.0, 'and the straights must be fast enough to test the lookahead'
     assert prog > len(oval) * 0.9, 'and get round the lap'
     assert np.mean(v_end) < 0.8 * np.mean(v_str), (np.mean(v_end), np.mean(v_str))
+    # R101: pointing 45 deg off a straight path it must not accelerate past v_align
+    pa = PurePursuit(oval)
+    cm = types.SimpleNamespace(position=np.array([5.0, 0.0, 0.0]), speed=1.5)
+    pa(cm)
+    pa.head = np.radians(45)
+    assert pa(cm)[1] == 0.0, 'misaligned at 1.5 m/s: no throttle'
 
     # D69: the wall follower laps a ring track (inner radius 2.0, outer 3.0) counter-clockwise,
     # so the outer wall is on its right, at the loop's 18 Hz with a 2-cycle command delay,
