@@ -143,7 +143,8 @@ class Recovery:
     below `v_stop` for `wait` s while commanding throttle, reverse at -`thr` for `dur` s with
     `steer` of lock opposite to the last forward steering, then resume. The car turns
     kinematically (R89), so rotation ~ distance x tan(delta) / L: full lock for 0.8 s turned it
-    ~120 deg and sent it the wrong way (R90). 0.4 of lock for 0.5 s backs ~0.5 m at ~15 deg. At most `max_n` per `window` s,
+    ~120 deg and sent it the wrong way (R90). 0.4 of lock for 0.5 s backs ~0.5 m at ~15 deg.
+    At most `max_n` per `window` s,
     so a car that cannot get out still stalls and is scored as stalled. Pass as `rollout(act=)`.
     """
 
