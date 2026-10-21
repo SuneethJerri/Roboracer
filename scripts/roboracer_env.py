@@ -278,6 +278,9 @@ class RoboRacerInterface:
     # path/top_speed = 30.52 m / 8.70 m/s: the fastest lap physics allows here. A second
     # line of defence only -- the gate above is what rejects the artifact.
     MIN_PLAUSIBLE_LAP = 3.5
+    # A lap counts only after this much forward progress (R86: a car that turned round
+    # crossed the line). Wrong-way driving earns none (B26). Ignored without a centreline.
+    LAP_MIN_PROGRESS = 0.5
 
     def min_plausible_lap(self):
         """Kept as a second line of defence for `rollout()`; the position counter below is
@@ -330,7 +333,9 @@ class RoboRacerInterface:
         the raw topic is unusable as a lap signal (B11). The crossing itself is correct.
         """
         new = int(m.data)
-        if new > self.sim_lap_counts and self._left_start:
+        cl = self._centerline()
+        fwd = cl is False or cl is None or self.progress() >= self.LAP_MIN_PROGRESS
+        if new > self.sim_lap_counts and self._left_start and fwd:
             self._left_start = False
             self._prog_idx = 0
             self.laps += 1
@@ -685,6 +690,7 @@ def selftest():
         def __init__(self, data):
             self.data = data
 
+    RoboRacerInterface._cl_cache = False         # the position gate alone; R86's gate below
     stub = RoboRacerInterface.__new__(RoboRacerInterface)
     stub.start_pos, stub._left_start, stub.laps, stub.sim_lap_counts = None, False, 0, 0
     stub.position, stub._prog_idx = np.zeros(3), 0
@@ -710,6 +716,19 @@ def selftest():
     RoboRacerInterface._on_ips(stub, _P(9.0))    # properly away
     RoboRacerInterface._on_lapcount(stub, _I(6))
     assert stub.laps == 2
+
+    # R86: with a centreline, a crossing counts only after half a lap of forward progress.
+    RoboRacerInterface._cl_cache = np.array([[float(i) * 0.1, 0.0] for i in range(100)])
+    for path, want in (([1.0, -3.0, -6.0], 0),           # a metre forward, then turned round
+                       ([1.0, 3.0, 5.0, 6.0], 1)):       # 0.6 of the line, forward
+        lp = RoboRacerInterface.__new__(RoboRacerInterface)
+        lp.start_pos, lp._left_start, lp.laps, lp.sim_lap_counts = np.zeros(3), False, 0, 0
+        lp.position, lp._prog_idx = np.zeros(3), 0
+        for x in path:
+            RoboRacerInterface._on_ips(lp, _P(x))
+        RoboRacerInterface._on_lapcount(lp, _I(1))
+        assert lp.laps == want, (path, lp.laps, lp.progress())
+    RoboRacerInterface._cl_cache = None
 
     # Progress along a synthetic centreline: monotone, clipped, and unable to jump across
     # a point where the track passes near itself.
