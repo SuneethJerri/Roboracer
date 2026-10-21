@@ -143,11 +143,14 @@ class PurePursuit:
     targets sqrt(a_lat / kappa) over the curvature ahead, bang-bang because throttle >= 0.3 is
     full acceleration and 0 is a hard brake (R89). `path` is (N, 2), closed, in IPS coordinates.
     Commands are in AutoDRIVE's own units (delta / 0.5236), so the runner must not rescale them.
+    Heading is the direction of the car's own last `head_m` of IPS travel, and the path tangent
+    before it has moved: odometry's quaternion, read as a planar yaw, was wrong (R93).
     """
     L, DELTA_MAX = 0.33, 0.5236                       # bridge TF; R73
 
-    def __init__(self, path, ld=0.8, a_lat=4.0, v_max=6.0, horizon=2.0, thr=0.6):
+    def __init__(self, path, ld=0.8, a_lat=4.0, v_max=6.0, horizon=2.0, thr=0.6, head_m=0.15):
         self.p = np.asarray(path, float)[:, :2]
+        self.head_m = head_m
         self.ld, self.a_lat, self.v_max, self.horizon, self.thr = ld, a_lat, v_max, horizon, thr
         seg = np.linalg.norm(np.diff(self.p, axis=0, append=self.p[:1]), axis=1)
         self.ds = float(np.median(seg))
@@ -166,7 +169,7 @@ class PurePursuit:
         self.reset()
 
     def reset(self):
-        self.i = None
+        self.i, self.anchor, self.head = None, None, None
 
     def _nearest(self, xy):
         n = len(self.p)
@@ -178,10 +181,16 @@ class PurePursuit:
         return self.i
 
     def __call__(self, iface):
-        xy, n = np.asarray(iface.position[:2], float), len(self.p)
+        xy, n = np.array(iface.position[:2], float), len(self.p)    # a copy: anchor keeps it
         i = self._nearest(xy)
+        if self.head is None:                                 # not moved yet: the path's tangent
+            t = self.p[(i + 1) % n] - self.p[i]
+            self.head, self.anchor = float(np.arctan2(t[1], t[0])), xy
+        elif np.linalg.norm(xy - self.anchor) >= self.head_m:
+            d = xy - self.anchor
+            self.head, self.anchor = float(np.arctan2(d[1], d[0])), xy
         tgt = self.p[(i + max(1, int(round(self.ld / self.ds)))) % n]
-        alpha = np.arctan2(tgt[1] - xy[1], tgt[0] - xy[0]) - iface.yaw
+        alpha = np.arctan2(tgt[1] - xy[1], tgt[0] - xy[0]) - self.head
         delta = np.arctan(2 * self.L * np.sin(alpha) / self.ld)
         ahead = self.kappa[(i + np.arange(int(round(self.horizon / self.ds)))) % n]
         v_t = min(self.v_max, np.sqrt(self.a_lat / max(float(ahead.max()), 1e-6)))
@@ -288,7 +297,6 @@ class RoboRacerInterface:
         self.angle_min = -2.35619
         self.angle_increment = 0.004363323
         self.speed = 0.0
-        self.yaw = 0.0
         self.position = np.zeros(3)
         self.lap_time = 0.0
         self.last_lap_time = 0.0
@@ -311,11 +319,8 @@ class RoboRacerInterface:
             self._new_scan.set()
 
         def on_odom(m):
-            v, q = m.twist.twist.linear, m.pose.pose.orientation
+            v = m.twist.twist.linear
             self.speed = float(np.hypot(v.x, v.y))
-            # D68: heading for pure pursuit. R89 found it matches the IPS track's direction.
-            self.yaw = float(np.arctan2(2 * (q.w * q.z + q.x * q.y),
-                                        1 - 2 * (q.y * q.y + q.z * q.z)))
 
         self.node.create_subscription(LaserScan, SCAN_TOPIC, on_scan, qos)
         self.node.create_subscription(Odometry, ODOM_TOPIC, on_odom, qos)
@@ -983,15 +988,16 @@ def selftest():
                  np.c_[np.linspace(6, 0, 80, endpoint=False), np.full(80, 2.4)],
                  np.c_[-1.2 * np.sin(th), 1.2 + 1.2 * np.cos(th)]]
     pp = PurePursuit(oval)
-    car = types.SimpleNamespace(position=np.zeros(3), yaw=0.0, speed=0.0)
+    car = types.SimpleNamespace(position=np.zeros(3), speed=0.0)    # no yaw: R93
+    yaw = 0.0
     dt, prog, dev, v_end, v_str = 0.05, 0.0, [], [], []
     for _ in range(600):                                 # 30 s
         st, th_ = pp(car)
         delta = st * PurePursuit.DELTA_MAX
         acc = 4.5 if th_ >= 0.3 else -6.0                # R89: saturated / hard brake
         car.speed = max(0.0, car.speed + acc * dt)
-        car.yaw += car.speed * np.tan(delta) / PurePursuit.L * dt
-        car.position[:2] += car.speed * dt * np.array([np.cos(car.yaw), np.sin(car.yaw)])
+        yaw += car.speed * np.tan(delta) / PurePursuit.L * dt
+        car.position[:2] += car.speed * dt * np.array([np.cos(yaw), np.sin(yaw)])
         d = np.min(np.linalg.norm(oval - car.position[:2], axis=1))
         dev.append(d)
         (v_end if car.position[0] > 6.3 or car.position[0] < -0.3 else v_str).append(car.speed)
