@@ -137,6 +137,58 @@ def reward_progress(prev, cur, collision_penalty=5.0, progress_scale=100.0,
 
 
 # ----------------------------------------------------------------- ROS 2 interface
+class PurePursuit:
+    """D68: follow a known path instead of the scan's gaps. Steering is pure pursuit,
+    delta = atan(2 L sin(alpha) / ld), which is exact for the kinematic car R89 measured. Speed
+    targets sqrt(a_lat / kappa) over the curvature ahead, bang-bang because throttle >= 0.3 is
+    full acceleration and 0 is a hard brake (R89). `path` is (N, 2), closed, in IPS coordinates.
+    Commands are in AutoDRIVE's own units (delta / 0.5236), so the runner must not rescale them.
+    """
+    L, DELTA_MAX = 0.33, 0.5236                       # bridge TF; R73
+
+    def __init__(self, path, ld=0.8, a_lat=4.0, v_max=6.0, horizon=2.0, thr=0.6):
+        self.p = np.asarray(path, float)[:, :2]
+        self.ld, self.a_lat, self.v_max, self.horizon, self.thr = ld, a_lat, v_max, horizon, thr
+        seg = np.linalg.norm(np.diff(self.p, axis=0, append=self.p[:1]), axis=1)
+        self.ds = float(np.median(seg))
+        a, b, c = np.roll(self.p, 1, 0), self.p, np.roll(self.p, -1, 0)
+        cross = np.abs((b - a)[:, 0] * (c - b)[:, 1] - (b - a)[:, 1] * (c - b)[:, 0])
+        den = (np.linalg.norm(b - a, axis=1) * np.linalg.norm(c - b, axis=1)
+               * np.linalg.norm(c - a, axis=1))
+        k = 2 * cross / np.maximum(den, 1e-9)                 # 1 / circumradius
+        # Smoothed over ~1 m and capped at the car's tightest turn (L / tan(DELTA_MAX) =
+        # 0.57 m): at 0.3 m Porto's driven path read R ~1.2 m everywhere and CDC-TF's spline had
+        # a 0.12 m kink, which no car can turn (D68).
+        k = np.minimum(k, np.tan(self.DELTA_MAX) / self.L)
+        w = max(1, int(round(0.5 / self.ds)))
+        self.kappa = np.convolve(np.r_[k[-w:], k, k[:w]], np.ones(2 * w + 1) / (2 * w + 1),
+                                 'same')[w:-w]
+        self.reset()
+
+    def reset(self):
+        self.i = None
+
+    def _nearest(self, xy):
+        n = len(self.p)
+        if self.i is None:
+            idx = np.arange(n)
+        else:
+            idx = (self.i + np.arange(-10, 40)) % n           # mostly forward of last
+        self.i = int(idx[np.argmin(np.sum((self.p[idx] - xy) ** 2, 1))])
+        return self.i
+
+    def __call__(self, iface):
+        xy, n = np.asarray(iface.position[:2], float), len(self.p)
+        i = self._nearest(xy)
+        tgt = self.p[(i + max(1, int(round(self.ld / self.ds)))) % n]
+        alpha = np.arctan2(tgt[1] - xy[1], tgt[0] - xy[0]) - iface.yaw
+        delta = np.arctan(2 * self.L * np.sin(alpha) / self.ld)
+        ahead = self.kappa[(i + np.arange(int(round(self.horizon / self.ds)))) % n]
+        v_t = min(self.v_max, np.sqrt(self.a_lat / max(float(ahead.max()), 1e-6)))
+        throttle = self.thr if iface.speed < v_t else 0.0
+        return float(np.clip(delta / self.DELTA_MAX, -1.0, 1.0)), throttle
+
+
 class Recovery:
     """D64: Follow-the-Gap plus a reverse recovery. FTG never reverses and stops when boxed in,
     so a stall on AutoDRIVE is absorbing (R77, R88). When `plan()` is boxed in, or the car has been
@@ -236,6 +288,7 @@ class RoboRacerInterface:
         self.angle_min = -2.35619
         self.angle_increment = 0.004363323
         self.speed = 0.0
+        self.yaw = 0.0
         self.position = np.zeros(3)
         self.lap_time = 0.0
         self.last_lap_time = 0.0
@@ -258,8 +311,11 @@ class RoboRacerInterface:
             self._new_scan.set()
 
         def on_odom(m):
-            v = m.twist.twist.linear
+            v, q = m.twist.twist.linear, m.pose.pose.orientation
             self.speed = float(np.hypot(v.x, v.y))
+            # D68: heading for pure pursuit. R89 found it matches the IPS track's direction.
+            self.yaw = float(np.arctan2(2 * (q.w * q.z + q.x * q.y),
+                                        1 - 2 * (q.y * q.y + q.z * q.z)))
 
         self.node.create_subscription(LaserScan, SCAN_TOPIC, on_scan, qos)
         self.node.create_subscription(Odometry, ODOM_TOPIC, on_odom, qos)
@@ -918,6 +974,31 @@ def selftest():
         assert all(rc(it)[1] >= 0 for it.t in np.arange(0, 3, 0.1)), 'never reverse a mover'
     finally:
         ftg.plan = plan0
+
+    # D68: pure pursuit on a kinematic car (R89's model) laps a stadium track, stays within
+    # 0.15 m of the line, and is slower in the tight ends than on the straights.
+    th = np.linspace(0, np.pi, 60, endpoint=False)
+    oval = np.r_[np.c_[np.linspace(0, 6, 80, endpoint=False), np.zeros(80)],
+                 np.c_[6 + 1.2 * np.sin(th), 1.2 - 1.2 * np.cos(th)],
+                 np.c_[np.linspace(6, 0, 80, endpoint=False), np.full(80, 2.4)],
+                 np.c_[-1.2 * np.sin(th), 1.2 + 1.2 * np.cos(th)]]
+    pp = PurePursuit(oval)
+    car = types.SimpleNamespace(position=np.zeros(3), yaw=0.0, speed=0.0)
+    dt, prog, dev, v_end, v_str = 0.05, 0.0, [], [], []
+    for _ in range(600):                                 # 30 s
+        st, th_ = pp(car)
+        delta = st * PurePursuit.DELTA_MAX
+        acc = 4.5 if th_ >= 0.3 else -6.0                # R89: saturated / hard brake
+        car.speed = max(0.0, car.speed + acc * dt)
+        car.yaw += car.speed * np.tan(delta) / PurePursuit.L * dt
+        car.position[:2] += car.speed * dt * np.array([np.cos(car.yaw), np.sin(car.yaw)])
+        d = np.min(np.linalg.norm(oval - car.position[:2], axis=1))
+        dev.append(d)
+        (v_end if car.position[0] > 6.3 or car.position[0] < -0.3 else v_str).append(car.speed)
+        prog = max(prog, pp.i) if pp.i < len(oval) - 5 else prog
+    assert max(dev[40:]) < 0.15, f'pure pursuit must hold the line: max dev {max(dev[40:]):.3f}'
+    assert prog > len(oval) * 0.9, 'and get round the lap'
+    assert np.mean(v_end) < 0.8 * np.mean(v_str), (np.mean(v_end), np.mean(v_str))
 
     print('selftest OK')
 
