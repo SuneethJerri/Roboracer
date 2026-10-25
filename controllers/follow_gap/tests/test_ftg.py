@@ -167,12 +167,59 @@ def test_repaired_equals_baseline_with_zero_weights():
     assert base.debug["target_idx"] == rep.debug["target_idx"]
 
 
-# -------------------------------------------- fill in after week 3 (real failures)
-@pytest.mark.skip(reason="fill in after week 3: load data/scans/failure_case_1.npz")
+# -------------------------------------------- fill in after week 3
+def _count_steer_flips(steers, threshold=0.15):
+    """Count left-right alternations of at least `threshold` radians.
+    Ignores noise oscillations around straight-ahead."""
+    steers = np.asarray(steers)
+    prev_sign = 0
+    flips = 0
+    for s in steers:
+        if abs(s) > threshold:
+            cur_sign = int(np.sign(s))
+            if prev_sign != 0 and cur_sign != prev_sign:
+                flips += 1
+            prev_sign = cur_sign
+    return flips
+
+def _run_sequence(controller, scans):
+    """Feed a sequence of scans and return the steering commands."""
+    return [controller.act(scan)[0] for scan in scans]
+
 def test_failure_case_1_baseline_fails_repaired_passes():
-    pass
+    """Case 1 (step 1560): Baseline flips 16 times. Repaired should be stable."""
+    run_path = HERE.parents[1] / "data" / "runs" / "baseline_001.npz"
+    if not run_path.exists():
+        pytest.skip("baseline_001.npz not found")
+        
+    data = np.load(run_path)
+    scans = data["scan"][1560:1677] # Sequence of 117 scans from the failure cluster
+    
+    base = FollowGap(CFG)
+    rep_cfg = yaml.safe_load(open(HERE.parents[3] / "configs" / "follow_gap_repaired.yaml"))
+    rep = FollowGapRepaired(rep_cfg)
+    
+    base_flips = _count_steer_flips(_run_sequence(base, scans))
+    rep_flips = _count_steer_flips(_run_sequence(rep, scans))
+    
+    assert base_flips >= 10, f"Baseline expected to flip heavily, got {base_flips}"
+    assert rep_flips <= 5, f"Repaired expected to be stable, got {rep_flips}"
 
-
-@pytest.mark.skip(reason="fill in after week 3: load data/scans/failure_case_2.npz")
 def test_failure_case_2_baseline_fails_repaired_passes():
-    pass
+    """Case 2 (step 1789): Baseline swings wildly 4 times. Repaired should be stable."""
+    run_path = HERE.parents[1] / "data" / "runs" / "baseline_001.npz"
+    if not run_path.exists():
+        pytest.skip("baseline_001.npz not found")
+        
+    data = np.load(run_path)
+    scans = data["scan"][1789:1817] # Sequence of 28 scans from the violent swing
+    
+    base = FollowGap(CFG)
+    rep_cfg = yaml.safe_load(open(HERE.parents[3] / "configs" / "follow_gap_repaired.yaml"))
+    rep = FollowGapRepaired(rep_cfg)
+    
+    base_flips = _count_steer_flips(_run_sequence(base, scans))
+    rep_flips = _count_steer_flips(_run_sequence(rep, scans))
+    
+    assert base_flips >= 3, f"Baseline expected to swing, got {base_flips}"
+    assert rep_flips <= 2, f"Repaired expected to be stable, got {rep_flips}"
