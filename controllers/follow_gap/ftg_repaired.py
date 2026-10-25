@@ -1,10 +1,10 @@
 """Follow-the-Gap, REPAIRED variant - P2.
 
-TEMPLATE: this scores gaps by width, depth and turn instead of width alone.
-With w_depth = 0 and w_turn = 0 it is identical to the baseline.
-After you document your two failure cases (week 3), adapt choose_gap() to the
-failure you actually observed. Other options: disparity extender, bigger bubble
-in corners, steering toward the deepest beam (target_mode: deepest).
+Adds on top of the baseline:
+  - Gap scoring by width/depth/turn (with optional hysteresis via w_switch)
+  - Disparity extender (widens near obstacles so openings narrower than the car close)
+  - Braking-distance speed regulation (optional via speed_mode: braking)
+  - Target smoothing (damps single-gap jitter when the gap centre moves each frame)
 """
 import numpy as np
 
@@ -22,7 +22,13 @@ class FollowGapRepaired(FollowGap):
         if missing:
             raise KeyError(f"config is missing keys: {missing}")
         super().__init__(cfg)
+        self._prev_target = None
 
+    def reset(self):
+        super().reset()
+        self._prev_target = None
+
+    # ------------------------------------------------------------ gap choice
     def choose_gap(self, gaps, win):
         """score = w_width*width + w_depth*depth - w_turn*turn - w_switch*switch
 
@@ -47,6 +53,31 @@ class FollowGapRepaired(FollowGap):
                           - c["w_turn"] * turn - w_switch * switch)
         self.extra["gap_scores"] = [float(x) for x in scores]
         return gaps[int(np.argmax(scores))]
+
+    # ------------------------------------------------------------ target smoothing
+    def choose_target(self, win, gap):
+        """Smooth the chosen target beam across frames to damp jitter.
+
+        Without this, the geometric centre of the gap shifts by a few beams
+        every step as the safety bubble expands and contracts. The car then
+        chases a moving target and the steering oscillates left-right even
+        when there is only ONE gap. Blending the new centre with the previous
+        target (alpha in [0,1]) damps that oscillation while still letting
+        the target move when the gap genuinely moves.
+
+        alpha = 1.0 disables smoothing (behaves like the baseline).
+        alpha = 0.5 gives heavy damping.
+        """
+        s, e = gap
+        centre = (s + e - 1) // 2
+        alpha = float(self.cfg.get("target_smooth", 0.5))
+        if self._prev_target is None or alpha >= 1.0:
+            target = centre
+        else:
+            target = int(round(alpha * centre + (1.0 - alpha) * self._prev_target))
+        target = max(s, min(e - 1, target))
+        self._prev_target = target
+        return target
 
     # ------------------------------------------------------------ disparity extender
     def preprocess(self, scan):

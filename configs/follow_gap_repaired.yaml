@@ -8,9 +8,9 @@ fov_deg: 180
 bubble_radius: 0.4
 free_threshold: 1.0
 min_gap_width: 5
-target_mode: deepest
+target_mode: center
 steer_gain: 1.0
-steer_alpha: 0.3
+steer_alpha: 0.8
 max_steer: 0.4189
 front_cone_deg: 15
 speed_min: 0.8
@@ -18,11 +18,13 @@ speed_max: 2.0
 k_range: 0.8
 k_steer: 2.0
 w_width: 1.0
-w_depth: 2.0
+w_depth: 0.0
 w_turn: 0.0
 speed_mode: linear
 a_brake: 3.0
 stop_margin: 0.5
-disparity_threshold: 0.0
-car_half_width: 0.15
-w_switch: 500.0
+disparity_threshold: 1.0
+car_half_width: 0.2
+w_switch: 10.0
+
+target_smooth: 0.5
