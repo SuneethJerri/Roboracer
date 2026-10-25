@@ -1,3 +1,5 @@
+Update the README with any broken modules found at the bottom.
+Also, if any module works on Linux but does not work on Windows, update the README accordingly.
 # RoboRacer Project Repository
 
 This repository contains the codebase for the RoboRacer autonomous racing project. The workload is divided into five main components (P1-P5). 
@@ -95,3 +97,6 @@ These files are the backbone of the simulation and should **not** be modified by
 **Owner focuses on:** Training PPO and SAC agents and evaluating their simulator-time cost against classical controllers[cite: 3, 4].
 * **Modify:** `rl/` (Stable-Baselines3 implementation, training loops, and environment wrappers)[cite: 3].
 * **Consumes:** `centreline/` (For calculating rewards based on progress) and outputs to `results/` (Logged in P4's strict schema format)[cite: 4].
+
+## broken modules
+common/fetch_tracks.py breaks on Windows. repair() uses Path.symlink_to(), which raises OSError on Windows without Developer Mode / admin, so fetch_tracks reports OSError for all 22 tracks and 0/22 circuits load. On Linux it works. Fix: in repair(), replace want.symlink_to(have.name) with import shutil; shutil.copy2(have, want) — copies are cheap (small yaml) and work on all OSes. Workaround (already applied locally): copy every maps\<Track>\<Track>.yaml to maps\<Track>\<Track>_map.yaml before running any track.
