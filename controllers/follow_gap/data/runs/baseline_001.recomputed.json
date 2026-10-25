@@ -1,0 +1,13 @@
+{
+  "source_npz": "baseline_001.npz",
+  "requested_laps": 1,
+  "steps": 2054,
+  "sim_time_s": 102.65,
+  "collision": false,
+  "collisions_step_count": 0,
+  "laps_completed": 1,
+  "lap_times_s": [
+    90.85
+  ],
+  "clean": true
+}
