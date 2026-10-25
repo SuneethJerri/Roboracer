@@ -1,47 +1,28 @@
 # Follow-the-Gap REPAIRED parameters (P2).
 # Same keys as follow_gap.yaml plus the gap-scoring weights at the bottom.
-# With w_depth = 0 and w_turn = 0 this behaves like the baseline (widest gap).
-# Tune the weights only AFTER you have seen your two failure cases (week 3).
-
 n_beams: 1080
 lidar_fov_deg: 270
-
 max_range: 6.0
 smooth_window: 5
-
 fov_deg: 180
 bubble_radius: 0.4
 free_threshold: 1.0
 min_gap_width: 5
-target_mode: center      # try "deepest" if the gap centre is the problem
-
+target_mode: deepest
 steer_gain: 1.0
-steer_alpha: 0.8
+steer_alpha: 0.3
 max_steer: 0.4189
-
 front_cone_deg: 15
 speed_min: 0.8
 speed_max: 2.0
 k_range: 0.8
 k_steer: 2.0
-
-# --- repair: gap score = w_width*width + w_depth*depth - w_turn*turn ---
-# width = gap width / search window width        (0..1)
-# depth = mean range inside the gap / max_range  (0..1)
-# turn  = |angle to gap centre| / half search FOV (0..1)
-# switch= |gap centre - previous heading| / full search FOV (0..1), set by w_switch (hysteresis)
 w_width: 1.0
-w_depth: 0.0
+w_depth: 2.0
 w_turn: 0.0
-
-# --- repair: scan-derived speed regulation ---
-speed_mode: linear       # linear = baseline rule | braking = stopping-distance rule
-a_brake: 3.0             # [m/s^2] assumed braking deceleration (braking mode)
-stop_margin: 0.5         # [m] range kept free in front of the car (braking mode)
-
-# --- repair: disparity extender (0 = off) ---
-disparity_threshold: 0.0 # [m] range jump between neighbouring beams that counts as an edge; try 1.0
-car_half_width: 0.15     # [m] half of the vehicle width plus margin - CHECK against the real car
-
-# --- repair: gap hysteresis (0 = off). Raise (try 0.3..1.0) if the car flips between two gaps ---
-w_switch: 0.0
+speed_mode: linear
+a_brake: 3.0
+stop_margin: 0.5
+disparity_threshold: 0.0
+car_half_width: 0.15
+w_switch: 500.0
