@@ -1,0 +1,13 @@
+arm,eval_run,seed,finished_of_17
+Constrained SPSA,20261019T114027Z_o19-eval-c3_p7,s0,17
+Constrained SPSA,20261019T114027Z_o19-eval-c3_p7,s1,17
+Constrained SPSA,20261019T114027Z_o19-eval-c3_p7,s2,17
+CMA-ES,20261020T072116Z_o27-eval-cma4_p7,s0,13
+CMA-ES,20261020T072116Z_o27-eval-cma4_p7,s1,14
+CMA-ES,20261020T072116Z_o27-eval-cma4_p7,s2,16
+"CMA-ES, circuits redrawn every generation",20261020T092435Z_o28-eval-cma4r_p7,s0,15
+"CMA-ES, circuits redrawn every generation",20261020T092435Z_o28-eval-cma4r_p7,s1,15
+"CMA-ES, circuits redrawn every generation",20261020T092435Z_o28-eval-cma4r_p7,s2,6
+Random search,20261019T114155Z_o19-eval-rand4_p7,s0,15
+Random search,20261019T114155Z_o19-eval-rand4_p7,s1,11
+Random search,20261019T114155Z_o19-eval-rand4_p7,s2,14

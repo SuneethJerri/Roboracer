@@ -44,11 +44,20 @@ twice. Reliability against black-box search on the train circuits, same rollout 
 1. **The constraint is what separates SPSA from black-box search.** Random search and
    CMA-ES overfit the circuits they select on. Giving CMA-ES the same per-iteration
    circuit redraw makes it worse (12.0/17): the ranking changes every generation.
+
+   ![Circuits finished per seed](results/fig2_reliability.svg)
+
+   *Training circuits finished, of 17, per seed. Data: `results/fig2_reliability.csv`.*
 2. **Perturbations on a deterministic objective.** On the synthetic testbed (Table I of
    Chandramouli et al. reproduced exactly), a Hadamard cycle beats Bernoulli by ~500x with
    no noise, and every family converges by σ = 0.3. On racing, no family wins with two
    measurements (n = 10); one-measurement Hadamard matches or beats two-measurement
    Bernoulli at the same rollout count.
+
+   ![NMSE against noise per perturbation family](results/fig1_sweep.svg)
+
+   *The synthetic testbed: deterministic (Hadamard) perturbations win by ~500x without noise,
+   and the advantage is gone by σ = 0.3. The star is Table I. Data: `results/fig1_sweep.csv`.*
 3. **The dual.** From a feasible start the constraint estimate never sits near α, so the
    multiplier follows its own step schedule; there is no equilibrium to track. The
    *magnitude* of the constraint channel is what matters: weakened 6.67x, feasibility broke
@@ -85,6 +94,7 @@ The shipped gains are `DELIVERABLE` in `scripts/follow_the_gap.py`. The run that
 | `scripts/spsa_bias.py` | Measures SPSA's gradient bias against an exact expectation |
 | `scripts/parallel_eval.py` | Scores many gain sets at once, one simulator per worker |
 | `scripts/rl_baseline.py` | PPO baseline, scored through the same rollout as everything else |
+| `scripts/plot_results.py` | Draws the README's figures and writes the data behind them |
 | `scripts/runlog.py` | Records each run's code, inputs and output hashes so results can be cited |
 | `scripts/trackmap.py` | AutoDRIVE transfer: speed set-point, encoder odometry, LIDAR map and localiser |
 | `scripts/dash.py` | AutoDRIVE transfer: live dashboard for a fine-tuning run |
@@ -124,6 +134,15 @@ The SPSA testbed is entirely self-contained:
 ```bash
 python3 scripts/spsa_testbed.py --family hadamard --sigma 0.01
 python3 scripts/spsa_testbed.py --sweep
+```
+
+The two figures (needs `matplotlib`). Fig 1 regenerates from scratch. Fig 2 reads the
+evaluation run records, which are kept locally and not in this repo, so its data is
+committed as `results/fig2_reliability.csv`:
+
+```bash
+python3 scripts/spsa_testbed.py --sweep --out scratch/outreach/sweep_quadratic.csv
+python3 scripts/plot_results.py
 ```
 
 ## Running against the simulator
