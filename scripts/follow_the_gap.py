@@ -29,6 +29,7 @@ MAX_THROTTLE = 0.40
 MIN_THROTTLE = 0.05
 STEER_SIGN = +1.0   # flip to -1.0 if the car steers the wrong way
 LOG_PATH = None     # set by --log; every completed lap is appended
+LAST = {}           # the last plan()'s gap, aim and clearance, for the dashboard (R122)
 
 # --- extra structure, tuned only above p = 6 (C6/D28) ---------------------
 # Each of these is EXACTLY NEUTRAL at the value below, which is the midpoint of its
@@ -50,6 +51,11 @@ THR_OFFSET = 0.0
 # D48/R67: scale the offset by forward clearance, 1 - LETOFF * (1 - clearance). 0 is the
 # unconditional offset; 1 lets it off fully when the way ahead is short.
 LETOFF = 0.0
+# R128: route guidance. With a route bearing (rad, from the map) and ROUTE_W > 0, the view widens
+# enough to see the route, the opening nearest it is taken, and the aim is blended toward the route
+# clipped inside that opening. 0 is plain Follow-the-Gap, bit for bit.
+ROUTE_W = 0.0
+ROUTE_FOV, ROUTE_MARGIN, ROUTE_EDGE = 1.57, 0.35, 0.10
 
 # The competition deliverable (D46, measured in R66). o29-c3w_p7 seed 0's final gains, as
 # tuned: C3 at p = 7 with THR_OFFSET's box widened to (-0.40, 0.40). 35/35 on TRAIN,
@@ -77,14 +83,17 @@ def largest_gap(mask):
     return int(starts[k]), int(ends[k])
 
 
-def plan(ranges, angle_min, angle_increment):
-    """Map one scan to (steering_command, throttle_command), both in [-1, 1]."""
+def plan(ranges, angle_min, angle_increment, route=None):
+    """Map one scan to (steering_command, throttle_command), both in [-1, 1]. `route` = the
+    bearing of the mapped route ahead, rad (R128); ignored while ROUTE_W is 0."""
+    guided = route is not None and ROUTE_W != 0.0
     ranges = np.nan_to_num(np.asarray(ranges, dtype=float),
                            nan=0.0, posinf=MAX_RANGE, neginf=0.0)
     ranges = np.clip(ranges, 0.0, MAX_RANGE)
 
     angles = angle_min + np.arange(ranges.size) * angle_increment
-    fwd = np.abs(angles) <= FOV
+    fov = max(FOV, min(ROUTE_FOV, abs(route) + ROUTE_MARGIN)) if guided else FOV
+    fwd = np.abs(angles) <= fov
     scan, scan_angles = ranges[fwd], angles[fwd]
     if scan.size < SMOOTH:
         return 0.0, 0.0
@@ -102,17 +111,33 @@ def plan(ranges, angle_min, angle_increment):
     # nothing is close: argmin ties to index 0 on a uniform scan, which would carve the
     # bubble out of one edge of the window and bias steering on an open straight.
     closest = int(np.argmin(scan))
+    bubble = None
     if scan[closest] < BUBBLE_MAX:
         half = int(np.ceil(np.arctan2(BUBBLE_R, max(scan[closest], 1e-3)) / angle_increment))
+        bubble = (float(scan_angles[closest]), float(half * angle_increment), float(scan[closest]))
         scan[max(0, closest - half):closest + half + 1] = 0.0
 
     start, end = largest_gap(scan > thresh)
     if end - start < 2:          # boxed in — stop rather than guess
+        LAST.clear()
+        LAST.update(boxed=True, thresh=GAP_THRESH, fov=fov, bubble=bubble,
+                    route=route if guided else None)
         return 0.0, 0.0
 
     # Aim at the gap centre. The furthest-point variant is faster but twitchier,
     # and a stable demo beats a quick one.
-    steer = STEER_SIGN * float(scan_angles[(start + end) // 2])
+    steer = float(scan_angles[(start + end) // 2])
+    aim_r = None
+    if guided:                    # the opening nearest the route, aimed at the route inside it
+        d = np.diff(np.concatenate(([0], (scan > thresh).astype(np.int8), [0])))
+        st, en = np.flatnonzero(d == 1), np.flatnonzero(d == -1)
+        keep = en - st >= 2
+        lo, hi = scan_angles[st[keep]], scan_angles[en[keep] - 1]
+        k = int(np.argmin(np.where(route < lo, lo - route, np.where(route > hi, route - hi, 0.0))))
+        m = min(ROUTE_EDGE, 0.5 * (hi[k] - lo[k]))
+        aim_r = float(np.clip(route, lo[k] + m, hi[k] - m))
+        steer = (1.0 - ROUTE_W) * steer + ROUTE_W * aim_r
+    steer = STEER_SIGN * steer
     steer_cmd = float(np.clip(steer / MAX_STEER, -1.0, 1.0))
 
     # Slow for corners, and for anything close dead ahead.
@@ -133,10 +158,31 @@ def plan(ranges, angle_min, angle_increment):
     # this is bit-for-bit the old return when the offset is neutral.
     # 1 - 0.0 * x is exactly 1.0, so LETOFF = 0 keeps this bit-for-bit as well.
     off = THR_OFFSET * (1.0 - LETOFF * (1.0 - clearance))
+    LAST.clear()
+    LAST.update(boxed=False, gap=(float(scan_angles[start]), float(scan_angles[end - 1])),
+                aim=steer, clearance=clearance, fov=fov, thresh=GAP_THRESH, bubble=bubble,
+                route=route if guided else None, aim_route=aim_r)
     return steer_cmd, float(np.clip(t + off, 0.0, 1.0))
 
 
 def selftest():
+    # R128: route guidance. Off (ROUTE_W 0) it is plain plan() bit for bit, route or not; on, in one
+    # merged opening from -90 to +30 deg with the route at -80 deg, it aims at the route's side of the
+    # opening, where plain plan() aims at the middle.
+    global ROUTE_W
+    a_ = -2.35619 + 0.004363323 * np.arange(1081)
+    merged = np.where((a_ > np.radians(-90)) & (a_ < np.radians(30)), 6.0, 0.8)
+    plain = plan(merged, -2.35619, 0.004363323)
+    plain_aim = LAST['aim']
+    assert plan(merged, -2.35619, 0.004363323, route=np.radians(-80)) == plain, 'ROUTE_W 0 is a no-op'
+    saved_w, ROUTE_W = ROUTE_W, 1.0
+    try:
+        guided = plan(merged, -2.35619, 0.004363323, route=np.radians(-80))
+        # the commands both saturate at full lock here, so the aims are what differ
+        assert np.degrees(LAST['aim']) < -60 < np.degrees(plain_aim), (LAST['aim'], plain_aim)
+        assert guided[0] <= plain[0] and LAST['aim_route'] is not None
+    finally:
+        ROUTE_W = saved_w
     inc, amin = 0.004363323, -2.35619
     n = 1080
 

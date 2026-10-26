@@ -29,6 +29,9 @@ import types
 
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from trackmap import K_THR, _wrap, sim_speed, throttle_for          # noqa: E402
+
 OBS_BEAMS = 54          # 1080 raw beams -> 54 bins
 MAX_RANGE = 10.0        # the bridge clips here (LaserScan.range_max)
 MAX_SPEED = 8.0         # speed normalisation constant
@@ -149,10 +152,10 @@ class WallFollower:
     positive scan angles are to the left, so the right wall is at -90 deg.
     """
 
-    def __init__(self, theta=0.87, look=0.6, kp=1.2, kd=0.15, v=1.0, thr=0.5, front_m=1.0,
+    def __init__(self, theta=0.87, look=0.6, kp=1.2, kd=0.15, v=1.0, front_m=1.0,
                  k_front=1.0, v_slow=0.4):
         self.theta, self.look = theta, look
-        self.kp, self.kd, self.v, self.thr = kp, kd, v, thr
+        self.kp, self.kd, self.v = kp, kd, v
         # R99 (user: "why is the car going into walls"): it only looked sideways. Within
         # front_m of a wall ahead (+-20 deg), slow to v_slow and steer toward the open side.
         self.front_m, self.k_front, self.v_slow = front_m, k_front, v_slow
@@ -187,7 +190,7 @@ class WallFollower:
             right = Recovery._sector(iface, -1.6, -0.35, np.median)
             steer += self.k_front * (1.0 - front / self.front_m) * (1.0 if left > right else -1.0)
             v = self.v_slow
-        return float(np.clip(steer, -1.0, 1.0)), (self.thr if iface.speed < v else 0.0)
+        return float(np.clip(steer, -1.0, 1.0)), throttle_for(v)
 
 
 class Explorer:
@@ -201,12 +204,12 @@ class Explorer:
     of lock away from the target side (a reverse flips the turn), then forward toward it, each leg
     at most `leg_m` m and `v_turn` m/s, switching early when the front is under `front_min` m,
     until the heading is within `align` of the target with the way ahead `clear` m open, or
-    `max_dur`. A plain reverse was too fast (throttle -0.3 is full acceleration, R89) and could
+    `max_dur`. A plain reverse was too fast (throttle -0.3 is a 7.5 m/s set-point, R103) and could
     not turn a car round in a corridor.
     Heading is from IPS motion (R93), flipped when a step goes against the current heading.
     """
 
-    def __init__(self, base=None, ds=0.05, near=0.4, skip_m=0.6, thr=0.3, steer=0.8, clear=0.5,
+    def __init__(self, base=None, ds=0.05, near=0.4, skip_m=0.6, steer=0.8, clear=0.5,
                  min_dur=0.3, max_dur=8.0, align=np.pi / 4, wait=1.0, v_stop=0.1, leg_m=0.5,
                  v_turn=0.8, front_min=0.3, planner=True, plan_d=(2.5, 2.0, 1.5, 1.0),
                  plan_front=1.2, plan_cool=2.0):
@@ -217,7 +220,7 @@ class Explorer:
         self.stop_m = 0.3
         self.base = base if base is not None else WallFollower()
         self.ds, self.near, self.skip = ds, near, int(round(skip_m / ds))
-        self.thr, self.steer, self.clear = thr, steer, clear
+        self.steer, self.clear = steer, clear
         self.min_dur, self.max_dur, self.align = min_dur, max_dur, align
         self.wait, self.v_stop = wait, v_stop
         self.leg_m, self.v_turn, self.front_min = leg_m, v_turn, front_min
@@ -280,7 +283,7 @@ class Explorer:
 
     def _leg(self, iface):
         """One K-turn leg: back away from the target side, or forward toward it, speed-limited."""
-        go = self.thr if iface.speed < self.v_turn else 0.0
+        go = throttle_for(self.v_turn)
         if self.leg_back:
             return -self.steer * self.side, -go
         return self.steer * self.side, go
@@ -409,6 +412,7 @@ class Explorer:
             self._log(now, xy, 'backtrack_turn')
             return self._turn(iface, now, odir)
         steer, th = self.base(iface)
+        boxed = steer == 0.0 and th == 0.0       # R113: Follow-the-Gap's "no gap", a stall too
         if Recovery._sector(iface, -0.35, 0.35, np.min) < self.stop_m:
             th = 0.0                                      # R99: stop before the wall, not at it
             self.since = now if self.since is None else self.since
@@ -418,7 +422,7 @@ class Explorer:
                 self.length += float(np.linalg.norm(xy - self.pts[-1]))
             self.pts.append(xy)
             self.dirs.append(self.head)
-        if th > 0 and iface.speed < self.v_stop:
+        if (th > 0 or boxed) and iface.speed < self.v_stop:
             self.since = now if self.since is None else self.since
         elif not (th == 0.0 and Recovery._sector(iface, -0.35, 0.35, np.min) < self.stop_m):
             self.since = None
@@ -447,8 +451,8 @@ class Explorer:
 class PurePursuit:
     """D68: follow a known path instead of the scan's gaps. Steering is pure pursuit,
     delta = atan(2 L sin(alpha) / ld), which is exact for the kinematic car R89 measured. Speed
-    targets sqrt(a_lat / kappa) over the curvature ahead, bang-bang because throttle >= 0.3 is
-    full acceleration and 0 is a hard brake (R89). `path` is (N, 2), closed, in IPS coordinates.
+    targets sqrt(a_lat / kappa) over the curvature ahead, sent as the simulator's speed set-point
+    (R103). `path` is (N, 2), closed, in IPS coordinates.
     Commands are in AutoDRIVE's own units (delta / 0.5236), so the runner must not rescale them.
     Heading is the direction of the car's own last `head_m` of IPS travel, and the path tangent
     before it has moved: odometry's quaternion, read as a planar yaw, was wrong (R93). The
@@ -457,7 +461,7 @@ class PurePursuit:
     """
     L, DELTA_MAX = 0.33, 0.5236                       # bridge TF; R73
 
-    def __init__(self, path, ld=0.6, a_lat=4.0, v_max=6.0, horizon=2.0, thr=0.6, head_m=0.15,
+    def __init__(self, path, ld=0.6, a_lat=4.0, v_max=6.0, horizon=2.0, head_m=0.15,
                  t_la=0.5, align=np.radians(30), v_align=1.0):
         self.p = np.asarray(path, float)[:, :2]
         self.head_m, self.t_la = head_m, t_la
@@ -465,7 +469,7 @@ class PurePursuit:
         # it sped to 3.2 m/s at ~40 deg off a straight and hit the wall
         self.align, self.v_align = align, v_align
         self.trace = None                  # set to [] to record every decision (R94)
-        self.ld, self.a_lat, self.v_max, self.horizon, self.thr = ld, a_lat, v_max, horizon, thr
+        self.ld, self.a_lat, self.v_max, self.horizon = ld, a_lat, v_max, horizon
         seg = np.linalg.norm(np.diff(self.p, axis=0, append=self.p[:1]), axis=1)
         self.ds = float(np.median(seg))
         a, b, c = np.roll(self.p, 1, 0), self.p, np.roll(self.p, -1, 0)
@@ -494,7 +498,9 @@ class PurePursuit:
         self.i = int(idx[np.argmin(np.sum((self.p[idx] - xy) ** 2, 1))])
         return self.i
 
-    def __call__(self, iface):
+    def bearing(self, iface, ahead_m):
+        """Track position and heading on the path; return (alpha, i, xy): the bearing, relative to
+        the car's heading, of the path point `ahead_m` along from the nearest one (R128 shares it)."""
         xy, n = np.array(iface.position[:2], float), len(self.p)    # a copy: anchor keeps it
         i = self._nearest(xy)
         if self.head is None:                                 # not moved yet: the path's tangent
@@ -502,21 +508,46 @@ class PurePursuit:
             self.head, self.anchor = float(np.arctan2(t[1], t[0])), xy
         elif np.linalg.norm(xy - self.anchor) >= self.head_m:
             d = xy - self.anchor
-            self.head, self.anchor = float(np.arctan2(d[1], d[0])), xy
+            mh = float(np.arctan2(d[1], d[0]))
+            # R104: a reverse step points backwards; continuity says which way the car faces
+            self.head = _wrap(mh + np.pi) if np.cos(mh - self.head) < 0 else mh
+            self.anchor = xy
+        tgt = self.p[(i + max(1, int(round(ahead_m / self.ds)))) % n]
+        return _wrap(np.arctan2(tgt[1] - xy[1], tgt[0] - xy[0]) - self.head), i, xy
+
+    def __call__(self, iface):
         ld = max(self.ld, self.t_la * iface.speed)
-        tgt = self.p[(i + max(1, int(round(ld / self.ds)))) % n]
-        alpha = np.arctan2(tgt[1] - xy[1], tgt[0] - xy[0]) - self.head
+        alpha, i, xy = self.bearing(iface, ld)
+        n = len(self.p)
         delta = np.arctan(2 * self.L * np.sin(alpha) / ld)
         ahead = self.kappa[(i + np.arange(int(round(self.horizon / self.ds)))) % n]
         v_t = min(self.v_max, np.sqrt(self.a_lat / max(float(ahead.max()), 1e-6)))
         if abs(alpha) > self.align:
             v_t = min(v_t, self.v_align)
-        throttle = self.thr if iface.speed < v_t else 0.0
+        throttle = throttle_for(v_t)
         steer = float(np.clip(delta / self.DELTA_MAX, -1.0, 1.0))
         if self.trace is not None:
             self.trace.append((iface.now(), xy[0], xy[1], i, self.head, alpha, steer, throttle,
                                iface.speed, v_t))
         return steer, throttle
+
+
+class RouteGuide:
+    """R128 (D78 step 2): Follow-the-Gap that knows the route. Each scan, the bearing of the mapped
+    path `ahead_m` along (PurePursuit's tracking, so heading and nearest point behave identically) is
+    handed to `ftg.plan(route=)`, which picks the opening nearest the route and blends its aim
+    toward it by ROUTE_W. Commands are Follow-the-Gap's own units, like plan()'s."""
+
+    def __init__(self, path, ahead_m=1.5):
+        self.pp, self.ahead_m, self.last = PurePursuit(path), ahead_m, None
+
+    def reset(self):
+        self.pp.reset()
+
+    def __call__(self, iface):
+        import follow_the_gap as ftg
+        self.last, _, _ = self.pp.bearing(iface, self.ahead_m)
+        return ftg.plan(iface.scan, iface.angle_min, iface.angle_increment, route=self.last)
 
 
 class Recovery:
@@ -532,8 +563,11 @@ class Recovery:
 
     def __init__(self, wait=1.0, thr=0.3, dur=0.5, max_n=3, window=10.0, v_stop=0.1,
                  steer=0.4, base=None, aware=False, clear=0.6, min_dur=0.3, max_dur=1.2,
-                 aware_steer=0.8):
+                 aware_steer=0.8, v_rev=None, back_m=None, max_rev_s=3.0):
         self.wait, self.thr, self.dur, self.steer = wait, thr, dur, steer
+        # R127: -0.3 is a -7.5 m/s set-point; the wheels spun at 7.4 m/s while the car moved 0.7
+        # (R126). With `v_rev`, reverse at that speed; with `back_m`, until that far backed.
+        self.v_rev, self.back_m, self.max_rev_s = v_rev, back_m, max_rev_s
         self.base = base                   # D69: any act(iface); None means FTG's plan()
         # D69 (user: "0.4 lock ... in a loop at a wall"): with `aware`, turn the nose toward the
         # more open side read from the scan (reversing flips the turn, so steer AWAY from it),
@@ -545,7 +579,7 @@ class Recovery:
 
     def reset(self):
         self.since, self.until, self.rsteer, self.last, self.done = None, None, 0.0, 0.0, []
-        self.t_rev = None
+        self.t_rev, self.rthr, self.backed, self.t_prev = None, -self.thr, 0.0, None
         if hasattr(self.base, 'reset'):
             self.base.reset()                 # a wrapped controller starts each rollout clean
 
@@ -560,10 +594,16 @@ class Recovery:
         import follow_the_gap as ftg
         now = iface.now()
         if self.until is not None and now < self.until:
-            if not (self.aware and now - self.t_rev >= self.min_dur
-                    and self._sector(iface, -0.26, 0.26, np.min) >= self.clear):
-                return self.rsteer, -self.thr
-            self.until = now                                  # room ahead: drive on
+            if self.back_m is not None:
+                self.backed += abs(iface.speed) * max(0.0, now - self.t_prev)
+                self.t_prev = now
+                done = self.backed >= self.back_m
+            else:
+                done = (self.aware and now - self.t_rev >= self.min_dur
+                        and self._sector(iface, -0.26, 0.26, np.min) >= self.clear)
+            if not done:
+                return self.rsteer, self.rthr
+            self.until = now                                  # backed far enough: drive on
         steer, thr = (self.base(iface) if self.base is not None else
                       ftg.plan(iface.scan, iface.angle_min, iface.angle_increment))
         boxed = steer == 0.0 and thr == 0.0
@@ -581,9 +621,12 @@ class Recovery:
             else:
                 self.rsteer = -self.steer * float(np.sign(self.last))
                 self.until = now + self.dur
-            self.since, self.t_rev = None, now
+            if self.back_m is not None:
+                self.until = now + self.max_rev_s
+            self.rthr = throttle_for(-self.v_rev) if self.v_rev else -self.thr
+            self.since, self.t_rev, self.backed, self.t_prev = None, now, 0.0, now
             self.done = recent + [now]
-            return self.rsteer, -self.thr
+            return self.rsteer, self.rthr
         if not boxed:
             self.last = steer
         return steer, thr
@@ -623,9 +666,16 @@ class ContactCounter:
 
 
 class RoboRacerInterface:
-    """Latest-message cache over the bridge topics, plus the reset handshake."""
+    """Latest-message cache over the bridge topics, plus the reset handshake.
 
-    def __init__(self, node_name='roboracer_interface', best_effort=True):
+    D72: with `legal`, `position` and `speed` come from encoders + IMU + scan matching
+    (trackmap.Odometer) in the start-pose frame, and /odom is not read. /ips is still read into
+    `ips`, for scoring only (progress, lap gate, reset check). `legal_map` (N, 2) fixes the map;
+    without it the map grows from every matched scan (the mapping lap)."""
+    legal, legal_map, odometer = False, None, None    # class defaults: runners set them here
+
+    def __init__(self, node_name='roboracer_interface', best_effort=True, legal=None,
+                 legal_map=None):
         import rclpy
         from rclpy.qos import QoSProfile, QoSReliabilityPolicy
         from sensor_msgs.msg import LaserScan
@@ -650,6 +700,13 @@ class RoboRacerInterface:
         self.angle_increment = 0.004363323
         self.speed = 0.0
         self.position = np.zeros(3)
+        self.ips = np.zeros(3)
+        self.legal = type(self).legal if legal is None else legal
+        legal_map = type(self).legal_map if legal_map is None else legal_map
+        if self.legal:
+            import trackmap as TM
+            self.odometer = TM.Odometer(hits=legal_map, mapping=legal_map is None)
+        self._enc, self._wz = [0.0, 0.0], 0.0
         self.lap_time = 0.0
         self.last_lap_time = 0.0
         self.start_pos = None   # learned on the first confirmed reset
@@ -668,6 +725,11 @@ class RoboRacerInterface:
             self._contact.update(self.scan, time.time())
             self.angle_min = float(m.angle_min)
             self.angle_increment = float(m.angle_increment)
+            if self.odometer is not None:
+                pose, self.speed = self.odometer.update(
+                    time.time(), *self._enc, self._wz, self.scan, self.angle_min,
+                    self.angle_increment)
+                self.position = np.array([pose[0], pose[1], 0.0])
             self._new_scan.set()
 
         def on_odom(m):
@@ -675,7 +737,17 @@ class RoboRacerInterface:
             self.speed = float(np.hypot(v.x, v.y))
 
         self.node.create_subscription(LaserScan, SCAN_TOPIC, on_scan, qos)
-        self.node.create_subscription(Odometry, ODOM_TOPIC, on_odom, qos)
+        if self.legal:
+            from sensor_msgs.msg import Imu, JointState
+            for i, side in enumerate(('left', 'right')):
+                self.node.create_subscription(
+                    JointState, f'/autodrive/roboracer_1/{side}_encoder',
+                    lambda m, i=i: self._enc.__setitem__(i, float(m.position[0])), qos)
+            self.node.create_subscription(
+                Imu, '/autodrive/roboracer_1/imu',
+                lambda m: setattr(self, '_wz', float(m.angular_velocity.z)), qos)   # R106
+        else:
+            self.node.create_subscription(Odometry, ODOM_TOPIC, on_odom, qos)
         self.node.create_subscription(Point, IPS_TOPIC, self._on_ips, qos)
         self.node.create_subscription(
             Float32, LAPTIME_TOPIC, lambda m: setattr(self, 'lap_time', float(m.data)), qos)
@@ -805,13 +877,15 @@ class RoboRacerInterface:
         a radius around the start, then return to it. The simulator's own counter is kept as
         `sim_lap_counts` for comparison, exactly as on the other backend.
         """
-        self.position = np.array([m.x, m.y, m.z])
+        self.ips = np.array([m.x, m.y, m.z])
+        if not self.legal:
+            self.position = self.ips
         if self.start_pos is None:
             # The start line is learned on the first confirmed reset, so a caller that
             # drives WITHOUT resetting never arms the counter. rollout() always resets
             # first; anything else must too.
             return
-        d = float(np.linalg.norm(self.position - np.asarray(self.start_pos, float)))
+        d = float(np.linalg.norm(self.ips - np.asarray(self.start_pos, float)))
         if d > self.LAP_OUT_M:
             self._left_start = True
         cl = self._centerline()
@@ -821,7 +895,7 @@ class RoboRacerInterface:
             lo = self._prog_idx
             hi = min(len(cl), lo + self.PROG_WINDOW + 1)
             win = cl[lo:hi]
-            d2 = np.sum((win - self.position[:2]) ** 2, axis=1)
+            d2 = np.sum((win - self.ips[:2]) ** 2, axis=1)
             k = int(np.argmin(d2))
             if d2[k] <= self.PROG_MAX_DEV ** 2:
                 # Off the corridor there is no evidence of progress, and crediting the
@@ -894,7 +968,7 @@ class RoboRacerInterface:
         if not self.wait_for_peer():
             raise TimeoutError('bridge never subscribed to our command topics — '
                                'is bringup_headless running?')
-        pre_lap_time, pre_pos = self.lap_time, np.array(self.position)
+        pre_lap_time, pre_pos = self.lap_time, np.array(self.ips)
         self.send(0.0, 0.0)
         # HOLD the flag until the reset is observed, rather than pulsing for a fixed
         # time and hoping. A 0.3 s pulse is a race the simulator can lose when it is
@@ -905,10 +979,13 @@ class RoboRacerInterface:
             while time.time() < deadline:
                 if not self.wait_for_scan(timeout=0.5):
                     continue
-                if reset_confirmed(pre_lap_time, pre_pos, self.lap_time, self.position,
+                if reset_confirmed(pre_lap_time, pre_pos, self.lap_time, self.ips,
                                    start_pos=self.start_pos):
                     if self.start_pos is None:
-                        self.start_pos = np.array(self.position)
+                        self.start_pos = np.array(self.ips)
+                    if self.odometer is not None:
+                        self.odometer.reset()
+                        self.position, self.speed = np.zeros(3), 0.0
                     # A reset far from the line would otherwise leave the counter armed,
                     # and the next return to the start would score a lap the car never
                     # drove -- the same artifact as the simulator's own counter (B11).
@@ -1380,8 +1457,7 @@ def selftest():
         q.append(pp(car))
         st, th_ = q.pop(0)                               # applied two cycles late
         delta = st * PurePursuit.DELTA_MAX
-        acc = 4.5 if th_ >= 0.3 else -6.0                # R89: saturated / hard brake
-        car.speed = max(0.0, car.speed + acc * dt)
+        car.speed = sim_speed(car.speed, th_, dt)
         yaw += car.speed * np.tan(delta) / PurePursuit.L * dt
         car.position[:2] += car.speed * dt * np.array([np.cos(yaw), np.sin(yaw)])
         d = np.min(np.linalg.norm(oval - car.position[:2], axis=1))
@@ -1400,7 +1476,10 @@ def selftest():
     cm = types.SimpleNamespace(position=np.array([5.0, 0.0, 0.0]), speed=1.5)
     pa(cm)
     pa.head = np.radians(45)
-    assert pa(cm)[1] == 0.0, 'misaligned at 1.5 m/s: no throttle'
+    assert pa(cm)[1] * K_THR <= pa.v_align, 'misaligned: target no faster than v_align'
+    pa.head, cm.position = 0.0, np.array([4.8, 0.0, 0.0])    # R104: backing up keeps the heading
+    pa(cm)
+    assert abs(np.cos(pa.head) - 1) < 1e-6, 'a reverse step must not flip the heading'
 
     # D69: the wall follower laps a ring track (inner radius 2.0, outer 3.0) counter-clockwise,
     # so the outer wall is on its right, at the loop's 18 Hz with a 2-cycle command delay,
@@ -1425,7 +1504,7 @@ def selftest():
         car.scan = ring_scan(car.position[:2], hd, angs)
         q.append(wf(car))
         st, th_ = q.pop(0)
-        car.speed = max(0.0, car.speed + (4.5 if th_ >= 0.3 else -6.0) * 0.055)
+        car.speed = sim_speed(car.speed, th_, 0.055)
         dh = car.speed * np.tan(st * PurePursuit.DELTA_MAX) / PurePursuit.L * 0.055
         hd, turned = hd + dh, turned + dh
         car.position[:2] += car.speed * 0.055 * np.array([np.cos(hd), np.sin(hd)])
@@ -1433,6 +1512,23 @@ def selftest():
     assert 2.25 < min(rad[20:]) and max(rad[20:]) < 2.75, (min(rad[20:]), max(rad[20:]))
     assert turned > 2 * np.pi, f'and get round the ring: {np.degrees(turned):.0f} deg'
     assert abs(np.mean(rad[200:]) - 2.5) < 0.1, f'centred in the corridor: {np.mean(rad[200:]):.3f}'
+
+    # R127: gentle reverse. A stalled car backs at the v_rev set-point (not -0.3 = -7.5 m/s) until it
+    # has backed back_m, measured from its speed, then hands back to the base.
+    gr = Recovery(base=lambda i: (0.2, 0.3), v_rev=1.0, back_m=1.5, max_rev_s=3.0)
+    gi = types.SimpleNamespace(speed=0.0, t=0.0, scan=np.full(1081, 5.0), angle_min=-2.35619,
+                               angle_increment=0.004363323)
+    gi.now = lambda: gi.t
+    cmds = []
+    for _ in range(200):
+        cmds.append(gr(gi))
+        gi.speed = 1.0 if cmds[-1][1] < 0 else 0.0          # reverses at 1 m/s, stuck going forward
+        gi.t += 0.055
+    rev = [c for c in cmds if c[1] < 0]
+    assert rev and all(np.isclose(c[1], -1.0 / K_THR) for c in rev), 'reverse at the -1 m/s set-point'
+    first = next(k for k, c in enumerate(cmds) if c[1] < 0)
+    run = next(k for k in range(first, len(cmds)) if cmds[k][1] >= 0) - first
+    assert 1.4 <= run * 0.055 <= 1.8, f'backs ~1.5 m at 1 m/s, then drives on: {run * 0.055:.2f} s'
 
     # D69 Explorer, on the same ring with signed velocity (a reverse flips the turn):
     # (1) driving forward it laps with no turn-rounds; (2) with memory of a counter-clockwise lap
@@ -1447,12 +1543,7 @@ def selftest():
             car.scan = ring_scan(car.position[:2], hd, angs)
             q.append(ex(car))
             st, th_ = q.pop(0)
-            if th_ >= 0.3:
-                v += (4.5 if v >= 0 else 6.0) * 0.055
-            elif th_ <= -0.3:
-                v -= (4.5 if v <= 0 else 6.0) * 0.055
-            else:
-                v -= np.sign(v) * min(abs(v), 6.0 * 0.055)
+            v = sim_speed(v, th_, 0.055)
             hd += v * np.tan(st * PurePursuit.DELTA_MAX) / PurePursuit.L * 0.055
             nxt = car.position[:2] + v * 0.055 * np.array([np.cos(hd), np.sin(hd)])
             if not 2.15 < np.linalg.norm(nxt) < 2.85:          # the body meets a wall: stop
@@ -1463,6 +1554,19 @@ def selftest():
             car.t += 0.055
             th_pos.append(np.arctan2(car.position[1], car.position[0]))
         return np.unwrap(th_pos), car
+    # R113: a base that answers (0, 0) (Follow-the-Gap boxed in) is a stall, so Explorer turns
+    boxed_base = type('Boxed', (), {'reset': lambda self: None,
+                                     '__call__': lambda self, i: (0.0, 0.0)})()
+    eb = Explorer(base=boxed_base, planner=False)
+    cb = types.SimpleNamespace(position=np.array([2.5, 0.0, 0.0]), speed=0.0, t=0.0,
+                               scan=ring_scan(np.array([2.5, 0.0]), np.pi / 2, angs),
+                               angle_min=-2.35619, angle_increment=0.0261799)
+    cb.now = lambda: cb.t
+    eb.head = np.pi / 2
+    for _ in range(40):
+        eb(cb)
+        cb.t += 0.055
+    assert eb.turns == 1, f'boxed in for 2 s must turn: {eb.turns}'
     ex = Explorer()
     th1, car1 = drive(ex, (2.5, 0.0), np.pi / 2, 500)
     assert ex.turns == 0 and th1[-1] - th1[0] > np.pi, (ex.turns, th1[-1] - th1[0])
@@ -1539,12 +1643,7 @@ def selftest():
                     ctrl.rays.append((car.position[:2].copy(), ends, car.scan[::2] < 9.0))
             q.append(ctrl(car))
             st, th_ = q.pop(0)
-            if th_ >= 0.3:
-                v += (4.5 if v >= 0 else 6.0) * 0.055
-            elif th_ <= -0.3:
-                v -= (4.5 if v <= 0 else 6.0) * 0.055
-            else:
-                v -= np.sign(v) * min(abs(v), 6.0 * 0.055)
+            v = sim_speed(v, th_, 0.055)
             nh = hd + v * np.tan(st * PurePursuit.DELTA_MAX) / PurePursuit.L * 0.055
             nxt = car.position[:2] + v * 0.055 * np.array([np.cos(nh), np.sin(nh)])
             if np.min(np.linalg.norm(wall - nxt, axis=1)) < 0.15:

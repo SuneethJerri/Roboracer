@@ -65,7 +65,9 @@ GAINS_ALL = [('FOV',          0.60, 2.00),
              # is exactly the residual's measured +0.2.
              ('THR_OFFSET', -0.20, 0.20),
              # D48: the clearance let-off on that offset, centred on its no-op 0.
-             ('LETOFF', -1.0, 1.0)]
+             ('LETOFF', -1.0, 1.0),
+             # R128: route guidance's blend weight, centred on its no-op 0 (plain FTG).
+             ('ROUTE_W', -1.0, 1.0)]
 GAINS = GAINS_ALL[:6]       # the six gains every run before C6 used, in that order
 P = len(GAINS)
 DIMS = (6, 12, 24)          # p = 6 FTG's own gains; +6 sector thresholds; +12 more
@@ -596,7 +598,7 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
                      delta=DELTA, family='bernoulli', accumulate_g=False,
                      graded_g=False, c_adapt=0.0, restart=False, sf_m=0, sf_sigma=0.16,
                      one_meas=False, tracks=None, beta=None, mu0=0.0, h_key='contacts',
-                     stall_s=None, restart_on='tie', act=None):
+                     stall_s=None, restart_on='tie', act=None, resume=None):
     """Primal-dual SPSA on a constrained racing problem (notebook C3).
 
         minimise   J(theta)  = E_M[ implied_lap(theta, M) / baseline(M) ]
@@ -673,6 +675,12 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
     tie trigger stops firing (R88). 'tie' stays the default so R53 reproduces.
 
     `tracks` fixes the draw for every iteration, for a single-track backend (AutoDRIVE).
+
+    `resume` = the `out` CSV of an interrupted run with the SAME arguments. Its rows are copied
+    to `out`, theta, lambda, mu and the dual's partial block are restored from them, every
+    random stream is fast-forwarded past them, and the loop carries on at the next iteration,
+    so the rows match an uninterrupted run exactly (R120). `iters` is the TOTAL, and A_stab
+    defaults to 0.1 * iters: to extend a run, pass the old run's A_stab explicitly.
     """
     import circuits
     if out is None:
@@ -703,15 +711,48 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
     # floor and nothing in the log said so, which is how an unphysical bound went unnoticed
     # for a fortnight.
     face = np.zeros(P, dtype=int)
+    done = list(csv.DictReader(open(resume))) if resume else []
+
+    def unit_of(r):      # the exact logged theta; older logs only have the real gains (1e-16)
+        if r.get('u'):
+            return np.array([float(x) for x in r['u'].split()])
+        return to_unit([float(r[nm]) for nm, _, _ in GAINS])
+    assert not (done and c_adapt), 'resume: cmul is not logged under c_adapt'
+    for r in done:                                     # replay the streams the rows consumed
+        k = int(r['iter'])
+        pert(k, rng)
+        if not tracks:
+            circuits.sample(tracks_per_iter, trng)
+        if sf_m:
+            srng.standard_normal((sf_m, P))
+        if restart and not (sf_m or one_meas) and (
+                r['L_plus'] == r['L_minus'] if restart_on == 'tie'
+                else r['feas_plus'] == r['feas_minus'] == '0'):
+            jrng.normal(0, 1, size=P)
+        ur = unit_of(r)
+        face += (ur <= 1e-12) | (ur >= 1.0 - 1e-12)
+        if k % lam_every == lam_every - 1:
+            gacc.clear()
+            hacc.clear()
+        else:
+            gacc.append(float(r['G_hat']))
+            if beta:
+                hacc.append(0.5 * (float(r['H_plus']) + float(r['H_minus'])))
+    if done:
+        u = unit_of(done[-1])
+        lam, mu = float(done[-1]['lam']), float(done[-1]['mu']) if beta else mu
+        print(f'resume: {len(done)} iterations from {resume}, lam {lam:.4f}', flush=True)
 
     fields = (['iter', 'a_n', 'b_n', 'c_n', 'lam'] + [n for n, _, _ in GAINS]
               + ['L_plus', 'L_minus', 'J_plus', 'J_minus', 'G_plus', 'G_minus',
                  'G_hat', 'G_dual', 'feas_plus', 'feas_minus', 'circuits', 'family']
-              + (['mu', 'H_plus', 'H_minus'] if beta else []))
+              + (['mu', 'H_plus', 'H_minus'] if beta else []) + ['u'])
     with open(out, 'w', newline='') as fh:
         w = csv.DictWriter(fh, fieldnames=fields)
         w.writeheader()
-        for n in range(iters):
+        w.writerows(done)
+        fh.flush()
+        for n in range(len(done), iters):
             an = a / (n + 1 + A_stab) ** ALPHA
             cn = cmul * c / (n + 1) ** GAMMA
             d = pert(n, rng)
@@ -808,6 +849,7 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
             if beta:
                 row.update({'mu': mu, 'H_plus': Hp, 'H_minus': Hm})
             row.update({nm: v for (nm, _, _), v in zip(GAINS, to_real(u))})
+            row['u'] = ' '.join(repr(float(x)) for x in u)      # exact theta, for resume (R120)
             w.writerow(row)
             fh.flush()
             print(f'{n:3d}  L+={Lp:7.3f} L-={Lm:7.3f}  J={0.5*(mp.cost+mm.cost):6.3f}  '
@@ -843,7 +885,7 @@ def selftest():
     # C6 (D28). The six original gains must stay first and unchanged, or no recorded run
     # reproduces; and every ADDED gain's box must be centred on the value at which it is
     # a no-op, which is what makes the p=24 midpoint the same controller as the p=6 one.
-    assert GAINS == GAINS_ALL[:6] and len(GAINS_ALL) == 27   # 26 + D48's LETOFF
+    assert GAINS == GAINS_ALL[:6] and len(GAINS_ALL) == 28   # 26 + LETOFF (D48) + ROUTE_W (R128)
     for nm, lo, hi in GAINS_ALL[6:]:
         assert 0.5 * (lo + hi) == getattr(ftg, nm), \
             f'{nm}: box centre {0.5*(lo+hi)} is not the neutral value {getattr(ftg, nm)}'
@@ -1177,6 +1219,33 @@ def selftest():
             assert np.linalg.norm(fin - 0.3) < np.linalg.norm(np.full(P, 0.5 - 0.3)), \
                 f'unconstrained SPSA must DESCEND a bowl: ended {fin.round(3)}'
 
+            # R120: an interrupted run resumed from its CSV writes the rows the uninterrupted
+            # run writes, byte for byte: theta, lambda, the dual's block and every stream.
+            kw = dict(iters=10, a=0.05, c=0.05, seed=3, timeout=1e9, tracks_per_iter=2,
+                      restart=True, lam_every=3)
+            full, part, cont = (os.path.join(td, f) for f in ('full.csv', 'part.csv', 'cont.csv'))
+            spsa_constrained(CircuitPool(lambda t: _Bowl(t)), out=full, **kw)
+            lines = open(full).read().splitlines(keepends=True)
+            open(part, 'w').write(''.join(lines[:5]))           # header + iterations 0-3
+            spsa_constrained(CircuitPool(lambda t: _Bowl(t)), out=cont, resume=part, **kw)
+            assert open(cont).read() == open(full).read(), 'a resumed run must match the full one'
+            # ...and through a restart and the accumulating dual: probes past a wall fail, so
+            # both fail at the start, the restart jumps (its own stream), and G varies.
+            st = np.full(P, 0.5)
+            st[0] = 0.62
+            kw2 = dict(iters=12, a=0.05, c=0.05, seed=5, timeout=1e9, tracks=('IMS',),
+                       restart=True, restart_on='infeasible', lam_every=3, accumulate_g=True,
+                       start=st)
+            spsa_constrained(CircuitPool(lambda t: _Bowl(t, wall=0.55)), out=full, **kw2)
+            fr = list(csv.DictReader(open(full)))
+            rs = [int(r['iter']) for r in fr if r['feas_plus'] == r['feas_minus'] == '0']
+            assert min(rs) < 2 <= max(rs), f'restarts on both sides of the cut: {rs}'
+            assert len({r['G_hat'] for r in fr[:6]}) > 1, 'G must vary for the block to matter'
+            lines = open(full).read().splitlines(keepends=True)
+            open(part, 'w').write(''.join(lines[:3]))           # header + iterations 0-1
+            spsa_constrained(CircuitPool(lambda t: _Bowl(t, wall=0.55)), out=cont, resume=part,
+                             **kw2)
+            assert open(cont).read() == open(full).read(), 'resume through restarts and the dual'
             spsa_constrained(CircuitPool(lambda t: _Bowl(t)), iters=30, a=0.05, c=0.05,
                              seed=0, timeout=1e9, lam0=0.05,
                              out=os.path.join(td, 'c.csv'))
