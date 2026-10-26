@@ -1,8 +1,75 @@
-# RoboRacer
+# Constrained SPSA for autonomous sim racing
 
-Autonomous racing on the [AutoDRIVE](https://github.com/AutoDRIVE-Ecosystem/AutoDRIVE-RoboRacer-Sim-Racing)
-RoboRacer platform — a Gym environment over the ROS 2 bridge, a reactive baseline
-controller, and a stochastic-approximation testbed.
+Tuning a LIDAR racing controller with two-timescale constrained SPSA: minimise lap time
+**subject to finishing every lap**, over a distribution of circuits. Built for the
+[AutoDRIVE RoboRacer](https://github.com/AutoDRIVE-Ecosystem/AutoDRIVE-RoboRacer-Sim-Racing)
+sim-racing league; all algorithm work runs on `f1tenth_gym`, which is bit-for-bit
+deterministic and runs ~2,650 steps/s per core.
+
+## Problem
+
+A Follow-the-Gap controller drives from a 1080-beam LIDAR. Tune its gains θ ∈ [0,1]^p
+(p = 6-8) on 22 real circuits (17 train, 5 test):
+
+    min_θ  J(θ) = E_M[ lap(θ, M) / baseline(M) ]    s.t.   P(lap not completed) ≤ α
+
+An unfinished lap is charged `budget / progress`, so every failure costs more than every
+finish. The objective has a 42x cliff at infeasibility, with the optimum right against it.
+
+## Method
+
+Two-timescale constrained SPSA: simultaneous perturbations on the Lagrangian, projected
+dual ascent on the completion constraint, and a **fresh pair of circuits drawn every
+iteration**. The box midpoint is the baseline controller, so every run starts feasible,
+and every evaluation carries a control that must read exactly 1.0000.
+
+## Results
+
+Normalised lap time, baseline = 1.000, lower is faster.
+
+| controller | circuits | finished | lap time |
+|---|---|---|---|
+| shipped | **train** (17) | 17/17 | **0.596** |
+| shipped | **held out**: Montreal, outside the 22 | 1/1 | 0.540 |
+| shipped | train, driven in reverse (17) | 17/17 | 0.595 |
+| earlier, same method | **train** (17) | 17/17 | 0.659 |
+| earlier, same method | **held out**: the 5 test circuits | **5/5** | **0.685** |
+
+The shipped controller was never run on the 5 test circuits, which had already been used
+twice. Reliability against black-box search on the train circuits, same rollout budget,
+3 seeds: constrained SPSA 17.0/17, CMA-ES 14.3/17, random search 13.3/17.
+
+**Findings**
+
+1. **The constraint is what separates SPSA from black-box search.** Random search and
+   CMA-ES overfit the circuits they select on. Giving CMA-ES the same per-iteration
+   circuit redraw makes it worse (12.0/17): the ranking changes every generation.
+2. **Perturbations on a deterministic objective.** On the synthetic testbed (Table I of
+   Chandramouli et al. reproduced exactly), a Hadamard cycle beats Bernoulli by ~500x with
+   no noise, and every family converges by σ = 0.3. On racing, no family wins with two
+   measurements (n = 10); one-measurement Hadamard matches or beats two-measurement
+   Bernoulli at the same rollout count.
+3. **The dual.** From a feasible start the constraint estimate never sits near α, so the
+   multiplier follows its own step schedule; there is no equilibrium to track. The
+   *magnitude* of the constraint channel is what matters: weakened 6.67x, feasibility broke
+   for the first time in 36 runs.
+4. **Parameterisation mattered more than algorithm.** A PPO residual on the earlier
+   controller was 17-20% faster where it finished, but finished 17/17 in one seed of three.
+   Its whole gain decomposed into a missing throttle-offset coordinate and a corner
+   let-off; both went back into the controller, which is where the shipped one came from.
+   This is not an SPSA-vs-PPO comparison.
+
+**Limitations.** Three seeds per cell; one truly out-of-sample circuit for the shipped
+controller; the test set was used twice, on earlier controllers. Transfer to AutoDRIVE is
+in progress.
+
+The shipped gains are `DELIVERABLE` in `scripts/follow_the_gap.py`. The run that tuned them:
+
+```bash
+.venv/bin/python scripts/spsa_racing.py --backend f1tenth --c3 --tracks-per-iter 2 \
+    --iters 200 --timeout 250 -a 0.042 --seed 0 \
+    --gains FOV,BUBBLE_R,GAP_THRESH,MAX_THROTTLE,MAX_STEER,CLEARANCE,THR_OFFSET:-0.40:0.40
+```
 
 ## Contents
 
@@ -19,6 +86,8 @@ controller, and a stochastic-approximation testbed.
 | `scripts/parallel_eval.py` | Scores many gain sets at once, one simulator per worker |
 | `scripts/rl_baseline.py` | PPO baseline, scored through the same rollout as everything else |
 | `scripts/runlog.py` | Records each run's code, inputs and output hashes so results can be cited |
+| `scripts/trackmap.py` | AutoDRIVE transfer: speed set-point, encoder odometry, LIDAR map and localiser |
+| `scripts/dash.py` | AutoDRIVE transfer: live dashboard for a fine-tuning run |
 
 ## Quick start
 
@@ -120,21 +189,17 @@ of the module works without it. `f1tenth_gym` for the unattended backend, and
 `stable-baselines3` with CPU `torch` for the PPO baseline — the simulator is the
 bottleneck, so a GPU build buys nothing.
 
-## Status
-
-Environment wrapper, baselines and the SPSA work implemented and unit-tested, validated
-end-to-end on `f1tenth_gym` across 22 circuits. The shipped controller completes all 17
-training circuits at 0.596x the baseline lap time, and Montreal, outside the 22, at 0.540x.
-On the five held-out circuits, an earlier controller from the same method completes all five
-at 0.685x.
-
 ## References
 
 - Sezer & Gokasan, *A novel obstacle avoidance algorithm: Follow the Gap Method*,
   Robotics and Autonomous Systems 60(9), 2012.
+- Spall, *Multivariate Stochastic Approximation Using a Simultaneous Perturbation
+  Gradient Approximation*, IEEE Transactions on Automatic Control 37(3), 1992.
 - Spall, *An Overview of the Simultaneous Perturbation Method for Efficient
   Optimization*, Johns Hopkins APL Technical Digest 19(4), 1998.
 - Chandramouli, Prabuchandran, Sai Koti Reddy & Bhatnagar, *Generalized Deterministic
   Perturbations for Stochastic Gradient Search*, arXiv:1702.06250.
+- Bhatnagar, Fu, Marcus & Wang, *Two-Timescale Simultaneous Perturbation Stochastic
+  Approximation Using Deterministic Perturbation Sequences*, ACM TOMACS 13(2), 2003.
 - Samak et al., *AutoDRIVE: A Comprehensive, Flexible and Integrated Digital Twin
   Ecosystem*, Robotics 12(3):77, 2023.
