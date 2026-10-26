@@ -1,5 +1,6 @@
 # ---------------------------------------------------------------------------
-# Deny by default. ONLY scripts/ is committed — nothing else leaves this machine.
+# Deny by default. Only scripts/, the README figures in results/ and the files below are
+# committed — nothing else leaves this machine.
 #
 # Everything else (notes/, docs/, literature/, reports/) stays on disk and
 # works normally; it is simply never offered to git.
@@ -24,6 +25,9 @@
 !/data/baseline_ftg.csv
 !/.gitignore
 !/README.md
+# The README's figures and the CSVs they were drawn from (scripts/plot_results.py).
+!/results/*.svg
+!/results/*.csv
 
 # --- never, even if a rule above would otherwise allow it ------------------
 # Listed last because the last matching rule wins.
