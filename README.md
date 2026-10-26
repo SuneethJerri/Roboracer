@@ -25,7 +25,10 @@ and every evaluation carries a control that must read exactly 1.0000.
 
 ## Results
 
-Normalised lap time, baseline = 1.000, lower is faster.
+Normalised lap time: each lap divided by that circuit's lap with **untuned Follow-the-Gap**
+(the centre of the tuning box, measured once per circuit), so baseline = 1.000 and lower is
+faster. The baseline is our own, not a published one. Absolute lap times are not comparable with
+other f1tenth benchmarks, whose maps and speed limits differ.
 
 | controller | circuits | finished | lap time |
 |---|---|---|---|
