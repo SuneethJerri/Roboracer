@@ -123,8 +123,10 @@ bottleneck, so a GPU build buys nothing.
 ## Status
 
 Environment wrapper, baselines and the SPSA work implemented and unit-tested, validated
-end-to-end on `f1tenth_gym` across 22 circuits. Best tuned controller completes all five
-held-out circuits at 0.79x the baseline lap time.
+end-to-end on `f1tenth_gym` across 22 circuits. The shipped controller completes all 17
+training circuits at 0.596x the baseline lap time, and Montreal, outside the 22, at 0.540x.
+On the five held-out circuits, an earlier controller from the same method completes all five
+at 0.685x.
 
 ## References
 
