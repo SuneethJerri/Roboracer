@@ -598,7 +598,7 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
                      delta=DELTA, family='bernoulli', accumulate_g=False,
                      graded_g=False, c_adapt=0.0, restart=False, sf_m=0, sf_sigma=0.16,
                      one_meas=False, tracks=None, beta=None, mu0=0.0, h_key='contacts',
-                     stall_s=None, restart_on='tie', act=None, resume=None):
+                     stall_s=None, restart_on='tie', act=None, resume=None, hold_tracks=1):
     """Primal-dual SPSA on a constrained racing problem (notebook C3).
 
         minimise   J(theta)  = E_M[ implied_lap(theta, M) / baseline(M) ]
@@ -658,6 +658,9 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
     `one_meas` (D37) is one-measurement SPSA, `ghat = L(theta + c_n d) / (c_n d)`, as in
     BhatnagarFuMarcusWang2003. With `family='hadamard'` the `L(theta)` term cancels exactly
     over each period; with Bernoulli only in expectation.
+
+    `hold_tracks` (D80) redraws circuits only when n % hold_tracks == 0, so with
+    hold_tracks = the Hadamard period each draw is held for one full period. 1 is the default.
 
     `beta` adds the second constraint (D60): contacts per lap <= beta, as
     `H = mean(contacts per lap) / beta <= 1`, with its own multiplier `mu` stepped on the
@@ -721,7 +724,7 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
     for r in done:                                     # replay the streams the rows consumed
         k = int(r['iter'])
         pert(k, rng)
-        if not tracks:
+        if not tracks and k % hold_tracks == 0:
             circuits.sample(tracks_per_iter, trng)
         if sf_m:
             srng.standard_normal((sf_m, P))
@@ -738,6 +741,7 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
             gacc.append(float(r['G_hat']))
             if beta:
                 hacc.append(0.5 * (float(r['H_plus']) + float(r['H_minus'])))
+    draw = tuple(done[-1]['circuits'].split(';')) if done else None
     if done:
         u = unit_of(done[-1])
         lam, mu = float(done[-1]['lam']), float(done[-1]['mu']) if beta else mu
@@ -756,8 +760,10 @@ def spsa_constrained(pool, iters=40, laps=1, a=0.01, b=B_GAIN, c=0.08, A_stab=No
             an = a / (n + 1 + A_stab) ** ALPHA
             cn = cmul * c / (n + 1) ** GAMMA
             d = pert(n, rng)
-            draw = (tuple(tracks) if tracks else
-                    circuits.sample(tracks_per_iter, trng))      # CRN, both arms (D4)
+            if tracks:
+                draw = tuple(tracks)
+            elif n % hold_tracks == 0:
+                draw = circuits.sample(tracks_per_iter, trng)    # CRN, both arms (D4)
             if sf_m:                                             # D36: J_sigma
                 cn = sf_sigma
                 mm = measure(pool, u, draw, laps, timeout, stall_s=stall_s, act=act)
@@ -1246,6 +1252,17 @@ def selftest():
             spsa_constrained(CircuitPool(lambda t: _Bowl(t, wall=0.55)), out=cont, resume=part,
                              **kw2)
             assert open(cont).read() == open(full).read(), 'resume through restarts and the dual'
+            # D80: held draws change only on the hold boundary, and resume mid-hold.
+            kw3 = dict(iters=10, a=0.05, c=0.05, seed=4, timeout=1e9, tracks_per_iter=2,
+                       one_meas=True, family='hadamard', hold_tracks=4)
+            spsa_constrained(CircuitPool(lambda t: _Bowl(t)), out=full, **kw3)
+            cs = [r['circuits'] for r in csv.DictReader(open(full))]
+            assert all(cs[i] == cs[i - i % 4] for i in range(10)), f'draw held for 4: {cs}'
+            assert len(set(cs)) > 1, 'and redrawn on the boundary'
+            lines = open(full).read().splitlines(keepends=True)
+            open(part, 'w').write(''.join(lines[:7]))           # header + iterations 0-5
+            spsa_constrained(CircuitPool(lambda t: _Bowl(t)), out=cont, resume=part, **kw3)
+            assert open(cont).read() == open(full).read(), 'resume in the middle of a hold'
             spsa_constrained(CircuitPool(lambda t: _Bowl(t)), iters=30, a=0.05, c=0.05,
                              seed=0, timeout=1e9, lam0=0.05,
                              out=os.path.join(td, 'c.csv'))
@@ -1656,6 +1673,9 @@ def main(argv):
     q.add_argument('--one-meas', action='store_true',
                    help='D37: one-measurement SPSA, L(theta + c d) / (c d). Pair with '
                         '--family hadamard for exact cancellation over a period')
+    q.add_argument('--hold-tracks', type=int, default=1,
+                   help='D80: redraw circuits every N iterations (N = the Hadamard period '
+                        'holds each draw for one period). 1 = every iteration')
     q.add_argument('--gains', default=None,
                    help='comma-separated gain NAMES to tune, overriding --dim. The only '
                         'way to reach a gain outside the first 24, such as MIN_THROTTLE '
@@ -1733,7 +1753,8 @@ def main(argv):
                              family=o.family, lam_every=o.lam_every,
                              accumulate_g=o.accumulate_g, graded_g=o.graded_g,
                              c_adapt=o.c_adapt, restart=o.restart, sf_m=o.sf_m,
-                             sf_sigma=o.sf_sigma, one_meas=o.one_meas)
+                             sf_sigma=o.sf_sigma, one_meas=o.one_meas,
+                             hold_tracks=o.hold_tracks)
         else:
             spsa(iface, o.iters, o.laps, o.a, o.c, seed=o.seed, out=o.out,
                  max_step=o.max_step, timeout=o.timeout, ref_lap=o.ref_lap,
