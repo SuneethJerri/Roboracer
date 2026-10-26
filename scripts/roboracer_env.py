@@ -1195,7 +1195,11 @@ def selftest():
         def close(self):
             pass
 
-    for repeat in (1, 5, 17):
+    import importlib.util
+    have_gym = importlib.util.find_spec('gymnasium') is not None   # B22's check builds the env
+    if not have_gym:
+        print('  B22 living-cost check skipped: gymnasium not installed')
+    for repeat in (1, 5, 17) if have_gym else ():
         e = make_env(max_steps=10, reward_fn=reward_progress, iface_factory=_StubIface,
                      action_repeat=repeat)
         e.reset()
