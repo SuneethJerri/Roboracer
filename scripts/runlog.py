@@ -8,6 +8,8 @@ Wraps a command instead of changing it, so no experiment script has to know this
     runlog.py ls
     runlog.py verify
 
+A run voided in the notebook gets `runs/<dir>/VOID` holding the reason, and `verify` skips it.
+
 Each run gets `runs/<UTC>_<name>/` holding `log.txt`, `meta.json` (argv, commit, dirty
 flag, package versions, a SHA-256 per tracked output), `patch.diff` when tracked files
 differ, and a copy of any untracked script named in the command. A notebook entry names the
@@ -223,9 +225,17 @@ def alive(pid):
     return True
 
 
+def later_tracked(runs, m):
+    """Paths that a run recorded after `m` also tracked."""
+    return {o['path'] for r in runs if r['_dir'] > m['_dir'] for o in r.get('outputs', [])}
+
+
 def do_verify():
     runs = load_all()
-    problems, running = [], []
+    problems, running, superseded = [], [], []
+    # A run voided in the notebook (B43) carries its reason in a VOID file and is not checked.
+    void = [m['_dir'] for m in runs if os.path.exists(os.path.join(RUNS, m['_dir'], 'VOID'))]
+    runs = [m for m in runs if m['_dir'] not in void]
     for m in runs:
         for o in m.get('outputs', []):
             p = os.path.join(ROOT, o['path'])
@@ -234,7 +244,13 @@ def do_verify():
             elif not os.path.exists(p):
                 problems.append(f'{m["_dir"]}: {o["path"]} is gone')
             elif sha256(p) != o['sha256']:
-                problems.append(f'{m["_dir"]}: {o["path"]} CHANGED since the run')
+                own_log = os.path.join(RUNS, m['_dir'], 'log.txt')
+                if os.path.exists(own_log) and sha256(own_log) == o['sha256']:
+                    pass    # B33: the recorded bytes survive in the run's own log
+                elif o['path'] in later_tracked(runs, m):
+                    superseded.append(m['_dir'])    # B33: a later run rewrote the same path
+                else:
+                    problems.append(f'{m["_dir"]}: {o["path"]} CHANGED since the run')
             elif o.get('fresh') is False:
                 problems.append(f'{m["_dir"]}: {o["path"]} is STALE -- it predates the '
                                 f'run, so the recorded hash is an earlier run\'s output')
@@ -287,7 +303,10 @@ def do_verify():
 
     dirty = [m['_dir'] for m in runs if m['git']['dirty']]
     print(f'{len(runs)} runs checked, {len(dirty)} from a dirty tree'
-          + (f', {len(running)} still running' if running else ''))
+          + (f', {len(running)} still running' if running else '')
+          + (f', {len(void)} void' if void else '')
+          + (f', {len(set(superseded))} with an output rewritten by a later run'
+             if superseded else ''))
     for r in running:
         print(f'  in flight: {r}')
     if problems:
@@ -332,6 +351,21 @@ def selftest():
         # A changed output must be caught.
         open(out, 'w').write('tampered')
         assert do_verify() == 1, 'a modified output must fail verification'
+        # ... unless a later run tracked the same path and rewrote it (B33).
+        assert do_run('later', [sys.executable, '-c', f'open({out!r},"w").write("z")'],
+                      [out]) == 0
+        assert do_verify() == 0, 'an output rewritten by a later run is not a problem'
+        open(out, 'w').write('tampered again')
+        assert do_verify() == 1, 'the latest run of a path must still be checked'
+        # ... and passes again when the run's own log still holds the recorded bytes.
+        lm = load_all()[-1]
+        shutil.copy(os.path.join(RUNS, lm['_dir'], 'log.txt'), out)
+        lmf = os.path.join(RUNS, lm['_dir'], 'meta.json')
+        d = json.load(open(lmf))
+        d['outputs'][0]['sha256'] = sha256(out)
+        json.dump(d, open(lmf, 'w'), indent=2, sort_keys=True)
+        open(out, 'w').write('overwritten')
+        assert do_verify() == 0, 'bytes kept in the run log must still verify'
 
         # Two runs of the same command that disagree must be caught as a discrepancy.
         RUNS = os.path.join(td, 'runs2')
@@ -352,6 +386,10 @@ def selftest():
         assert do_run('boom', [sys.executable, '-c', 'raise SystemExit(3)'], []) == 3
         assert load_all()[0]['exit_code'] == 3
         assert do_verify() == 1, 'a non-zero exit must fail verification'
+        vf = os.path.join(RUNS, load_all()[0]['_dir'], 'VOID')
+        open(vf, 'w').write('selftest\n')
+        assert do_verify() == 0, 'a voided run must not be checked'
+        os.remove(vf)
 
         # A killed run leaves meta.json with no exit code at all, and its partial outputs
         # must not pass as a result.
