@@ -26,8 +26,10 @@
 !/.gitignore
 !/README.md
 # The README's figures and the CSVs they were drawn from (scripts/plot_results.py).
-!/results/*.svg
-!/results/*.csv
+!/results/fig1_sweep.svg
+!/results/fig1_sweep.csv
+!/results/fig2_reliability.svg
+!/results/fig2_reliability.csv
 
 # --- never, even if a rule above would otherwise allow it ------------------
 # Listed last because the last matching rule wins.
