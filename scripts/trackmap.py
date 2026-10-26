@@ -167,14 +167,28 @@ def plan(grid, start, goal, r_min=R_MIN, step=0.2, n_th=72, cell=0.1, goal_tol=0
     return None
 
 
+K_THR = 25.0          # m/s per unit throttle: the simulator holds speed K_THR * throttle (R103)
+
+
+def throttle_for(v):
+    """Throttle for a signed target speed in m/s (R103)."""
+    return float(np.clip(v / K_THR, -1.0, 1.0))
+
+
+def sim_speed(v, th, dt):
+    """Test car: speed moves toward K_THR * th, at <= 4.5 m/s^2 speeding up and 6.0 slowing (R89)."""
+    tgt = K_THR * th
+    rate = 4.5 if abs(tgt) > abs(v) and tgt * v >= 0 else 6.0
+    return v + float(np.clip(tgt - v, -rate * dt, rate * dt))
+
+
 class PlanFollower:
     """Drive a plan run by run. Each run (constant direction) is tracked with pure pursuit on
-    its own poses; reversing mirrors the steering. Speed is held under `v` with bang-bang
-    throttle (R89). `done` when the last run's end is reached; `failed` if the car is more
+    its own poses; reversing mirrors the steering. Speed is held at `v` (R103). `done` when the last run's end is reached; `failed` if the car is more
     than `max_dev` m off the run."""
     DELTA_MAX = 0.5236
 
-    def __init__(self, path, v=0.5, thr=0.3, ld=0.4, end_tol=0.15, max_dev=0.45, stuck_s=2.5,
+    def __init__(self, path, v=0.5, ld=0.4, end_tol=0.15, max_dev=0.45, stuck_s=2.5,
                  dt=0.055):
         self.runs, cur = [], []
         for p in path[1:]:
@@ -184,7 +198,7 @@ class PlanFollower:
             cur.append(p)
         if cur:
             self.runs.append(cur)
-        self.v, self.thr, self.ld, self.end_tol, self.max_dev = v, thr, ld, end_tol, max_dev
+        self.v, self.ld, self.end_tol, self.max_dev = v, ld, end_tol, max_dev
         self.r, self.done, self.failed = 0, not self.runs, False
         # R99: pinned against a wall, it commanded throttle for 500 steps. No progress ALONG the
         # run (its nearest index not advancing) for stuck_s (calls x dt) means failed. Distance to
@@ -200,7 +214,9 @@ class PlanFollower:
         if d.min() > self.max_dev:
             self.failed = True
             return 0.0, 0.0
-        if np.linalg.norm(pts[-1] - xy) < self.end_tol:
+        e = run[-1]                                       # R103: at the end line, not just near it
+        past = (xy - pts[-1]) @ (np.array([np.cos(e[2]), np.sin(e[2])]) * np.sign(e[3])) > -0.02
+        if np.linalg.norm(pts[-1] - xy) < self.end_tol and past:
             self.r += 1
             self.done = self.r >= len(self.runs)
             self.best, self.idle = -1, 0
@@ -222,8 +238,8 @@ class PlanFollower:
         alpha = _wrap(np.arctan2(tgt[1] - xy[1], tgt[0] - xy[0]) - facing)
         delta = np.arctan(2 * L * np.sin(alpha) / max(self.ld, 1e-3))
         steer = float(np.clip((-delta if back else delta) / self.DELTA_MAX, -1.0, 1.0))
-        go = self.thr if speed < self.v else 0.0
-        return steer, (-go if back else go)
+        v = min(self.v, 0.1 + 1.5 * float(np.linalg.norm(pts[-1] - xy)))   # R103: ease into the run's end
+        return steer, throttle_for(-v if back else v)
 
 
 def clean_path(P, redrive_m=0.15, gap_m=0.4, ds=0.05, smooth_m=0.3, closed=True,
@@ -281,6 +297,127 @@ def clean_path(P, redrive_m=0.15, gap_m=0.4, ds=0.05, smooth_m=0.3, closed=True,
 
 
 # ---------------------------------------------------------------------------- test geometry
+WHEEL_R = 0.0583        # m per encoder radian (R103)
+LIDAR_X = 0.2733        # lidar ahead of the /ips point (bridge TF)
+
+
+class Localiser:
+    """D72: race-legal pose. Predict from speed and yaw rate, then correct by matching the scan
+    to a truncated distance field of the map: a coarse then a fine grid search of
+    (dx, dy, dth) around the prediction. `add_scan` grows the map (mapping lap); a fixed map is
+    passed as `hits`. The grid is fixed-size around the start, so it is good for one track.
+    ponytail: no loop closure and no filter; the best match replaces the prediction outright."""
+
+    def __init__(self, pose=(0.0, 0.0, 0.0), hits=None, res=RES, half=40.0, cap=0.5, every=3,
+                 max_r=9.0, bad=0.12, lidar_x=0.0, a_max=7.0):
+        self.res, self.cap, self.every, self.max_r, self.bad = res, cap, every, max_r, bad
+        self.lidar_x, self.a_max, self.v = lidar_x, a_max, 0.0
+        self.lo = np.array(pose[:2], float) - half
+        n = int(2 * half / res)
+        self.occ = np.zeros((n, n), bool)
+        self.df = np.full((n, n), cap, np.float32)
+        r = int(np.ceil(cap / res))
+        o = np.arange(-r, r + 1)
+        self.stencil = np.minimum(np.hypot(*np.meshgrid(o, o, indexing='ij')) * res, cap) \
+            .astype(np.float32)
+        self.pose = np.array(pose, float)
+        self.score = 0.0
+        if hits is not None:
+            self.add(hits)
+
+    def add(self, pts):
+        ij = np.unique(np.floor((np.asarray(pts, float).reshape(-1, 2) - self.lo) / self.res)
+                       .astype(int), axis=0)
+        r, n = self.stencil.shape[0] // 2, self.occ.shape[0]
+        ij = ij[(ij >= r).all(1) & (ij < n - r).all(1)]
+        ij = ij[~self.occ[ij[:, 0], ij[:, 1]]]
+        self.occ[ij[:, 0], ij[:, 1]] = True
+        for i, j in ij:
+            w = self.df[i - r:i + r + 1, j - r:j + r + 1]
+            np.minimum(w, self.stencil, out=w)
+
+    def points(self, scan, amin, inc, pose=None):
+        x, y, th = self.pose if pose is None else pose
+        r = np.asarray(scan, float)
+        a = amin + inc * np.arange(r.size)
+        k = np.isfinite(r) & (r > 0.05) & (r < self.max_r)
+        x, y = x + self.lidar_x * np.cos(th), y + self.lidar_x * np.sin(th)
+        return np.c_[x + r[k] * np.cos(th + a[k]), y + r[k] * np.sin(th + a[k])]
+
+    def _cost(self, local, cand):
+        """Mean truncated distance of `local` (N, 2 body-frame points) under each candidate."""
+        c, s = np.cos(cand[:, 2]), np.sin(cand[:, 2])
+        X = cand[:, :1] + c[:, None] * local[:, 0] - s[:, None] * local[:, 1]
+        Y = cand[:, 1:2] + s[:, None] * local[:, 0] + c[:, None] * local[:, 1]
+        i = np.clip(((X - self.lo[0]) / self.res).astype(int), 0, self.df.shape[0] - 1)
+        j = np.clip(((Y - self.lo[1]) / self.res).astype(int), 0, self.df.shape[1] - 1)
+        return self.df[i, j].mean(axis=1)
+
+    def _search(self, local, c, span, n):
+        g = [np.linspace(-h, h, n) for h in span]
+        d = np.stack(np.meshgrid(*g, indexing='ij'), -1).reshape(-1, 3)
+        cand = c + d
+        cost = self._cost(local, cand)
+        k = int(np.argmin(cost))
+        return cand[k], float(cost[k])
+
+    def step(self, v, w, dt, scan, amin, inc):
+        """Predict with wheel speed v (clamped to a_max) and yaw rate w over dt, then match
+        `scan`. Returns the pose."""
+        # R107: wheels spin past the body's speed in reverse pulses and contacts
+        v = self.v = float(np.clip(v, self.v - self.a_max * dt, self.v + self.a_max * dt))
+        x, y, th = self.pose
+        th_m = th + 0.5 * w * dt
+        pred = np.array([x + v * dt * np.cos(th_m), y + v * dt * np.sin(th_m), th + w * dt])
+        r = np.asarray(scan, float)[::self.every]
+        a = amin + inc * self.every * np.arange(r.size)
+        k = np.isfinite(r) & (r > 0.05) & (r < self.max_r)
+        local = np.c_[self.lidar_x + r[k] * np.cos(a[k]), r[k] * np.sin(a[k])]
+        if not self.occ.any() or len(local) < 20:
+            self.pose, self.score = pred, np.nan
+            return self.pose
+        best, cost = self._search(local, pred, (0.2, 0.2, np.radians(8)), 9)
+        best, cost = self._search(local, best, (0.05, 0.05, np.radians(2)), 9)
+        self.score = cost
+        self.pose = best if cost < self.bad else pred
+        self.pose[2] = _wrap(self.pose[2])
+        return self.pose
+
+
+class Odometer:
+    """D72 #22/#23: race-legal pose and speed from the wheel encoders, IMU yaw rate and the
+    scan, through a Localiser. The frame is the car's start pose (0, 0, 0). `mapping` grows the
+    map from every matched scan (the warm-up lap); otherwise the map is fixed."""
+
+    def __init__(self, hits=None, mapping=False, lidar_x=LIDAR_X):
+        self.loc = Localiser(hits=hits, lidar_x=lidar_x)
+        self.mapping, self.last = mapping, None
+
+    def reset(self):
+        self.loc.pose, self.loc.v, self.last = np.zeros(3), 0.0, None
+
+    def update(self, t, enc_l, enc_r, wz, scan, amin, inc):
+        """Returns (pose, speed). The first call only takes the encoder reading (and seeds an
+        empty map from its scan)."""
+        enc = 0.5 * (enc_l + enc_r)
+        if self.last is None or not 0 < t - self.last[0] < 0.5:
+            self.last = (t, enc)
+            if not self.loc.occ.any():
+                self.loc.add(self.loc.points(scan, amin, inc))
+            return self.loc.pose.copy(), abs(self.loc.v)
+        dt = t - self.last[0]
+        v = (enc - self.last[1]) / dt * WHEEL_R
+        self.last = (t, enc)
+        pose = self.loc.step(v, wz, dt, scan, amin, inc)
+        if self.mapping and self.loc.score < self.loc.bad:
+            self.loc.add(self.loc.points(scan, amin, inc))
+        return pose.copy(), abs(self.loc.v)
+
+    def map_points(self):
+        ij = np.argwhere(self.loc.occ)
+        return self.loc.lo + (ij + 0.5) * self.loc.res
+
+
 def hairpin_walls(w=1.2, div=0.2, length=4.0, ds=0.02):
     """Two parallel legs (y in [0, w] and [w + div, 2w + div]) joined by a U-bend around the end
     of a thin divider, with the bend's centre line at radius ~(div/2 + w/2). Returns (segments,
@@ -401,6 +538,31 @@ def selftest():
     for _ in range(60):
         fs(np.array([0.3, 0.0]), 0.0, 0.0)
     assert fs.failed, 'no progress along the run for > stuck_s means failed'
+    # D72 localiser on the hairpin: drive the centre line with 6% speed error and a 0.2 rad/s
+    # yaw-rate bias. Against a known map it stays within 0.08 m where dead reckoning drifts
+    # past 0.3 m; building its own map from the first scan it stays within 0.15 m.
+    cl = np.r_[np.c_[np.linspace(0.6, 4.0, 35), np.full(35, 0.6)],
+               0.7 * np.c_[np.sin(np.linspace(0, np.pi, 23)[1:-1]),
+                           -np.cos(np.linspace(0, np.pi, 23)[1:-1])] + [4.0, 1.3],
+               np.c_[np.linspace(4.0, 0.6, 35), np.full(35, 2.0)]]
+    hd_ = np.arctan2(*np.diff(cl, axis=0, append=cl[-1:] + [-1, 0]).T[::-1])
+    an = np.linspace(-2.35619, 2.35619, 271)
+    for known in (True, False):
+        lo_ = Localiser((*cl[0], hd_[0]), hits=wall if known else None)
+        lo_.v = 0.1 / 0.055 * 1.06                       # already moving: no clamp ramp-up
+        dr, err = np.array([*cl[0], hd_[0]]), []
+        for k in range(1, len(cl)):
+            dt = 0.055
+            v = np.linalg.norm(cl[k] - cl[k - 1]) / dt * 1.06
+            w = _wrap(hd_[k] - hd_[k - 1]) / dt + 0.2
+            sc = ray_cast(segs, cl[k], hd_[k], an)
+            est = lo_.step(v, w, dt, sc, an[0], an[1] - an[0])
+            if not known:
+                lo_.add(lo_.points(sc, an[0], an[1] - an[0]))
+            dr = dr + [v * dt * np.cos(dr[2]), v * dt * np.sin(dr[2]), w * dt]
+            err.append(np.linalg.norm(est[:2] - cl[k]))
+        assert max(err) < (0.08 if known else 0.15), (known, max(err))
+    assert np.linalg.norm(dr[:2] - cl[-1]) > 0.3, 'dead reckoning alone must drift'
     print('selftest OK', f'hairpin plan {len(path)} poses, clearance {mind:.2f}; dead end '
           f'{len(pf2.runs)} runs, clearance {mind2:.2f}')
 
@@ -412,12 +574,7 @@ def drive(path, start, wall):
     for _ in range(1500):
         q.append(pf(car_xy, hd, abs(v)))
         st, th = q.pop(0)
-        if th >= 0.3:
-            v += (4.5 if v >= 0 else 6.0) * dt
-        elif th <= -0.3:
-            v -= (4.5 if v <= 0 else 6.0) * dt
-        else:
-            v -= np.sign(v) * min(abs(v), 6.0 * dt)
+        v = sim_speed(v, th, dt)
         hd = _wrap(hd + v * np.tan(st * PlanFollower.DELTA_MAX) / L * dt)
         car_xy = car_xy + v * dt * np.array([np.cos(hd), np.sin(hd)])
         mind = min(mind, float(np.min(np.linalg.norm(wall - car_xy, axis=1))))
