@@ -1,1 +1,21 @@
-# P1
+# P1 - Pure Pursuit parameters.
+# Tune these four values as the required P1 parameter vector. Values are
+# conservative starting points for development, not final tuned results.
+
+lookahead_base: 0.8                 # [m] base lookahead distance
+speed_coefficient: 0.2             # [s] added lookahead per m/s of speed
+speed_cap: 2.0                     # [m/s] maximum commanded speed
+lateral_acceleration_limit: 2.0    # [m/s^2] curvature-based lateral acceleration limit
+
+# Fixed model/implementation settings (verify wheelbase against the simulator).
+wheelbase: 0.33                    # [m] provisional; confirm the vehicle parameter
+
+# Optional centreline CSV. Leave null until P3's output format is agreed.
+# Expected named columns: x,y; optional signed curvature column.
+path_csv: null
+
+# Fixed safeguards; not part of the four-gain sweep.
+lookahead_min: 0.5                 # [m]
+lookahead_max: 3.0                 # [m]
+curvature_preview_distance: 4.0    # [m] look ahead for upcoming curvature
+nearest_search_window: 100         # [path points] forward projection search
