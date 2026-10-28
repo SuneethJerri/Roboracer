@@ -19,6 +19,10 @@ class RacingEnv(gym.Env):
 
     def __init__(self, track="Spielberg", max_steps=18000, target_laps=1):
         super().__init__()
+        if isinstance(max_steps, bool) or not isinstance(max_steps, (int, np.integer)) or max_steps <= 0:
+            raise ValueError("max_steps must be a positive integer")
+        if isinstance(target_laps, bool) or not isinstance(target_laps, (int, np.integer)) or target_laps <= 0:
+            raise ValueError("target_laps must be a positive integer")
         self._track = track
         self._max_steps = int(max_steps)
         self._target_laps = int(target_laps)
@@ -42,7 +46,12 @@ class RacingEnv(gym.Env):
         return np.concatenate([scan, [x, y, th, v], self._prev_action]).astype(np.float32)
 
     def _scale(self, action):
-        a = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+        a = np.asarray(action, dtype=np.float32)
+        if a.shape != (2,):
+            raise ValueError(f"action must have shape (2,), got {a.shape}")
+        if not np.all(np.isfinite(a)):
+            raise ValueError("action values must all be finite")
+        a = np.clip(a, -1.0, 1.0)
         steer = float(a[0]) * MAX_STEER
         speed = (float(a[1]) + 1.0) * 0.5 * MAX_SPEED
         return steer, speed
