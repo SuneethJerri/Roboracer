@@ -26,6 +26,7 @@ class RacingEnv(gym.Env):
 
         self._n = 0
         self._prev_action = np.zeros(2, dtype=np.float32)
+        self._prev_progress = 0.0
 
         scan_dim = int(len(self.env.scan))
         obs_dim = scan_dim + 3 + 1 + 2  # scan + x,y,theta + speed + prev(steer,speed)
@@ -52,6 +53,7 @@ class RacingEnv(gym.Env):
         self.env.reset()
         self._n = 0
         self._prev_action = np.zeros(2, dtype=np.float32)
+        self._prev_progress = 0.0
         return self._obs(), {}
 
     def step(self, action):
@@ -62,9 +64,13 @@ class RacingEnv(gym.Env):
 
         collisions = int(self.env.collisions)
         laps = int(self.env.laps)
+        progress = float(self.env.progress())
+        progress_delta = max(progress - self._prev_progress, 0.0)
+        self._prev_progress = max(self._prev_progress, progress)
 
-        # Reward: dense progress + collision penalty + tiny steering penalty.
-        reward = 100.0 * float(self.env.progress())
+        # Reward new progress, rather than repeatedly paying for distance already covered.
+        progress_reward = 100.0 * progress_delta
+        reward = progress_reward
         if collisions > 0:
             reward -= 50.0
         reward -= 0.001 * abs(steer) / MAX_STEER
@@ -79,7 +85,9 @@ class RacingEnv(gym.Env):
             "sim_seconds": float(self.env.now()),
             "laps": laps,
             "collisions": collisions,
-            "progress": float(self.env.progress()),
+            "progress": progress,
+            "progress_delta": progress_delta,
+            "progress_reward": progress_reward,
         }
         return self._obs(), float(reward), bool(terminated), bool(truncated), info
 
