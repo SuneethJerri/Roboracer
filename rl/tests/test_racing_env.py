@@ -117,3 +117,47 @@ def test_reset_clears_progress_reward_baseline(fake_env):
     assert info == {}
     assert reward == pytest.approx(10.0)
     assert step_info["progress_delta"] == pytest.approx(0.1)
+
+
+@pytest.mark.parametrize(
+    ("action", "message"),
+    [
+        (np.array([0.0]), "shape"),
+        (np.array([0.0, 0.0, 0.0]), "shape"),
+        (np.array([np.nan, 0.0]), "finite"),
+        (np.array([0.0, np.inf]), "finite"),
+    ],
+)
+def test_rejects_malformed_actions(fake_env, action, message):
+    wrapped, _ = fake_env
+
+    with pytest.raises(ValueError, match=message):
+        wrapped._scale(action)
+
+
+def test_action_scaling_clips_valid_actions_to_physical_limits(fake_env):
+    wrapped, _ = fake_env
+
+    steer, speed = wrapped._scale(np.array([-2.0, 2.0]))
+
+    assert steer == pytest.approx(-racing_env.MAX_STEER)
+    assert speed == pytest.approx(racing_env.MAX_SPEED)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"max_steps": 0}, "max_steps"),
+        ({"max_steps": 1.5}, "max_steps"),
+        ({"target_laps": 0}, "target_laps"),
+        ({"target_laps": True}, "target_laps"),
+    ],
+)
+def test_rejects_invalid_episode_limits(monkeypatch, kwargs, message):
+    def unexpected_env_creation(*args, **kwargs):
+        pytest.fail("invalid options should be rejected before creating GymEnv")
+
+    monkeypatch.setattr(racing_env, "GymEnv", unexpected_env_creation)
+
+    with pytest.raises(ValueError, match=message):
+        racing_env.RacingEnv(**kwargs)
