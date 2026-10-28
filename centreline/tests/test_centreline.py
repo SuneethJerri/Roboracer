@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from centreline import Centreline
+from controllers.pure_pursuit.pure_pursuit import PurePursuit
 
 
 def circle_points(radius=3.0, count=80):
@@ -45,6 +46,23 @@ def test_projection_returns_nearest_point_and_arc_length():
     assert result.distance == pytest.approx(0.0, abs=0.01)
     assert np.linalg.norm(result.point) == pytest.approx(3.0, abs=0.01)
     assert 0.0 <= result.arc_length < path.total_length
+
+
+def test_csv_export_loads_in_pure_pursuit(tmp_path):
+    path = Centreline(circle_points(), sample_count=120)
+    csv_path = path.save_csv(tmp_path / "centreline.csv")
+    controller = PurePursuit({
+        "lookahead_base": 0.8,
+        "speed_coefficient": 0.2,
+        "speed_cap": 2.0,
+        "lateral_acceleration_limit": 2.0,
+        "wheelbase": 0.33,
+    })
+
+    controller.load_path_csv(csv_path)
+
+    assert np.allclose(controller.path, path.points)
+    assert np.allclose(controller.curvature, path.curvature)
 
 
 @pytest.mark.parametrize(
