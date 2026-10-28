@@ -1,7 +1,9 @@
 """Fit noisy lap samples to a smooth, arc-length-parameterized closed path."""
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from scipy.interpolate import splprep, splev
@@ -83,6 +85,18 @@ class Centreline:
         ))
         self.curvature = np.interp(self.s, closed_s, closed_curvature)
         self.sample_count = sample_count
+
+    def save_csv(self, path):
+        """Save points and signed curvature in Pure Pursuit's CSV format."""
+        output_path = Path(path)
+        with output_path.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow(("x", "y", "curvature"))
+            writer.writerows(
+                (float(point[0]), float(point[1]), float(curvature))
+                for point, curvature in zip(self.points, self.curvature)
+            )
+        return output_path
 
     @staticmethod
     def _prepare_points(points):

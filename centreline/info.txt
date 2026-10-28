@@ -12,7 +12,10 @@ Example:
     curvature = path.curvature
     next_point = path.point_at(path.s[10] + 1.0)
     projection = path.project(vehicle_x, vehicle_y)
+    path.save_csv("centreline.csv")
 
+The exported CSV uses named x, y, and curvature columns and can be loaded by
+PurePursuit's path_csv option or load_path_csv() method.
 The first input point may be repeated at the end. Consecutive duplicates are
 removed; invalid coordinates, fewer than three distinct points, and invalid
 options raise ValueError. Smoothing is SciPy's non-negative spline residual
