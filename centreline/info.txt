@@ -1,1 +1,19 @@
-# P3 - Track representation and the reference centreline. Required by P1 and P5 to operate.
+P3 centreline implementation
+
+centreline.Centreline accepts ordered world-frame lap samples as an Nx2 array.
+It fits a periodic spline, resamples the closed path at approximately uniform
+arc-length intervals, and provides signed curvature for each output point.
+
+Example:
+    from centreline import Centreline
+
+    path = Centreline(odometry_xy, sample_count=500, smoothing=0.5)
+    points = path.points
+    curvature = path.curvature
+    next_point = path.point_at(path.s[10] + 1.0)
+    projection = path.project(vehicle_x, vehicle_y)
+
+The first input point may be repeated at the end. Consecutive duplicates are
+removed; invalid coordinates, fewer than three distinct points, and invalid
+options raise ValueError. Smoothing is SciPy's non-negative spline residual
+factor; use 0 for an interpolating spline.
