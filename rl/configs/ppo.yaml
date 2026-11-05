@@ -1,0 +1,9 @@
+algo: PPO
+policy: MlpPolicy
+n_steps: 2048
+batch_size: 64
+learning_rate: 3.0e-4
+gamma: 0.99
+seeds: [0, 1, 2, 3, 4]
+steps_per_seed: 100000
+track: Spielberg
