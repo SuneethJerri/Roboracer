@@ -29,6 +29,7 @@ def evaluate_policy(
         episode_seed = seed + episode - 1
         observation, _ = env.reset(seed=episode_seed)
         total_reward = 0.0
+        steps = 0
         terminated = truncated = False
         info = {}
 
@@ -36,6 +37,7 @@ def evaluate_policy(
             action, _ = model.predict(observation, deterministic=True)
             observation, reward, terminated, truncated, info = env.step(action)
             total_reward += float(reward)
+            steps += 1
 
         records.append({
             "algo": algo,
@@ -43,6 +45,7 @@ def evaluate_policy(
             "track": track,
             "seed": episode_seed,
             "episode": episode,
+            "steps": steps,
             "sim_seconds": float(info.get("sim_seconds", 0.0)),
             "progress": float(info.get("progress", 0.0)),
             "laps": int(info.get("laps", 0)),
@@ -59,7 +62,7 @@ def evaluate_policy(
 def write_results(path, records):
     """Write episode results using a stable, standalone P5 evaluation schema."""
     columns = (
-        "algo", "model", "track", "seed", "episode", "sim_seconds",
+        "algo", "model", "track", "seed", "episode", "steps", "sim_seconds",
         "progress", "laps", "target_laps", "success", "collisions",
         "reward", "terminated", "truncated",
     )

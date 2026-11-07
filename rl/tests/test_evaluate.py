@@ -52,6 +52,7 @@ def test_evaluation_records_each_episode_until_done():
 
     assert len(rows) == 3
     assert [row["episode"] for row in rows] == [1, 2, 3]
+    assert [row["steps"] for row in rows] == [1, 2, 3]
     assert [row["seed"] for row in rows] == [17, 18, 19]
     assert env.reset_seeds == [17, 18, 19]
     assert all(row["algo"] == "ppo" for row in rows)
@@ -77,6 +78,7 @@ def test_evaluation_csv_has_header_and_episode_rows(tmp_path):
     assert saved[0]["seed"] == "5"
     assert saved[0]["algo"] == "sac"
     assert saved[0]["episode"] == "1"
+    assert saved[0]["steps"] == "1"
     assert saved[0]["success"] == "True"
     assert saved[1]["reward"] == "3.0"
 
