@@ -75,3 +75,89 @@ def test_rejects_empty_run_csv(tmp_path):
 
     with pytest.raises(ValueError, match="empty run"):
         summarize_csv(source)
+
+
+def write_policy_evaluation(path, rows):
+    fields = (
+        "algo", "model", "track", "seed", "episode", "steps", "sim_seconds",
+        "progress", "laps", "target_laps", "success", "collisions", "reward",
+    )
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+def test_summarize_csv_accepts_p5_episode_results(tmp_path):
+    source = write_policy_evaluation(
+        tmp_path / "ppo.csv",
+        [{
+            "algo": "ppo",
+            "model": "models/ppo.zip",
+            "track": "Spielberg",
+            "seed": 12,
+            "episode": 1,
+            "steps": 1500,
+            "sim_seconds": 15.0,
+            "progress": 1.0,
+            "laps": 1,
+            "target_laps": 1,
+            "success": True,
+            "collisions": 0,
+            "reward": 25.0,
+        }],
+    )
+
+    summaries = summarize_csv(source)
+
+    assert len(summaries) == 1
+    assert summaries[0]["run"] == "ppo-12-episode1"
+    assert summaries[0]["algo"] == "ppo"
+    assert summaries[0]["seed"] == 12
+    assert summaries[0]["steps"] == 1500
+    assert summaries[0]["completed"]
+    assert summaries[0]["reward"] == 25.0
+
+
+def test_aggregates_each_p5_episode_into_run_summary(tmp_path):
+    source = write_policy_evaluation(
+        tmp_path / "sac.csv",
+        [
+            {
+                "algo": "sac", "model": "models/sac.zip", "track": "Monza",
+                "seed": 2, "episode": 1, "steps": 90, "sim_seconds": 0.9,
+                "progress": 0.2, "laps": 0, "target_laps": 1,
+                "success": False, "collisions": 1, "reward": -3.0,
+            },
+            {
+                "algo": "sac", "model": "models/sac.zip", "track": "Monza",
+                "seed": 2, "episode": 2, "steps": 100, "sim_seconds": 1.0,
+                "progress": 1.0, "laps": 1, "target_laps": 1,
+                "success": True, "collisions": 0, "reward": 8.0,
+            },
+        ],
+    )
+
+    summaries = aggregate_csv_files([source], tmp_path / "summary.csv")
+
+    assert [row["run"] for row in summaries] == [
+        "sac-2-episode1",
+        "sac-2-episode2",
+    ]
+    assert [row["success"] for row in summaries] == [False, True]
+
+
+def test_rejects_inconsistent_p5_success_flag(tmp_path):
+    source = write_policy_evaluation(
+        tmp_path / "invalid.csv",
+        [{
+            "algo": "ppo", "model": "model.zip", "track": "Track",
+            "seed": 0, "episode": 1, "steps": 10, "sim_seconds": 0.1,
+            "progress": 0.2, "laps": 0, "target_laps": 1,
+            "success": True, "collisions": 1, "reward": -1.0,
+        }],
+    )
+
+    with pytest.raises(ValueError, match="conflicts with lap count"):
+        summarize_csv(source)
