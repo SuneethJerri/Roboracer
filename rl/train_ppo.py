@@ -8,6 +8,11 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 
 from rl.logger import Logger, training_log_row
+from rl.training import (
+    add_checkpoint_arguments,
+    make_checkpoint_callback,
+    validate_checkpoint_options,
+)
 from rl.wrappers.racing_env import DT, RacingEnv
 
 
@@ -54,14 +59,32 @@ def main():
     p.add_argument("--track", type=str, default="Spielberg")
     p.add_argument("--log", type=str, default="results/rl_training.csv")
     p.add_argument("--out", type=str, default="rl/checkpoints")
+    add_checkpoint_arguments(p)
     args = p.parse_args()
+    try:
+        validate_checkpoint_options(
+            "ppo",
+            args.checkpoint_freq,
+            args.resume,
+            args.resume_replay_buffer,
+        )
+    except ValueError as exc:
+        p.error(str(exc))
 
     Path(args.out).mkdir(parents=True, exist_ok=True)
     env = RecordEpisodeStatistics(RacingEnv(track=args.track))
-    model = PPO("MlpPolicy", env, verbose=1, seed=args.seed, n_steps=2048, batch_size=64)
+    if args.resume:
+        model = PPO.load(args.resume, env=env)
+    else:
+        model = PPO("MlpPolicy", env, verbose=1, seed=args.seed,
+                    n_steps=2048, batch_size=64)
     model.learn(
         args.steps,
-        callback=SimTimeCallback(args.log, "ppo", args.seed, args.track),
+        callback=[
+            SimTimeCallback(args.log, "ppo", args.seed, args.track),
+            make_checkpoint_callback(args.out, "ppo", args.seed, args.checkpoint_freq),
+        ],
+        reset_num_timesteps=not bool(args.resume),
     )
     path = f"{args.out}/ppo_seed{args.seed}"
     model.save(path)
