@@ -5,9 +5,15 @@ import pytest
 from evaluation.report import build_report, main, write_report
 
 
-def run_row(track, progress, completed, sim_seconds=10.0, laps=0, collisions=0):
+def run_row(
+    track, progress, completed, sim_seconds=10.0, laps=0, collisions=0,
+    algo="", seed="", model="",
+):
     return {
         "track": track,
+        "algo": algo,
+        "seed": str(seed) if seed != "" else "",
+        "model": model,
         "steps": "100",
         "sim_seconds": str(sim_seconds),
         "laps": str(laps),
@@ -27,17 +33,58 @@ def test_builds_statistics_for_each_track_and_metric():
     report = build_report(rows, resamples=500, seed=4)
     progress = next(
         row for row in report
-        if row["group"] == "Spielberg" and row["metric"] == "progress"
+        if row["group"] == "track=Spielberg" and row["metric"] == "progress"
     )
     completion = next(
         row for row in report
-        if row["group"] == "Spielberg" and row["metric"] == "completion_rate"
+        if row["group"] == "track=Spielberg" and row["metric"] == "completion_rate"
     )
 
     assert progress["n"] == 2
     assert progress["mean"] == pytest.approx(0.75)
     assert completion["mean"] == pytest.approx(0.5)
     assert completion["ci_low"] <= 0.5 <= completion["ci_high"]
+
+
+def test_groups_metrics_by_algorithm_and_track():
+    rows = [
+        run_row("Spielberg", 0.4, False, algo="ppo", seed=1),
+        run_row("Spielberg", 0.8, True, algo="ppo", seed=2),
+        run_row("Spielberg", 1.0, True, algo="sac", seed=1),
+    ]
+
+    report = build_report(rows, group_by="algo,track", resamples=200, seed=2)
+    ppo_progress = next(
+        row for row in report
+        if row["algo"] == "ppo" and row["track"] == "Spielberg"
+        and row["metric"] == "progress"
+    )
+    sac_progress = next(
+        row for row in report
+        if row["algo"] == "sac" and row["track"] == "Spielberg"
+        and row["metric"] == "progress"
+    )
+
+    assert ppo_progress["group"] == "algo=ppo | track=Spielberg"
+    assert ppo_progress["n"] == 2
+    assert ppo_progress["mean"] == pytest.approx(0.6)
+    assert sac_progress["mean"] == pytest.approx(1.0)
+
+
+def test_missing_optional_group_metadata_is_labeled_unspecified():
+    report = build_report(
+        [run_row("Track", 0.5, False)],
+        group_by="algo,track",
+        resamples=100,
+    )
+
+    assert report[0]["group"] == "algo=unspecified | track=Track"
+
+
+@pytest.mark.parametrize("group_by", ["unknown", "track,track", ""])
+def test_rejects_invalid_group_fields(group_by):
+    with pytest.raises(ValueError, match="group_by"):
+        build_report([run_row("Track", 0.5, False)], group_by=group_by)
 
 
 def test_writes_machine_readable_report_csv(tmp_path):
@@ -50,7 +97,7 @@ def test_writes_machine_readable_report_csv(tmp_path):
     with output.open(newline="", encoding="utf-8") as file:
         saved = list(csv.DictReader(file))
     assert len(saved) == 6
-    assert saved[0]["group"] == "Spielberg"
+    assert saved[0]["group"] == "track=Spielberg"
     assert saved[0]["metric"] == "steps"
     assert saved[0]["n"] == "2"
 
@@ -59,7 +106,6 @@ def test_writes_machine_readable_report_csv(tmp_path):
     ("rows", "message"),
     [
         ([], "at least one"),
-        ([run_row("", 0.5, True)], "empty"),
         ([{**run_row("A", 0.5, True), "completed": "yes"}], "completed"),
         ([{**run_row("A", 0.5, True), "progress": "nan"}], "non-finite"),
     ],

@@ -7,9 +7,14 @@ from pathlib import Path
 from evaluation.statistics import summarize_values
 
 REPORT_METRICS = ("steps", "sim_seconds", "laps", "progress", "collisions", "completion_rate")
-GROUP_FIELDS = ("track",)
+GROUP_FIELDS = ("track", "algo", "seed", "model")
 REPORT_FIELDS = (
+    "group_by",
     "group",
+    "track",
+    "algo",
+    "seed",
+    "model",
     "metric",
     "n",
     "mean",
@@ -21,13 +26,23 @@ REPORT_FIELDS = (
 )
 
 
+def _normalize_group_fields(group_by):
+    fields = tuple(part.strip() for part in group_by.split(",")) if isinstance(group_by, str) else tuple(group_by)
+    if not fields or any(field not in GROUP_FIELDS for field in fields):
+        raise ValueError(f"group_by fields must be selected from: {', '.join(GROUP_FIELDS)}")
+    if len(set(fields)) != len(fields):
+        raise ValueError("group_by fields must not be repeated")
+    return fields
+
+
 def _read_summary(path, group_by):
+    fields = _normalize_group_fields(group_by)
     source = Path(path)
     with source.open("r", newline="", encoding="utf-8-sig") as file:
         reader = csv.DictReader(file)
         if not reader.fieldnames:
             raise ValueError(f"{source}: CSV is empty or has no header")
-        required = {group_by, *REPORT_METRICS[:-1], "completed"}
+        required = {*fields, *REPORT_METRICS[:-1], "completed"}
         missing = required.difference(reader.fieldnames)
         if missing:
             raise ValueError(
@@ -40,17 +55,19 @@ def _read_summary(path, group_by):
 
 
 def build_report(rows, group_by="track", confidence=0.95, resamples=10_000, seed=0):
-    """Return one statistics row per group and metric."""
-    if group_by not in GROUP_FIELDS:
-        raise ValueError(f"group_by must be one of: {', '.join(GROUP_FIELDS)}")
+    """Return one statistics row per selected metadata group and metric.
+
+    ``group_by`` accepts one field or a comma-separated combination, such as
+    ``"algo,track"``.
+    """
+    group_fields = _normalize_group_fields(group_by)
     if not rows:
         raise ValueError("at least one run summary is required")
     grouped = {}
     for row_number, row in enumerate(rows, start=2):
-        group = (row.get(group_by) or "").strip()
-        if not group:
-            raise ValueError(f"row {row_number} has an empty {group_by!r}")
-        values = grouped.setdefault(group, {metric: [] for metric in REPORT_METRICS})
+        group_key = tuple((row.get(field) or "").strip() or "unspecified"
+                          for field in group_fields)
+        values = grouped.setdefault(group_key, {metric: [] for metric in REPORT_METRICS})
         for metric in REPORT_METRICS[:-1]:
             try:
                 value = float(row[metric])
@@ -68,15 +85,28 @@ def build_report(rows, group_by="track", confidence=0.95, resamples=10_000, seed
         values["completion_rate"].append(float(completion == "true"))
 
     report_rows = []
-    for group in sorted(grouped):
+    for group_key in sorted(grouped):
+        group_values = dict(zip(group_fields, group_key))
+        group_label = " | ".join(
+            f"{field}={value}" for field, value in zip(group_fields, group_key)
+        )
         for metric in REPORT_METRICS:
             summary = summarize_values(
-                grouped[group][metric],
+                grouped[group_key][metric],
                 confidence=confidence,
                 resamples=resamples,
                 seed=seed,
             )
-            report_rows.append({"group": group, "metric": metric, **summary})
+            report_rows.append({
+                "group_by": ",".join(group_fields),
+                "group": group_label,
+                "track": group_values.get("track", ""),
+                "algo": group_values.get("algo", ""),
+                "seed": group_values.get("seed", ""),
+                "model": group_values.get("model", ""),
+                "metric": metric,
+                **summary,
+            })
     return report_rows
 
 
@@ -95,7 +125,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", help="run summary CSV from evaluation.aggregate")
     parser.add_argument("--out", default="results/evaluation_report.csv")
-    parser.add_argument("--group-by", choices=GROUP_FIELDS, default="track")
+    parser.add_argument(
+        "--group-by",
+        default="track",
+        help="comma-separated metadata fields: " + ", ".join(GROUP_FIELDS),
+    )
     parser.add_argument("--confidence", type=float, default=0.95)
     parser.add_argument("--resamples", type=int, default=10_000)
     parser.add_argument("--seed", type=int, default=0)
