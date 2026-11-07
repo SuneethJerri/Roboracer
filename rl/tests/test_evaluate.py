@@ -16,10 +16,12 @@ class FakeEnv:
     def __init__(self):
         self.episode = 0
         self.step_count = 0
+        self.reset_seeds = []
 
-    def reset(self):
+    def reset(self, seed=None):
         self.episode += 1
         self.step_count = 0
+        self.reset_seeds.append(seed)
         return np.array([self.episode], dtype=np.float32), {}
 
     def step(self, action):
@@ -42,17 +44,28 @@ class FakeEnv:
 
 
 def test_evaluation_records_each_episode_until_done():
-    rows = evaluate_policy(FakeModel(), FakeEnv(), episodes=3, track="Spielberg")
+    env = FakeEnv()
+    rows = evaluate_policy(
+        FakeModel(), env, episodes=3, track="Spielberg",
+        seed=17, algo="ppo", model_path="models/ppo.zip",
+    )
 
     assert len(rows) == 3
     assert [row["episode"] for row in rows] == [1, 2, 3]
+    assert [row["seed"] for row in rows] == [17, 18, 19]
+    assert env.reset_seeds == [17, 18, 19]
+    assert all(row["algo"] == "ppo" for row in rows)
+    assert all(row["model"] == "models/ppo.zip" for row in rows)
     assert [row["reward"] for row in rows] == [1.5, 3.0, 4.5]
     assert [row["progress"] for row in rows] == pytest.approx([0.1, 0.2, 0.3])
     assert all(row["terminated"] and not row["truncated"] for row in rows)
 
 
 def test_evaluation_csv_has_header_and_episode_rows(tmp_path):
-    rows = evaluate_policy(FakeModel(), FakeEnv(), episodes=2, track="Spielberg")
+    rows = evaluate_policy(
+        FakeModel(), FakeEnv(), episodes=2, track="Spielberg",
+        seed=5, algo="sac", model_path="models/sac.zip",
+    )
     output = write_results(tmp_path / "nested" / "evaluation.csv", rows)
 
     with output.open(newline="", encoding="utf-8") as file:
@@ -60,5 +73,16 @@ def test_evaluation_csv_has_header_and_episode_rows(tmp_path):
 
     assert len(saved) == 2
     assert saved[0]["track"] == "Spielberg"
+    assert saved[0]["seed"] == "5"
+    assert saved[0]["algo"] == "sac"
     assert saved[0]["episode"] == "1"
     assert saved[1]["reward"] == "3.0"
+
+
+@pytest.mark.parametrize(
+    ("episodes", "seed", "message"),
+    [(0, 0, "episodes"), (True, 0, "episodes"), (1, -1, "seed"), (1, True, "seed")],
+)
+def test_evaluation_rejects_invalid_episode_count_or_seed(episodes, seed, message):
+    with pytest.raises(ValueError, match=message):
+        evaluate_policy(FakeModel(), FakeEnv(), episodes, "Spielberg", seed=seed)
