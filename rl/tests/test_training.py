@@ -6,6 +6,7 @@ from rl.training import (
     add_checkpoint_arguments,
     checkpoint_directory,
     validate_checkpoint_options,
+    validate_training_options,
 )
 
 
@@ -42,3 +43,29 @@ def test_rejects_invalid_checkpoint_options(algo, frequency, resume, buffer, mes
 def test_accepts_valid_ppo_and_sac_checkpoint_options():
     validate_checkpoint_options("ppo", 1000, None, None)
     validate_checkpoint_options("sac", 1000, "policy.zip", "replay.pkl")
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        ((0, 0, "Spielberg", "train.csv", "models"), "steps"),
+        ((-1, 0, "Spielberg", "train.csv", "models"), "steps"),
+        ((1, -1, "Spielberg", "train.csv", "models"), "seed"),
+        ((1, 0, "  ", "train.csv", "models"), "track"),
+        ((1, 0, "Spielberg", "", "models"), "log_path"),
+        ((1, 0, "Spielberg", "train.csv", " "), "output_dir"),
+    ],
+)
+def test_rejects_invalid_shared_training_options(values, message):
+    with pytest.raises(ValueError, match=message):
+        validate_training_options(*values)
+
+
+def test_accepts_valid_shared_training_options():
+    validate_training_options(
+        steps=50_000,
+        seed=3,
+        track="Monza",
+        log_path="results/ppo.csv",
+        output_dir="rl/checkpoints",
+    )

@@ -12,6 +12,7 @@ from rl.training import (
     add_checkpoint_arguments,
     make_checkpoint_callback,
     validate_checkpoint_options,
+    validate_training_options,
 )
 from rl.wrappers.racing_env import DT, RacingEnv
 
@@ -62,6 +63,9 @@ def main():
     add_checkpoint_arguments(p)
     args = p.parse_args()
     try:
+        validate_training_options(
+            args.steps, args.seed, args.track, args.log, args.out
+        )
         validate_checkpoint_options(
             "ppo",
             args.checkpoint_freq,

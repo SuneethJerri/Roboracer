@@ -2,6 +2,19 @@
 from pathlib import Path
 
 
+def validate_training_options(steps, seed, track, log_path, output_dir):
+    """Validate shared PPO/SAC options before creating files or simulator state."""
+    if isinstance(steps, bool) or not isinstance(steps, int) or steps <= 0:
+        raise ValueError("steps must be a positive integer")
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError("seed must be a non-negative integer")
+    if not isinstance(track, str) or not track.strip():
+        raise ValueError("track must be a non-empty name")
+    for name, value in (("log_path", log_path), ("output_dir", output_dir)):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} must be a non-empty path")
+
+
 def add_checkpoint_arguments(parser):
     """Add periodic checkpoint and resume options to a training parser."""
     parser.add_argument(
