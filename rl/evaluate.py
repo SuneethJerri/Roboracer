@@ -6,12 +6,23 @@ from pathlib import Path
 from rl.wrappers.racing_env import RacingEnv
 
 
-def evaluate_policy(model, env, episodes, track, seed=0, algo="", model_path=""):
+def evaluate_policy(
+    model,
+    env,
+    episodes,
+    track,
+    seed=0,
+    algo="",
+    model_path="",
+    target_laps=1,
+):
     """Run deterministic episodes and return their measured outcomes."""
     if isinstance(episodes, bool) or not isinstance(episodes, int) or episodes <= 0:
         raise ValueError("episodes must be a positive integer")
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
         raise ValueError("seed must be a non-negative integer")
+    if isinstance(target_laps, bool) or not isinstance(target_laps, int) or target_laps <= 0:
+        raise ValueError("target_laps must be a positive integer")
 
     records = []
     for episode in range(1, episodes + 1):
@@ -35,6 +46,8 @@ def evaluate_policy(model, env, episodes, track, seed=0, algo="", model_path="")
             "sim_seconds": float(info.get("sim_seconds", 0.0)),
             "progress": float(info.get("progress", 0.0)),
             "laps": int(info.get("laps", 0)),
+            "target_laps": target_laps,
+            "success": int(info.get("laps", 0)) >= target_laps,
             "collisions": int(info.get("collisions", 0)),
             "reward": total_reward,
             "terminated": bool(terminated),
@@ -47,7 +60,8 @@ def write_results(path, records):
     """Write episode results using a stable, standalone P5 evaluation schema."""
     columns = (
         "algo", "model", "track", "seed", "episode", "sim_seconds",
-        "progress", "laps", "collisions", "reward", "terminated", "truncated",
+        "progress", "laps", "target_laps", "success", "collisions",
+        "reward", "terminated", "truncated",
     )
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -94,6 +108,7 @@ def main(argv=None):
             seed=args.seed,
             algo=args.algo,
             model_path=args.model,
+            target_laps=args.target_laps,
         )
     finally:
         env.close()
@@ -101,9 +116,11 @@ def main(argv=None):
     output = write_results(args.out, records)
     mean_progress = sum(row["progress"] for row in records) / len(records)
     mean_sim_seconds = sum(row["sim_seconds"] for row in records) / len(records)
+    success_rate = sum(row["success"] for row in records) / len(records)
     print(
         f"Evaluated {len(records)} {args.algo.upper()} episodes on {args.track}: "
         f"mean_progress={mean_progress:.3f} "
+        f"success_rate={success_rate:.3f} "
         f"mean_sim_seconds={mean_sim_seconds:.2f} -> {output}"
     )
     return 0

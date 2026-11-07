@@ -37,7 +37,7 @@ class FakeEnv:
             {
                 "sim_seconds": self.step_count * 0.01,
                 "progress": self.step_count * 0.1,
-                "laps": 0,
+                "laps": int(self.step_count == self.episode),
                 "collisions": 0,
             },
         )
@@ -58,6 +58,7 @@ def test_evaluation_records_each_episode_until_done():
     assert all(row["model"] == "models/ppo.zip" for row in rows)
     assert [row["reward"] for row in rows] == [1.5, 3.0, 4.5]
     assert [row["progress"] for row in rows] == pytest.approx([0.1, 0.2, 0.3])
+    assert [row["success"] for row in rows] == [True, True, True]
     assert all(row["terminated"] and not row["truncated"] for row in rows)
 
 
@@ -76,6 +77,7 @@ def test_evaluation_csv_has_header_and_episode_rows(tmp_path):
     assert saved[0]["seed"] == "5"
     assert saved[0]["algo"] == "sac"
     assert saved[0]["episode"] == "1"
+    assert saved[0]["success"] == "True"
     assert saved[1]["reward"] == "3.0"
 
 
@@ -86,3 +88,42 @@ def test_evaluation_csv_has_header_and_episode_rows(tmp_path):
 def test_evaluation_rejects_invalid_episode_count_or_seed(episodes, seed, message):
     with pytest.raises(ValueError, match=message):
         evaluate_policy(FakeModel(), FakeEnv(), episodes, "Spielberg", seed=seed)
+
+
+def test_episode_that_ends_without_target_laps_is_not_success():
+    class CollisionEnv(FakeEnv):
+        def step(self, action):
+            observation, reward, _, _, info = super().step(action)
+            info["laps"] = 0
+            info["collisions"] = 1
+            return observation, reward, True, False, info
+
+    rows = evaluate_policy(FakeModel(), CollisionEnv(), 1, "Spielberg")
+
+    assert rows[0]["terminated"]
+    assert not rows[0]["truncated"]
+    assert not rows[0]["success"]
+    assert rows[0]["collisions"] == 1
+
+
+@pytest.mark.parametrize(
+    ("episodes", "seed", "target_laps", "message"),
+    [
+        (0, 0, 1, "episodes"),
+        (True, 0, 1, "episodes"),
+        (1, -1, 1, "seed"),
+        (1, True, 1, "seed"),
+        (1, 0, 0, "target_laps"),
+        (1, 0, True, "target_laps"),
+    ],
+)
+def test_evaluation_rejects_invalid_counts(episodes, seed, target_laps, message):
+    with pytest.raises(ValueError, match=message):
+        evaluate_policy(
+            FakeModel(),
+            FakeEnv(),
+            episodes,
+            "Spielberg",
+            seed=seed,
+            target_laps=target_laps,
+        )
