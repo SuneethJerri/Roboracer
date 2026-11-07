@@ -6,11 +6,17 @@ from pathlib import Path
 from rl.wrappers.racing_env import RacingEnv
 
 
-def evaluate_policy(model, env, episodes, track):
+def evaluate_policy(model, env, episodes, track, seed=0, algo="", model_path=""):
     """Run deterministic episodes and return their measured outcomes."""
+    if isinstance(episodes, bool) or not isinstance(episodes, int) or episodes <= 0:
+        raise ValueError("episodes must be a positive integer")
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError("seed must be a non-negative integer")
+
     records = []
     for episode in range(1, episodes + 1):
-        observation, _ = env.reset()
+        episode_seed = seed + episode - 1
+        observation, _ = env.reset(seed=episode_seed)
         total_reward = 0.0
         terminated = truncated = False
         info = {}
@@ -21,7 +27,10 @@ def evaluate_policy(model, env, episodes, track):
             total_reward += float(reward)
 
         records.append({
+            "algo": algo,
+            "model": model_path,
             "track": track,
+            "seed": episode_seed,
             "episode": episode,
             "sim_seconds": float(info.get("sim_seconds", 0.0)),
             "progress": float(info.get("progress", 0.0)),
@@ -37,8 +46,8 @@ def evaluate_policy(model, env, episodes, track):
 def write_results(path, records):
     """Write episode results using a stable, standalone P5 evaluation schema."""
     columns = (
-        "track", "episode", "sim_seconds", "progress", "laps",
-        "collisions", "reward", "terminated", "truncated",
+        "algo", "model", "track", "seed", "episode", "sim_seconds",
+        "progress", "laps", "collisions", "reward", "terminated", "truncated",
     )
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -55,12 +64,15 @@ def main(argv=None):
     parser.add_argument("--model", required=True, help="Saved SB3 model path")
     parser.add_argument("--track", default="Spielberg")
     parser.add_argument("--episodes", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=18000)
     parser.add_argument("--target-laps", type=int, default=1)
     parser.add_argument("--out", default="results/rl_evaluation.csv")
     args = parser.parse_args(argv)
     if args.episodes <= 0:
         parser.error("--episodes must be positive")
+    if args.seed < 0:
+        parser.error("--seed must be non-negative")
 
     if args.algo == "ppo":
         from stable_baselines3 import PPO as Algorithm
@@ -74,7 +86,15 @@ def main(argv=None):
         target_laps=args.target_laps,
     )
     try:
-        records = evaluate_policy(model, env, args.episodes, args.track)
+        records = evaluate_policy(
+            model,
+            env,
+            args.episodes,
+            args.track,
+            seed=args.seed,
+            algo=args.algo,
+            model_path=args.model,
+        )
     finally:
         env.close()
 
