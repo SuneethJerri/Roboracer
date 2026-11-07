@@ -7,16 +7,17 @@ from gymnasium.wrappers import RecordEpisodeStatistics
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 
-from rl.logger import Logger
+from rl.logger import Logger, training_log_row
 from rl.wrappers.racing_env import DT, RacingEnv
 
 
 class SimTimeCallback(BaseCallback):
-    def __init__(self, log_path, algo, seed, log_every=1000):
+    def __init__(self, log_path, algo, seed, track, log_every=1000):
         super().__init__(verbose=0)
         self.log = Logger(log_path)
         self.algo = algo
         self.seed = seed
+        self.track = track
         self.log_every = log_every
         self._t0 = time.time()
         self._last = 0
@@ -32,17 +33,17 @@ class SimTimeCallback(BaseCallback):
         if self.num_timesteps - self._last >= self.log_every:
             self._last = self.num_timesteps
             mean_r = float(np.mean(self._returns[-20:])) if self._returns else float("nan")
-            self.log.log({
-                "run_id": f"{self.algo}-{self.seed}-{int(self._t0)}",
-                "algo": self.algo,
-                "seed": self.seed,
-                "track": "Spielberg",
-                "timesteps": self.num_timesteps,
-                "sim_seconds": round(self.num_timesteps * DT, 3),
-                "wall_seconds": round(time.time() - self._t0, 3),
-                "episodes": self._episodes,
-                "mean_reward": round(mean_r, 3) if mean_r == mean_r else "",
-            })
+            self.log.log(training_log_row(
+                run_id=f"{self.algo}-{self.seed}-{int(self._t0)}",
+                algo=self.algo,
+                seed=self.seed,
+                track=self.track,
+                timesteps=self.num_timesteps,
+                sim_seconds=round(self.num_timesteps * DT, 3),
+                wall_seconds=round(time.time() - self._t0, 3),
+                episodes=self._episodes,
+                mean_reward=round(mean_r, 3) if mean_r == mean_r else "",
+            ))
         return True
 
 
@@ -58,7 +59,10 @@ def main():
     Path(args.out).mkdir(parents=True, exist_ok=True)
     env = RecordEpisodeStatistics(RacingEnv(track=args.track))
     model = PPO("MlpPolicy", env, verbose=1, seed=args.seed, n_steps=2048, batch_size=64)
-    model.learn(args.steps, callback=SimTimeCallback(args.log, "ppo", args.seed))
+    model.learn(
+        args.steps,
+        callback=SimTimeCallback(args.log, "ppo", args.seed, args.track),
+    )
     path = f"{args.out}/ppo_seed{args.seed}"
     model.save(path)
     print(f"saved {path}")

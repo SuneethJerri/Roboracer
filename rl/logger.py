@@ -9,6 +9,22 @@ COLUMNS = [
 ]
 
 
+def training_log_row(run_id, algo, seed, track, timesteps, sim_seconds,
+                     wall_seconds, episodes, mean_reward):
+    """Build a training log record with the run's actual experiment metadata."""
+    return {
+        "run_id": run_id,
+        "algo": algo,
+        "seed": seed,
+        "track": track,
+        "timesteps": timesteps,
+        "sim_seconds": sim_seconds,
+        "wall_seconds": wall_seconds,
+        "episodes": episodes,
+        "mean_reward": mean_reward,
+    }
+
+
 class Logger:
     def __init__(self, path):
         self.path = Path(path)
