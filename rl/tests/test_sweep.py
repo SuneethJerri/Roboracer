@@ -14,8 +14,8 @@ def test_generate_combinations_produces_cartesian_product():
     assert len(combos) == 4
     expected = [
         {"batch_size": 32, "lr": 1e-4},
-        {"batch_size": 64, "lr": 1e-4},
         {"batch_size": 32, "lr": 3e-4},
+        {"batch_size": 64, "lr": 1e-4},
         {"batch_size": 64, "lr": 3e-4},
     ]
     assert combos == expected
