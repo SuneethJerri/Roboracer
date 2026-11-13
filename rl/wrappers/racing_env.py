@@ -6,10 +6,29 @@ to (steer_rad, speed_mps) and the observation to a flat float32 vector.
 """
 import gymnasium as gym
 import numpy as np
+import yaml
 from gymnasium import spaces
+from pathlib import Path
 
 from common.interface import MAX_SPEED, MAX_STEER
 from sims.gym_env import GymEnv
+
+_DEFAULT_REWARD_CFG = {
+    "progress_scale": 100.0,
+    "collision_penalty": 50.0,
+    "steering_penalty": 0.001,
+}
+
+def _load_reward_config(path=None):
+    """Load reward weights from YAML, falling back to built-in defaults."""
+    if path is None:
+        path = Path(__file__).resolve().parents[1] / "configs" / "reward.yaml"
+    path = Path(path)
+    if path.is_file():
+        with open(path) as f:
+            cfg = yaml.safe_load(f) or {}
+        return {k: float(cfg.get(k, v)) for k, v in _DEFAULT_REWARD_CFG.items()}
+    return dict(_DEFAULT_REWARD_CFG)
 
 DT = 0.01  # f1tenth 100 Hz
 
@@ -17,7 +36,8 @@ DT = 0.01  # f1tenth 100 Hz
 class RacingEnv(gym.Env):
     metadata = {"render_modes": []}
 
-    def __init__(self, track="Spielberg", max_steps=18000, target_laps=1):
+    def __init__(self, track="Spielberg", max_steps=18000, target_laps=1,
+                 reward_config=None):
         super().__init__()
         if isinstance(max_steps, bool) or not isinstance(max_steps, (int, np.integer)) or max_steps <= 0:
             raise ValueError("max_steps must be a positive integer")
@@ -26,6 +46,7 @@ class RacingEnv(gym.Env):
         self._track = track
         self._max_steps = int(max_steps)
         self._target_laps = int(target_laps)
+        self._reward_cfg = _load_reward_config(reward_config)
         self.env = GymEnv(track=track)
 
         self._n = 0
@@ -78,11 +99,11 @@ class RacingEnv(gym.Env):
         self._prev_progress = max(self._prev_progress, progress)
 
         # Reward new progress, rather than repeatedly paying for distance already covered.
-        progress_reward = 100.0 * progress_delta
+        progress_reward = self._reward_cfg["progress_scale"] * progress_delta
         reward = progress_reward
         if collisions > 0:
-            reward -= 50.0
-        reward -= 0.001 * abs(steer) / MAX_STEER
+            reward -= self._reward_cfg["collision_penalty"]
+        reward -= self._reward_cfg["steering_penalty"] * abs(steer) / MAX_STEER
 
         terminated = (collisions > 0) or (laps >= self._target_laps)
         truncated = (not terminated) and ((not alive) or (self._n >= self._max_steps))
