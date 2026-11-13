@@ -1,0 +1,10 @@
+# Reward function weights for RacingEnv.
+# Adjust these to run ablation experiments on reward shaping.
+
+# reward = progress_scale * progress_delta
+#         - collision_penalty   (if collision)
+#         - steering_penalty * |steer| / MAX_STEER
+
+progress_scale: 100.0      # reward per unit of new track progress
+collision_penalty: 50.0     # one-time penalty on collision (terminates episode)
+steering_penalty: 0.001     # per-step cost proportional to absolute steering
