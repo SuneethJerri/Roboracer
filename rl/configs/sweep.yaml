@@ -1,0 +1,10 @@
+# Hyperparameter sweep configuration for P5 RL baselines.
+algo: ppo
+track: Spielberg
+steps_per_run: 20000
+seed: 0
+
+# Parameter grid to sweep over
+grid:
+  learning_rate: [1.0e-4, 3.0e-4, 5.0e-4]
+  batch_size: [32, 64]
