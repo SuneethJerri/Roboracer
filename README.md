@@ -100,3 +100,4 @@ These files are the backbone of the simulation and should **not** be modified by
 
 ## broken modules
 common/fetch_tracks.py breaks on Windows. repair() uses Path.symlink_to(), which raises OSError on Windows without Developer Mode / admin, so fetch_tracks reports OSError for all 22 tracks and 0/22 circuits load. On Linux it works. Fix: in repair(), replace want.symlink_to(have.name) with import shutil; shutil.copy2(have, want) — copies are cheap (small yaml) and work on all OSes. Workaround (already applied locally): copy every maps\<Track>\<Track>.yaml to maps\<Track>\<Track>_map.yaml before running any track.
+
