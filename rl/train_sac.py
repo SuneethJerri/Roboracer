@@ -60,6 +60,8 @@ def main():
     p.add_argument("--track", type=str, default="Spielberg")
     p.add_argument("--log", type=str, default="results/rl_training.csv")
     p.add_argument("--out", type=str, default="rl/checkpoints")
+    p.add_argument("--tensorboard-dir", type=str, default=None,
+                   help="Directory for TensorBoard logs (disabled if not set)")
     add_checkpoint_arguments(p)
     args = p.parse_args()
     try:
@@ -90,6 +92,7 @@ def main():
             batch_size=256,
             learning_rate=3e-4,
             gamma=0.99,
+            tensorboard_log=args.tensorboard_dir,
         )
     model.learn(
         args.steps,
