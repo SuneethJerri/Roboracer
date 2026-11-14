@@ -48,12 +48,16 @@ class Centreline:
             raise ValueError("sample_count must be at least 3")
 
         degree = min(3, len(source) - 1)
-        spline, _ = splprep(
-            source.T,
+        # With per=True SciPy treats the LAST input point as the closing copy of
+        # the first. Close the loop explicitly so every recorded sample is fitted.
+        closed_source = np.vstack((source, source[:1]))
+        spline, source_u = splprep(
+            closed_source.T,
             s=float(smoothing),
             per=True,
             k=degree,
         )
+        source_u = source_u[:-1]
 
         dense_count = max(sample_count * 8, 1024)
         dense_u = np.linspace(0.0, 1.0, dense_count, endpoint=False)
@@ -89,6 +93,14 @@ class Centreline:
         ))
         self.curvature = np.interp(self.s, closed_s, closed_curvature)
         self.sample_count = sample_count
+
+        # Arc length of every (deduplicated) input sample, from the spline
+        # parameter the fit assigned to it. The parameter follows recording order,
+        # so replaying the recorded lap gives strictly increasing arc length by
+        # construction -- unlike projecting the noisy points back onto the curve.
+        closed_u = np.append(dense_u, 1.0)
+        self.source_points = source
+        self.source_arc_length = np.interp(source_u, closed_u, closed_s)
 
         # Unit tangent (direction of travel) and heading angle per sample.
         closed_dx = np.append(dx, dx[0])

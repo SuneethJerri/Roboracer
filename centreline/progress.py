@@ -122,3 +122,33 @@ class ProgressTracker:
         self.progress += advanced
         return TrackedProjection(projection, self.arc_length, advanced, held,
                                  self.progress)
+
+
+@dataclass(frozen=True)
+class ReplayResult:
+    """Progress reported for every sample of a replayed trajectory."""
+
+    arc_length: np.ndarray    # tracked arc length per sample, in [0, total_length)
+    progress: np.ndarray      # cumulative progress per sample, never decreasing
+    held: np.ndarray          # bool: raw projection was behind and was held
+    relocalised: np.ndarray   # bool: tracker lost the car and searched globally
+
+    @property
+    def backwards_steps(self):
+        return int(np.sum(np.diff(self.progress) < 0.0))
+
+    @property
+    def strictly_increasing(self):
+        return bool(np.all(np.diff(self.progress) > 0.0))
+
+
+def replay(centreline, points, **tracker_kwargs) -> ReplayResult:
+    """Run an ordered (N, 2) trajectory through a fresh :class:`ProgressTracker`."""
+    tracker = ProgressTracker(centreline, **tracker_kwargs)
+    results = [tracker.update(x, y) for x, y in np.asarray(points, dtype=float)]
+    return ReplayResult(
+        arc_length=np.array([r.arc_length for r in results]),
+        progress=np.array([r.progress for r in results]),
+        held=np.array([r.held for r in results]),
+        relocalised=np.array([r.relocalised for r in results]),
+    )
