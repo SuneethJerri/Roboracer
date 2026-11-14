@@ -105,3 +105,22 @@ def test_heading_at_wraps_and_matches_samples():
     assert path.heading_at(path.total_length + 0.0) == pytest.approx(
         path.heading_at(0.0), abs=1e-6)
     assert path.heading_at(0.0) == pytest.approx(np.pi / 2, abs=1e-2)
+
+
+def test_lateral_offset_is_positive_left_of_travel():
+    # CCW circle: the inside (centre side) is to the LEFT of travel.
+    path = Centreline(circle_points(radius=3.0), sample_count=400)
+
+    inside = path.project(2.5, 0.0)
+    outside = path.project(3.5, 0.0)
+
+    assert inside.lateral_offset == pytest.approx(0.5, abs=0.01)
+    assert outside.lateral_offset == pytest.approx(-0.5, abs=0.01)
+    assert abs(inside.lateral_offset) == pytest.approx(inside.distance)
+
+
+def test_projection_keeps_positional_fields_backwards_compatible():
+    path = Centreline(circle_points(), sample_count=100)
+    point, distance, arc_length, index, *_ = vars(path.project(3.0, 0.0)).values()
+    assert np.allclose(point, [3.0, 0.0], atol=0.01)
+    assert isinstance(index, int)

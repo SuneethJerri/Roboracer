@@ -17,6 +17,10 @@ class Projection:
     distance: float
     arc_length: float
     segment_index: int
+    # Signed distance from the path: positive to the LEFT of the direction of
+    # travel, negative to the right. ``distance == abs(lateral_offset)`` except
+    # at a segment's end where the closest point is a vertex.
+    lateral_offset: float = 0.0
 
 
 class Centreline:
@@ -177,10 +181,18 @@ class Centreline:
         candidates = starts + fractions[:, None] * vectors
         distances = np.linalg.norm(candidates - query, axis=1)
         index = int(np.argmin(distances))
-        arc_length = self.s[index] + fractions[index] * lengths[index]
+        return self._projection(query, index, fractions[index],
+                                candidates[index], distances[index], vectors[index],
+                                lengths[index])
+
+    def _projection(self, query, index, fraction, candidate, distance, vector, length):
+        arc_length = self.s[index] + fraction * length
+        offset = query - candidate
+        side = np.sign(vector[0] * offset[1] - vector[1] * offset[0])
         return Projection(
-            point=candidates[index].copy(),
-            distance=float(distances[index]),
+            point=np.asarray(candidate, dtype=float).copy(),
+            distance=float(distance),
             arc_length=float(arc_length % self.total_length),
-            segment_index=index,
+            segment_index=int(index),
+            lateral_offset=float(side * distance),
         )
