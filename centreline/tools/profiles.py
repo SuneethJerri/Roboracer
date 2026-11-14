@@ -4,8 +4,10 @@
     python -m centreline.tools.profiles --centreline \
         results/p3_centreline/Spielberg_centreline.csv --track Spielberg
 
-Writes <track>_profile.csv (s, x, y, curvature, reference_curvature) and a PNG.
-The reference is the circuit's own shipped centreline, used only for checking.
+Writes <track>_profile.csv (s, x, y, curvature, and with --track also
+reference_curvature, width_left, width_right, width) and a PNG. The reference is
+the circuit's own shipped centreline, used only for checking; width is measured
+on the circuit's occupancy map.
 """
 from __future__ import annotations
 
@@ -30,11 +32,15 @@ def centreline_from_csv(path):
     return Centreline(points, sample_count=len(points), smoothing=0.0)
 
 
-def build_profile(path, reference=None):
+def build_profile(path, reference=None, width=None):
     profile = {"s": path.s, "x": path.points[:, 0], "y": path.points[:, 1],
                "curvature": path.curvature}
     if reference is not None:
         profile["reference_curvature"] = reference_curvature_along(path, reference)
+    if width is not None:
+        profile["width_left"] = width.left
+        profile["width_right"] = width.right
+        profile["width"] = width.total
     return profile
 
 
@@ -54,7 +60,10 @@ def plot_profile(profile, corners, out, title):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(13, 4.5))
+    has_width = "width" in profile
+    fig, axes = plt.subplots(2 if has_width else 1, 1, sharex=True,
+                             figsize=(13, 7.5 if has_width else 4.5), squeeze=False)
+    ax = axes[0, 0]
     if "reference_curvature" in profile:
         ax.plot(profile["s"], profile["reference_curvature"], color="0.65", lw=1,
                 label="circuit's shipped centreline")
@@ -67,7 +76,18 @@ def plot_profile(profile, corners, out, title):
                     xytext=(0, 6 if c.peak_curvature > 0 else -12),
                     textcoords="offset points")
     ax.axhline(0, color="k", lw=0.5)
-    ax.set_xlabel("arc length s [m]")
+    if has_width:
+        aw = axes[1, 0]
+        aw.fill_between(profile["s"], -profile["width_right"], profile["width_left"],
+                        color="C2", alpha=0.25, label="track (left +, right -)")
+        aw.plot(profile["s"], profile["width"], color="C2", lw=1.2, label="total width")
+        aw.axhline(0, color="C0", lw=1, label="centreline")
+        aw.set_ylabel("distance to wall [m]")
+        aw.legend(loc="upper right", fontsize=8)
+        aw.grid(alpha=0.3)
+        aw.set_xlabel("arc length s [m]")
+    else:
+        ax.set_xlabel("arc length s [m]")
     ax.set_ylabel("curvature [1/m]  (+ left, - right)")
     ax.set_title(title)
     ax.legend(loc="upper right", fontsize=8)
@@ -88,12 +108,14 @@ def main(argv=None):
     o = p.parse_args(argv)
 
     path = centreline_from_csv(o.centreline)
-    reference = None
+    reference = width = None
     if o.track:
-        from centreline.track_files import reference_centreline
+        from centreline.track_files import occupancy_map, reference_centreline
+        from centreline.width import measure_width
         pts, _, _ = reference_centreline(o.track)
         reference = Centreline(pts, sample_count=3000)
-    profile = build_profile(path, reference)
+        width = measure_width(path, occupancy_map(o.track))
+    profile = build_profile(path, reference, width)
     corners = find_corners(path, threshold=o.threshold)
 
     src = pathlib.Path(o.centreline)
@@ -109,6 +131,11 @@ def main(argv=None):
     if reference is not None:
         err = profile["curvature"] - profile["reference_curvature"]
         print(f"curvature rms error vs circuit centreline: {np.sqrt(np.mean(err**2)):.3f} 1/m")
+    if width is not None:
+        print(f"width: min {width.total.min():.2f}  median {np.median(width.total):.2f}  "
+              f"max {width.total.max():.2f} m; centreline off-centre (median) "
+              f"{np.median(np.abs(width.left - width.right)) / 2:.3f} m; "
+              f"samples on a wall: {int(width.on_wall.sum())}")
     print(f"-> {out}\n-> {png}")
     return 0
 

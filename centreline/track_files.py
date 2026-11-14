@@ -26,3 +26,13 @@ def reference_centreline(track):
     data = np.loadtxt(track_dir(track) / f"{track}_centerline.csv", delimiter=",",
                       comments="#")
     return data[:, :2], data[:, 2], data[:, 3]
+
+
+def occupancy_map(track):
+    """The circuit's occupancy map (see :class:`centreline.width.OccupancyMap`)."""
+    from .width import OccupancyMap
+    folder = track_dir(track)
+    for name in (f"{track}_map.yaml", f"{track}.yaml"):
+        if (folder / name).exists():
+            return OccupancyMap.from_yaml(folder / name)
+    raise FileNotFoundError(f"no map yaml for {track} in {folder}")
