@@ -17,6 +17,10 @@ class Projection:
     distance: float
     arc_length: float
     segment_index: int
+    # Signed distance from the path: positive to the LEFT of the direction of
+    # travel, negative to the right. ``distance == abs(lateral_offset)`` except
+    # at a segment's end where the closest point is a vertex.
+    lateral_offset: float = 0.0
 
 
 class Centreline:
@@ -44,12 +48,16 @@ class Centreline:
             raise ValueError("sample_count must be at least 3")
 
         degree = min(3, len(source) - 1)
-        spline, _ = splprep(
-            source.T,
+        # With per=True SciPy treats the LAST input point as the closing copy of
+        # the first. Close the loop explicitly so every recorded sample is fitted.
+        closed_source = np.vstack((source, source[:1]))
+        spline, source_u = splprep(
+            closed_source.T,
             s=float(smoothing),
             per=True,
             k=degree,
         )
+        source_u = source_u[:-1]
 
         dense_count = max(sample_count * 8, 1024)
         dense_u = np.linspace(0.0, 1.0, dense_count, endpoint=False)
@@ -85,6 +93,24 @@ class Centreline:
         ))
         self.curvature = np.interp(self.s, closed_s, closed_curvature)
         self.sample_count = sample_count
+
+        # Arc length of every (deduplicated) input sample, from the spline
+        # parameter the fit assigned to it. The parameter follows recording order,
+        # so replaying the recorded lap gives strictly increasing arc length by
+        # construction -- unlike projecting the noisy points back onto the curve.
+        closed_u = np.append(dense_u, 1.0)
+        self.source_points = source
+        self.source_arc_length = np.interp(source_u, closed_u, closed_s)
+
+        # Unit tangent (direction of travel) and heading angle per sample.
+        closed_dx = np.append(dx, dx[0])
+        closed_dy = np.append(dy, dy[0])
+        tangent = np.column_stack((
+            np.interp(self.s, closed_s, closed_dx),
+            np.interp(self.s, closed_s, closed_dy),
+        ))
+        self.tangent = tangent / np.linalg.norm(tangent, axis=1, keepdims=True)
+        self.heading = np.arctan2(self.tangent[:, 1], self.tangent[:, 0])
 
     def save_csv(self, path):
         """Save points and signed curvature in Pure Pursuit's CSV format."""
@@ -139,26 +165,63 @@ class Centreline:
             self.points[next_index] - self.points[index]
         )
 
+    def heading_at(self, arc_length):
+        """Heading (rad, world frame) of the direction of travel at an arc length."""
+        distance = float(arc_length)
+        if not np.isfinite(distance):
+            raise ValueError("arc_length must be finite")
+        distance %= self.total_length
+        closed_s = np.append(self.s, self.total_length)
+        closed_t = np.vstack((self.tangent, self.tangent[0]))
+        tx = np.interp(distance, closed_s, closed_t[:, 0])
+        ty = np.interp(distance, closed_s, closed_t[:, 1])
+        return float(np.arctan2(ty, tx))
+
     def project(self, x, y):
-        """Project a world-frame point onto the closest sampled path segment."""
+        """Project a world-frame point onto the closest sampled path segment.
+
+        This is a GLOBAL nearest-point search with no memory. Where the track
+        doubles back near itself it can snap to the wrong side; use
+        :class:`centreline.ProgressTracker` to follow a moving vehicle.
+        """
+        query, segments = self._segments(x, y)
+        index = int(np.argmin(segments["distances"]))
+        return self._projection_from(query, segments, index)
+
+    def _segments(self, x, y):
+        """Closest point on every sampled segment to (x, y), vectorised."""
         query = np.asarray([x, y], dtype=float)
         if not np.all(np.isfinite(query)):
             raise ValueError("query coordinates must be finite")
-
         starts = self.points
-        ends = np.roll(self.points, -1, axis=0)
-        vectors = ends - starts
+        vectors = np.roll(self.points, -1, axis=0) - starts
         lengths = np.linalg.norm(vectors, axis=1)
-        offsets = query - starts
-        fractions = np.einsum("ij,ij->i", offsets, vectors) / (lengths ** 2)
+        fractions = np.einsum("ij,ij->i", query - starts, vectors) / (lengths ** 2)
         fractions = np.clip(fractions, 0.0, 1.0)
         candidates = starts + fractions[:, None] * vectors
-        distances = np.linalg.norm(candidates - query, axis=1)
-        index = int(np.argmin(distances))
-        arc_length = self.s[index] + fractions[index] * lengths[index]
+        return query, {
+            "vectors": vectors,
+            "lengths": lengths,
+            "fractions": fractions,
+            "candidates": candidates,
+            "distances": np.linalg.norm(candidates - query, axis=1),
+            "arc_lengths": (self.s + fractions * lengths) % self.total_length,
+        }
+
+    def _projection_from(self, query, segments, index):
+        return self._projection(
+            query, index, segments["fractions"][index],
+            segments["candidates"][index], segments["distances"][index],
+            segments["vectors"][index], segments["lengths"][index])
+
+    def _projection(self, query, index, fraction, candidate, distance, vector, length):
+        arc_length = self.s[index] + fraction * length
+        offset = query - candidate
+        side = np.sign(vector[0] * offset[1] - vector[1] * offset[0])
         return Projection(
-            point=candidates[index].copy(),
-            distance=float(distances[index]),
+            point=np.asarray(candidate, dtype=float).copy(),
+            distance=float(distance),
             arc_length=float(arc_length % self.total_length),
-            segment_index=index,
+            segment_index=int(index),
+            lateral_offset=float(side * distance),
         )

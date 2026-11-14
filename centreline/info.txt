@@ -1,22 +1,65 @@
-P3 centreline implementation
+P3 centreline -- what P1 and P5 consume
+=======================================
 
-centreline.Centreline accepts ordered world-frame lap samples as an Nx2 array.
-It fits a periodic spline, resamples the closed path at approximately uniform
-arc-length intervals, and provides signed curvature for each output point.
+Deliverable file (load this, do not refit):
+    results/p3_centreline/Spielberg_centreline.csv
+    columns: x, y, curvature, s, heading      (0.2 m spacing, 342.7 m lap)
+    Pure Pursuit loads it unchanged:  path_csv: results/p3_centreline/Spielberg_centreline.csv
 
-Example:
-    from centreline import Centreline
+Python API
+----------
+    from centreline import Centreline, ProgressTracker, replay
 
-    path = Centreline(odometry_xy, sample_count=500, smoothing=0.5)
-    points = path.points
-    curvature = path.curvature
-    next_point = path.point_at(path.s[10] + 1.0)
-    projection = path.project(vehicle_x, vehicle_y)
-    path.save_csv("centreline.csv")
+    path = Centreline(odometry_xy, sample_count=500, smoothing=0.5)   # as before
+    path.points, path.s, path.curvature          # (N,2), (N,), (N,)   unchanged
+    path.tangent, path.heading                   # unit tangent, rad    new
+    path.point_at(s), path.heading_at(s)         # wrap-around lookups
+    path.project(x, y)                           # GLOBAL nearest point -> Projection
+        .point .distance .arc_length .segment_index      (unchanged)
+        .lateral_offset                          # signed, + left of travel   new
+    path.source_arc_length                       # arc length of every input sample,
+                                                 # strictly increasing by construction
+    path.save_csv("out.csv")                     # x, y, curvature (unchanged)
 
-The exported CSV uses named x, y, and curvature columns and can be loaded by
-PurePursuit's path_csv option or load_path_csv() method.
-The first input point may be repeated at the end. Consecutive duplicates are
-removed; invalid coordinates, fewer than three distinct points, and invalid
-options raise ValueError. Smoothing is SciPy's non-negative spline residual
-factor; use 0 for an interpolating spline.
+    Fitting a recorded lap (chooses smoothing for you):
+    from centreline.fitting import fit_lap
+    path = fit_lap(odometry_xy)                  # s = 2N(sigma^2 + 0.05^2), sigma estimated
+
+USE ProgressTracker FOR A MOVING CAR, NOT project()
+---------------------------------------------------
+project() has no memory. Where the track runs close to itself it can snap to the
+other side, and arc length jumps backwards by half a lap without any error.
+
+    tracker = ProgressTracker(path)              # or start_arc_length=pose_s
+    r = tracker.update(x, y)                     # call once per control step
+    r.arc_length        position on the lap, [0, total_length)
+    r.progress          cumulative metres since reset -- NEVER decreases
+    r.projection.lateral_offset                  signed offset from the centreline
+    tracker.laps, tracker.lap_fraction           laps from cumulative progress
+    tracker.reset()                              on an episode reset
+
+    window_ahead (2.0 m) must exceed the distance travelled between updates
+    (5 m/s at 20 Hz = 0.25 m). A jump of more than lost_distance (2.0 m) off the
+    window, e.g. a teleport, re-localises globally and credits NO progress.
+
+    P5 reward example:   reward = tracker.update(x, y).advanced
+
+Other modules
+-------------
+    centreline.profiles     find_corners(path) -> apex, radius, direction
+    centreline.width        OccupancyMap, measure_width(path, map) -> left/right
+    centreline.start_poses  generate_start_poses, load_start_poses
+    centreline.synthetic    noisy ellipse / hairpin laps for tests
+    centreline.robustness   scoring used by the sweep
+
+Reproduce everything (about 6 minutes; the sweep is most of it)
+--------------------------------------------------------------
+    python -m centreline.tools.record_lap        --track Spielberg
+    python -m centreline.tools.fit_centreline    --raw results/p3_centreline/Spielberg_raw_lap.csv
+    python -m centreline.tools.plot_fit          --raw results/p3_centreline/Spielberg_raw_lap.csv
+    python -m centreline.tools.profiles          --centreline results/p3_centreline/Spielberg_centreline.csv --track Spielberg
+    python -m centreline.tools.start_poses       --centreline results/p3_centreline/Spielberg_centreline.csv --track Spielberg
+    python -m centreline.tools.verify_start_poses --centreline results/p3_centreline/Spielberg_centreline.csv --poses results/p3_centreline/Spielberg_start_poses.csv
+    python -m centreline.tools.robustness_sweep  --centreline results/p3_centreline/Spielberg_centreline.csv --poses results/p3_centreline/Spielberg_start_poses.csv
+
+Results and assumptions: report/p3_centreline/report.md
