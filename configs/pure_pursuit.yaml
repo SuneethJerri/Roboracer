@@ -12,10 +12,15 @@ wheelbase: 0.33                    # [m] provisional; confirm the vehicle parame
 
 # Optional centreline CSV. Leave null until P3's output format is agreed.
 # Expected named columns: x,y; optional signed curvature column.
-path_csv: null
+path_csv: results/p3_centreline/Spielberg_centreline.csv
 
 # Fixed safeguards; not part of the four-gain sweep.
 lookahead_min: 0.5                 # [m]
 lookahead_max: 3.0                 # [m]
 curvature_preview_distance: 4.0    # [m] look ahead for upcoming curvature
 nearest_search_window: 100         # [path points] forward projection search
+
+# P3 monotonic projection safeguards (fixed implementation settings).
+projection_window_ahead: 2.0       # [m] must exceed distance per control update
+projection_window_behind: 0.5      # [m] tolerate small along-track noise
+projection_lost_distance: 2.0      # [m] trigger global re-localisation after a reset
