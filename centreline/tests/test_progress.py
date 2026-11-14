@@ -54,3 +54,55 @@ def test_first_update_uses_global_projection():
 def test_rejects_bad_windows(kwargs):
     with pytest.raises(ValueError):
         ProgressTracker(hairpin_path(), **kwargs)
+
+
+def circle_path(radius=3.0):
+    angles = np.linspace(0.0, 2.0 * np.pi, 120, endpoint=False)
+    return Centreline(np.column_stack((radius * np.cos(angles),
+                                       radius * np.sin(angles))), sample_count=600)
+
+
+def test_progress_unwraps_across_start_finish_line():
+    path = circle_path()
+    tracker = ProgressTracker(path)
+    angles = np.linspace(0.0, 2.5 * 2.0 * np.pi, 1000)     # two and a half laps
+    results = [tracker.update(3.0 * np.cos(a), 3.0 * np.sin(a)) for a in angles]
+
+    progress = np.array([r.progress for r in results])
+    assert np.all(np.diff(progress) >= 0.0)
+    assert tracker.laps == 2
+    assert tracker.lap_fraction == pytest.approx(2.5, abs=0.01)
+    # Arc length itself wraps back to ~0 at the line; progress does not.
+    assert np.any(np.diff([r.arc_length for r in results]) < -path.total_length / 2)
+
+
+def test_teleport_relocalises_without_crediting_progress():
+    path = circle_path()
+    tracker = ProgressTracker(path, lost_distance=1.0)
+    tracker.update(3.0, 0.0)
+    tracker.update(3.0 * np.cos(0.1), 3.0 * np.sin(0.1))
+    before = tracker.progress
+
+    jump = tracker.update(-3.0, 0.0)            # moved to the far side: out of window
+    assert jump.relocalised
+    assert jump.advanced == 0.0
+    assert tracker.progress == pytest.approx(before)
+    assert tracker.arc_length == pytest.approx(path.project(-3.0, 0.0).arc_length)
+
+
+def test_far_off_track_query_relocalises():
+    path = circle_path()
+    tracker = ProgressTracker(path, lost_distance=1.0)
+    tracker.update(3.0, 0.0)
+    result = tracker.update(0.0, 10.0)          # 7 m from the path
+    assert result.relocalised
+    assert result.advanced == 0.0
+
+
+def test_reset_clears_progress():
+    tracker = ProgressTracker(circle_path())
+    for a in np.linspace(0.0, 1.0, 20):
+        tracker.update(3.0 * np.cos(a), 3.0 * np.sin(a))
+    assert tracker.progress > 0.0
+    tracker.reset()
+    assert tracker.progress == 0.0 and tracker.arc_length is None

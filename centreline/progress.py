@@ -29,6 +29,8 @@ class TrackedProjection:
     arc_length: float        # reported position along the lap, in [0, total_length)
     advanced: float          # how far progress moved this update, >= 0
     held: bool               # True when the raw projection was behind and was held
+    progress: float = 0.0    # cumulative distance since reset, never decreases
+    relocalised: bool = False  # True when the window lost the car (global re-search)
 
 
 class ProgressTracker:
@@ -42,10 +44,13 @@ class ProgressTracker:
             and still be considered (then held). Small: it only absorbs noise.
         start_arc_length: initial arc length; ``None`` takes a global projection
             of the first query point.
+        lost_distance: if the nearest in-window point is further than this (m),
+            the vehicle is assumed to have been moved (a reset, a teleport): the
+            tracker re-localises globally and credits NO progress for the jump.
     """
 
     def __init__(self, centreline: Centreline, window_ahead=2.0, window_behind=0.5,
-                 start_arc_length=None):
+                 start_arc_length=None, lost_distance=2.0):
         if not isinstance(centreline, Centreline):
             raise TypeError("centreline must be a Centreline")
         if not (np.isfinite(window_ahead) and window_ahead > 0):
@@ -54,18 +59,32 @@ class ProgressTracker:
             raise ValueError("window_behind must be non-negative")
         if window_ahead + window_behind >= centreline.total_length / 2:
             raise ValueError("window must cover less than half the lap")
+        if not (np.isfinite(lost_distance) and lost_distance > 0):
+            raise ValueError("lost_distance must be positive")
         self.centreline = centreline
+        self.lost_distance = float(lost_distance)
         self.window_ahead = float(window_ahead)
         self.window_behind = float(window_behind)
         self._start = start_arc_length
         self.reset(start_arc_length)
 
     def reset(self, start_arc_length=None):
-        """Forget history; the next update re-initialises."""
+        """Forget history and cumulative progress; the next update re-initialises."""
+        self.progress = 0.0
         if start_arc_length is None:
             self.arc_length = None
         else:
             self.arc_length = float(start_arc_length) % self.centreline.total_length
+
+    @property
+    def laps(self):
+        """Whole laps completed since reset (from cumulative progress)."""
+        return int(self.progress // self.centreline.total_length)
+
+    @property
+    def lap_fraction(self):
+        """Cumulative progress in laps, e.g. 1.25 = one lap and a quarter."""
+        return self.progress / self.centreline.total_length
 
     def _wrapped_delta(self, s):
         """Signed distance from the last arc length to ``s``, in [-L/2, L/2)."""
@@ -81,16 +100,25 @@ class ProgressTracker:
             index = int(np.argmin(segments["distances"]))
             projection = path._projection_from(query, segments, index)
             self.arc_length = projection.arc_length
-            return TrackedProjection(projection, self.arc_length, 0.0, False)
+            return TrackedProjection(projection, self.arc_length, 0.0, False,
+                                     self.progress)
 
         delta = self._wrapped_delta(segments["arc_lengths"])
         in_window = (delta >= -self.window_behind) & (delta <= self.window_ahead)
         distances = np.where(in_window, segments["distances"], np.inf)
         index = int(np.argmin(distances))
+        if not distances[index] <= self.lost_distance:
+            index = int(np.argmin(segments["distances"]))
+            projection = path._projection_from(query, segments, index)
+            self.arc_length = projection.arc_length
+            return TrackedProjection(projection, self.arc_length, 0.0, False,
+                                     self.progress, relocalised=True)
         projection = path._projection_from(query, segments, index)
 
         step = float(delta[index])
         held = step < 0.0
         advanced = max(step, 0.0)
         self.arc_length = (self.arc_length + advanced) % path.total_length
-        return TrackedProjection(projection, self.arc_length, advanced, held)
+        self.progress += advanced
+        return TrackedProjection(projection, self.arc_length, advanced, held,
+                                 self.progress)
