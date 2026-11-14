@@ -21,7 +21,8 @@ import numpy as np
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from centreline.fitting import estimate_noise_sigma, fit_lap      # noqa: E402
+from centreline.fitting import (DEFAULT_TOLERANCE, estimate_noise_sigma,  # noqa: E402
+                                fit_lap)
 from centreline.tools.record_lap import load                       # noqa: E402
 
 COLUMNS = ("x", "y", "curvature", "s", "heading")
@@ -54,8 +55,10 @@ def main(argv=None):
     p.add_argument("--out", default=None)
     p.add_argument("--sigma", type=float, default=None,
                    help="odometry noise, m (default: estimated from the data)")
-    p.add_argument("--factor", type=float, default=0.5,
-                   help="smoothing = factor * 2 N sigma^2")
+    p.add_argument("--tolerance", type=float, default=DEFAULT_TOLERANCE,
+                   help="allowed deviation from the driven path beyond noise, m")
+    p.add_argument("--factor", type=float, default=1.0,
+                   help="smoothing = factor * 2 N (sigma^2 + tolerance^2)")
     p.add_argument("--spacing", type=float, default=0.2,
                    help="output sample spacing, m")
     o = p.parse_args(argv)
@@ -63,9 +66,9 @@ def main(argv=None):
     data = load(o.raw)
     points = np.column_stack((data["x"], data["y"]))
     sigma = o.sigma if o.sigma is not None else estimate_noise_sigma(points)
-    rough = fit_lap(points, sigma, o.factor)
+    rough = fit_lap(points, sigma, o.factor, o.tolerance)
     count = max(200, int(round(rough.total_length / o.spacing)))
-    path = fit_lap(points, sigma, o.factor, sample_count=count)
+    path = fit_lap(points, sigma, o.factor, o.tolerance, sample_count=count)
 
     raw = pathlib.Path(o.raw)
     out = o.out or raw.with_name(raw.name.replace("_raw_lap", "_centreline"))

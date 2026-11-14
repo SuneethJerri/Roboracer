@@ -1,21 +1,28 @@
 """Choose a smoothing factor for a recorded lap and fit it.
 
 SciPy's periodic spline takes ``s``, an upper bound on the summed squared
-residual over x and y. For white odometry noise of standard deviation sigma the
-expected residual is about ``2 N sigma^2``. On the Spielberg recording, half of
-that (``N sigma^2``, the default ``factor=0.5``) gave the lowest position error
-against the true pose and removed curvature spikes; the full value over-smoothed
-corners. sigma is usually unknown, so it is estimated from the data.
+residual over x and y. Two things separate the recorded points from the track
+centreline the rest of the team wants:
 
-The default assumes the recording regime: sample spacing well above sigma
-(Spielberg: 0.14 m vs 0.02 m). For dense samples whose spacing is below sigma,
-use ``factor=1``.
+* odometry noise, white, standard deviation sigma (estimated from the data);
+* the driver's own weave -- Follow-the-Gap zig-zags a few centimetres either
+  side of its line. This is real motion, not noise, so a noise-only smoothing
+  factor keeps it and the curvature profile shows phantom corners.
+
+So ``s = factor * 2 N (sigma^2 + tolerance^2)``: the curve may leave each point
+by about the noise plus ``tolerance`` metres of weave. Scored against the
+simulator's own Spielberg centreline, tolerance = 0.05 m sat at the optimum for
+both 0.02 m and 0.05 m odometry noise, cutting curvature error from ~0.6 to
+~0.05 1/m while staying within a few centimetres of the track centre.
+``tolerance=0`` gives the pure white-noise rule.
 """
 from __future__ import annotations
 
 import numpy as np
 
 from .centreline import Centreline
+
+DEFAULT_TOLERANCE = 0.05
 
 
 def estimate_noise_sigma(points):
@@ -32,17 +39,19 @@ def estimate_noise_sigma(points):
     return float(np.sqrt(np.median(squared) / np.log(2.0) / 12.0))
 
 
-def smoothing_for(points, sigma=None, factor=0.5):
-    """SciPy smoothing factor ``factor * 2 N sigma^2`` for these points."""
+def smoothing_for(points, sigma=None, factor=1.0, tolerance=DEFAULT_TOLERANCE):
+    """SciPy smoothing factor ``factor * 2 N (sigma^2 + tolerance^2)``."""
     if sigma is None:
         sigma = estimate_noise_sigma(points)
-    if not (np.isfinite(sigma) and sigma >= 0) or not (np.isfinite(factor) and factor >= 0):
-        raise ValueError("sigma and factor must be finite and non-negative")
-    return float(factor * 2.0 * len(points) * sigma ** 2)
+    for name, value in (("sigma", sigma), ("factor", factor), ("tolerance", tolerance)):
+        if not (np.isfinite(value) and value >= 0):
+            raise ValueError(f"{name} must be finite and non-negative")
+    return float(factor * 2.0 * len(points) * (sigma ** 2 + tolerance ** 2))
 
 
-def fit_lap(points, sigma=None, factor=0.5, sample_count=None):
+def fit_lap(points, sigma=None, factor=1.0, tolerance=DEFAULT_TOLERANCE,
+            sample_count=None):
     """Fit a recorded lap with a data-driven smoothing factor."""
     points = np.asarray(points, dtype=float)
     return Centreline(points, sample_count=sample_count,
-                      smoothing=smoothing_for(points, sigma, factor))
+                      smoothing=smoothing_for(points, sigma, factor, tolerance))
