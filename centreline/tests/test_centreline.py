@@ -85,3 +85,23 @@ def test_rejects_invalid_sample_count_and_smoothing():
         Centreline(points, sample_count=2)
     with pytest.raises(ValueError, match="smoothing"):
         Centreline(points, smoothing=-1.0)
+
+
+def test_tangent_is_unit_and_heading_follows_counter_clockwise_circle():
+    path = Centreline(circle_points(), sample_count=200)
+
+    assert path.tangent.shape == (200, 2)
+    assert np.allclose(np.linalg.norm(path.tangent, axis=1), 1.0)
+    # On a CCW circle the tangent is perpendicular to the radius, rotated +90 deg.
+    radial = path.points / np.linalg.norm(path.points, axis=1, keepdims=True)
+    expected = np.column_stack((-radial[:, 1], radial[:, 0]))
+    assert np.allclose(path.tangent, expected, atol=1e-2)
+
+
+def test_heading_at_wraps_and_matches_samples():
+    path = Centreline(circle_points(), sample_count=200)
+
+    assert path.heading_at(0.0) == pytest.approx(path.heading[0], abs=1e-6)
+    assert path.heading_at(path.total_length + 0.0) == pytest.approx(
+        path.heading_at(0.0), abs=1e-6)
+    assert path.heading_at(0.0) == pytest.approx(np.pi / 2, abs=1e-2)

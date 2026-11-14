@@ -86,6 +86,16 @@ class Centreline:
         self.curvature = np.interp(self.s, closed_s, closed_curvature)
         self.sample_count = sample_count
 
+        # Unit tangent (direction of travel) and heading angle per sample.
+        closed_dx = np.append(dx, dx[0])
+        closed_dy = np.append(dy, dy[0])
+        tangent = np.column_stack((
+            np.interp(self.s, closed_s, closed_dx),
+            np.interp(self.s, closed_s, closed_dy),
+        ))
+        self.tangent = tangent / np.linalg.norm(tangent, axis=1, keepdims=True)
+        self.heading = np.arctan2(self.tangent[:, 1], self.tangent[:, 0])
+
     def save_csv(self, path):
         """Save points and signed curvature in Pure Pursuit's CSV format."""
         output_path = Path(path)
@@ -138,6 +148,18 @@ class Centreline:
         return self.points[index] + fraction * (
             self.points[next_index] - self.points[index]
         )
+
+    def heading_at(self, arc_length):
+        """Heading (rad, world frame) of the direction of travel at an arc length."""
+        distance = float(arc_length)
+        if not np.isfinite(distance):
+            raise ValueError("arc_length must be finite")
+        distance %= self.total_length
+        closed_s = np.append(self.s, self.total_length)
+        closed_t = np.vstack((self.tangent, self.tangent[0]))
+        tx = np.interp(distance, closed_s, closed_t[:, 0])
+        ty = np.interp(distance, closed_s, closed_t[:, 1])
+        return float(np.arctan2(ty, tx))
 
     def project(self, x, y):
         """Project a world-frame point onto the closest sampled path segment."""
