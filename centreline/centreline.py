@@ -166,24 +166,41 @@ class Centreline:
         return float(np.arctan2(ty, tx))
 
     def project(self, x, y):
-        """Project a world-frame point onto the closest sampled path segment."""
+        """Project a world-frame point onto the closest sampled path segment.
+
+        This is a GLOBAL nearest-point search with no memory. Where the track
+        doubles back near itself it can snap to the wrong side; use
+        :class:`centreline.ProgressTracker` to follow a moving vehicle.
+        """
+        query, segments = self._segments(x, y)
+        index = int(np.argmin(segments["distances"]))
+        return self._projection_from(query, segments, index)
+
+    def _segments(self, x, y):
+        """Closest point on every sampled segment to (x, y), vectorised."""
         query = np.asarray([x, y], dtype=float)
         if not np.all(np.isfinite(query)):
             raise ValueError("query coordinates must be finite")
-
         starts = self.points
-        ends = np.roll(self.points, -1, axis=0)
-        vectors = ends - starts
+        vectors = np.roll(self.points, -1, axis=0) - starts
         lengths = np.linalg.norm(vectors, axis=1)
-        offsets = query - starts
-        fractions = np.einsum("ij,ij->i", offsets, vectors) / (lengths ** 2)
+        fractions = np.einsum("ij,ij->i", query - starts, vectors) / (lengths ** 2)
         fractions = np.clip(fractions, 0.0, 1.0)
         candidates = starts + fractions[:, None] * vectors
-        distances = np.linalg.norm(candidates - query, axis=1)
-        index = int(np.argmin(distances))
-        return self._projection(query, index, fractions[index],
-                                candidates[index], distances[index], vectors[index],
-                                lengths[index])
+        return query, {
+            "vectors": vectors,
+            "lengths": lengths,
+            "fractions": fractions,
+            "candidates": candidates,
+            "distances": np.linalg.norm(candidates - query, axis=1),
+            "arc_lengths": (self.s + fractions * lengths) % self.total_length,
+        }
+
+    def _projection_from(self, query, segments, index):
+        return self._projection(
+            query, index, segments["fractions"][index],
+            segments["candidates"][index], segments["distances"][index],
+            segments["vectors"][index], segments["lengths"][index])
 
     def _projection(self, query, index, fraction, candidate, distance, vector, length):
         arc_length = self.s[index] + fraction * length
