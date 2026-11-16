@@ -1,0 +1,7 @@
+lookahead_base_m,completed,lap_time_s,max_lateral_deviation_m,collisions,return_code,log_file
+0.5,True,173.5,0.09070057399621245,0,0,results\p1_sweep_runs\lookahead_0p50.csv
+0.8,True,173.3,0.1372967400335849,0,0,results\p1_sweep_runs\lookahead_0p80.csv
+1.1,True,173.2,0.2081408476894968,0,0,results\p1_sweep_runs\lookahead_1p10.csv
+1.4,True,173.1,0.28260312860827463,0,0,results\p1_sweep_runs\lookahead_1p40.csv
+1.7,True,172.8,0.37626113632382263,0,0,results\p1_sweep_runs\lookahead_1p70.csv
+2.0,True,172.7,0.4796229065415058,0,0,results\p1_sweep_runs\lookahead_2p00.csv
