@@ -30,6 +30,8 @@ Run any part's controller through the shared runner:
 # -> follow_gap on Spielberg: COMPLETE  t=242.1s  laps=1  progress=1.000  collisions=0
 .venv/bin/python -m common.tracks                     # list the circuits
 ```
+### Architecture
+<img width="1900" height="2948" alt="mermaid-diagram (1)" src="https://github.com/user-attachments/assets/fb133afb-546c-4f3f-979b-214fdd177b01" />
 
 ### Which simulator package
 
