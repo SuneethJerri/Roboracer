@@ -59,58 +59,6 @@ how to add the Porto map -- nobody has verified that path yet.
 
 ---
 
-### Architecture
-flowchart TB
-    A["RoboRacer Simulation Environment"]
-
-    A --> B["Sensor Observations / Track Data"]
-
-    B --> C["P1: Pure Pursuit"]
-    B --> D["P2: Follow-the-Gap"]
-    B --> E["P5: Deep Reinforcement Learning"]
-
-    F["P3: Track Geometry and Centreline"]
-    F --> F1["Periodic Cubic Splines"]
-    F1 --> F2["Arc-Length Resampling"]
-    F2 --> F3["Curvature and Track Projection"]
-    F3 --> F4["Progress Tracking"]
-
-    F4 --> C
-    F4 --> E
-
-    E --> G["PPO"]
-    E --> H["SAC"]
-
-    G --> I["Reward-Based Training"]
-    H --> I
-
-    I --> J["Trained RL Controllers"]
-
-    C --> K["Controller Evaluation"]
-    D --> K
-    J --> K
-
-    K --> L["P4: Evaluation Pipeline"]
-
-    L --> M["Run Logs and CSV Aggregation"]
-    M --> N["Mean / Median / Standard Deviation"]
-    M --> O["Bootstrap Confidence Intervals"]
-    M --> P["Grouped Comparisons and Graphs"]
-
-    P --> Q["Performance and Robustness Analysis"]
-
-    C --> R["Steering and Driving Actions"]
-    D --> R
-    J --> R
-    R --> A
-
-    style A fill:#dbeafe,stroke:#2563eb,color:#172554
-    style F fill:#dcfce7,stroke:#16a34a,color:#14532d
-    style E fill:#f3e8ff,stroke:#9333ea,color:#581c87
-    style L fill:#ffedd5,stroke:#ea580c,color:#7c2d12
-    style Q fill:#dbeafe,stroke:#2563eb,color:#172554
-
-
 ## 📌 Shared Core (Team-Wide)
 These files are the backbone of the simulation and should **not** be modified by individual members without full team consensus.
 * `sims/`: Contains the wrappers for `f1tenth_gym` and `AutoDRIVE`[cite: 1].
